@@ -1,0 +1,264 @@
+Venetium 0042 - GPU YUV->RGB for software-decoded video (VP9/AV1/software H.264) on ANGLE D3D9 (BATCH MEDIA-1).
+Without GL_EXT_texture_rg every software frame was converted YUV->RGB on the CPU and uploaded as a 4-byte RGB texture. Chromium 77
+used LUMINANCE_8 planes instead. Now: 8-bit single-channel planes (I420/I422/I444) are uploaded as GL_LUMINANCE (native D3DFMT_L8)
+on ANGLE D3D9 (GL_ALPHA elsewhere without texture_rg) and converted in the GPU shader. Service: UseLuminanceForSingleChannelPlanes()
+drives BOTH GLFormatCaps::GetFallbackFormatIfNotSupported and GetMultiPlaneFormatInfo so viz/Skia and the backing agree;
+CopySharedImageHelper::WritePixelsYUV retypes kR8_unorm pixmaps to the backend channel. Client: WritePixelsYUV and
+VideoResourceUpdater accept single-channel 8-bit planes without texture_rg; 2-channel UV (NV12) stays on the CPU path; the kill
+switch is --disable-features=VenetiumSoftwareVideoGpuYuv. Contexts with texture_rg and non-D3D9 ANGLE are unchanged.
+
+--- a/media/renderers/video_resource_updater.cc
++++ b/media/renderers/video_resource_updater.cc
+@@ -197,6 +197,33 @@
+          frame_format == PIXEL_FORMAT_ABGR || frame_format == PIXEL_FORMAT_ARGB;
+ }
+ 
++// Venetium 0042: kill switch for uploading software-decoded (VP9 / AV1 /
++// software H.264) frames as single-channel YUV planes, converted to RGB on the
++// GPU, when the context lacks GL_EXT_texture_rg (ANGLE D3D9, e.g. Windows ARM32
++// / Tegra). Disabled, those frames go back to CPU YUV->RGB conversion.
++BASE_FEATURE(kVenetiumSoftwareVideoGpuYuv, base::FEATURE_ENABLED_BY_DEFAULT);
++
++// True when 8-bit single-channel planes can be used even though
++// MultiPlaneChannelFormatSupported() (which also gates canvas/WebGL uploads, left
++// unchanged) refuses them for lack of texture_rg: the GPU service then backs
++// them with LUMINANCE (ANGLE D3D9) or ALPHA textures, as Chromium 77 did.
++bool CanUseSingleChannelPlaneFallback(
++    viz::RasterContextProvider* raster_context_provider) {
++#if BUILDFLAG(IS_WIN)
++  if (!base::FeatureList::IsEnabled(kVenetiumSoftwareVideoGpuYuv)) {
++    return false;
++  }
++  const auto& caps = raster_context_provider->ContextCapabilities();
++  const auto& shared_image_caps =
++      raster_context_provider->SharedImageInterface()->GetCapabilities();
++  return !caps.texture_rg &&
++         shared_image_caps.supports_luminance_shared_images &&
++         !shared_image_caps.disable_one_component_textures;
++#else
++  return false;
++#endif
++}
++
+ std::optional<viz::SharedImageFormat::ChannelFormat>
+ SupportedMultiPlaneChannelFormat(
+     viz::RasterContextProvider* raster_context_provider,
+@@ -209,6 +236,9 @@
+             viz::SharedImageFormat::ChannelFormat::k8)) {
+       return viz::SharedImageFormat::ChannelFormat::k8;
+     }
++    if (CanUseSingleChannelPlaneFallback(raster_context_provider)) {
++      return viz::SharedImageFormat::ChannelFormat::k8;
++    }
+   }
+   // TODO(https:/crbug.com/481590672): Checking `supports_r16_shared_images`
+   // may be too pessimistic. Consider removing it.
+@@ -907,6 +937,19 @@
+         yuv_si_format.plane_config(), yuv_si_format.subsampling(),
+         supported_channel_format.value());
+   }
++
++  // Venetium 0042: the single-channel-plane fallback (no texture_rg) has no
++  // 2-channel texture, so NV12/NV12A-style UV planes must stay on the CPU path;
++  // otherwise the service could not create the image and the video would be
++  // blank.
++  if (!PaintCanvasVideoRenderer::MultiPlaneChannelFormatSupported(
++          context_provider_, supported_channel_format.value())) {
++    for (int plane = 0; plane < yuv_si_format.NumberOfPlanes(); ++plane) {
++      if (yuv_si_format.NumChannelsInPlane(plane) > 1) {
++        return PaintCanvasVideoRenderer::GetRGBPixelsOutputFormat();
++      }
++    }
++  }
+   return yuv_si_format;
+ }
+ 
+--- a/gpu/command_buffer/client/raster_implementation.cc
++++ b/gpu/command_buffer/client/raster_implementation.cc
+@@ -1262,13 +1262,22 @@
+ void RasterImplementation::WritePixelsYUV(const gpu::Mailbox& dest_mailbox,
+                                           const SkYUVAPixmaps& src_yuv_pixmap) {
+   TRACE_EVENT0("gpu", "RasterImplementation::WritePixelsYUV");
+-  if (!capabilities().texture_rg) {
+-    SetGLError(GL_INVALID_OPERATION, "WritePixelsYUV", "unsupported");
+-    return;
+-  }
+-
+   const auto& src_yuv_info = src_yuv_pixmap.yuvaInfo();
+   const auto& src_yuv_pixmap_info = src_yuv_pixmap.pixmapsInfo();
++  if (!capabilities().texture_rg) {
++    // Venetium 0042: without texture_rg the service backs 8-bit single-channel
++    // planes with LUMINANCE (ANGLE D3D9) or ALPHA textures, so I420/I422/I444
++    // uploads work; 2-channel (UV) planes and deeper data still do not.
++    bool single_channel_8bit = src_yuv_pixmap_info.dataType() ==
++                               SkYUVAPixmapInfo::DataType::kUnorm8;
++    for (int plane = 0; plane < src_yuv_info.numPlanes(); plane++) {
++      single_channel_8bit &= src_yuv_info.numChannelsInPlane(plane) == 1;
++    }
++    if (!single_channel_8bit) {
++      SetGLError(GL_INVALID_OPERATION, "WritePixelsYUV", "unsupported");
++      return;
++    }
++  }
+   const std::array<SkPixmap, SkYUVAInfo::kMaxPlanes>& src_sk_pixmaps =
+       src_yuv_pixmap.planes();
+ 
+--- a/gpu/command_buffer/service/copy_shared_image_helper.cc
++++ b/gpu/command_buffer/service/copy_shared_image_helper.cc
+@@ -23,11 +23,13 @@
+ #include "third_party/abseil-cpp/absl/cleanup/cleanup.h"
+ #include "third_party/libyuv/include/libyuv/planar_functions.h"
+ #include "third_party/skia/include/core/SkCanvas.h"
++#include "third_party/skia/include/core/SkColor.h"
+ #include "third_party/skia/include/core/SkColorSpace.h"
+ #include "third_party/skia/include/core/SkImage.h"
+ #include "third_party/skia/include/core/SkRect.h"
+ #include "third_party/skia/include/core/SkSurface.h"
+ #include "third_party/skia/include/gpu/ganesh/GrBackendSemaphore.h"
++#include "third_party/skia/include/gpu/ganesh/GrBackendSurface.h"
+ #include "third_party/skia/include/gpu/ganesh/GrDirectContext.h"
+ #include "third_party/skia/include/gpu/ganesh/GrTypes.h"
+ #include "third_party/skia/include/gpu/ganesh/SkSurfaceGanesh.h"
+@@ -790,9 +792,31 @@
+   for (int plane = 0; plane < dest_format.NumberOfPlanes(); plane++) {
+     bool written = false;
+     if (gr_context) {
++      const GrBackendTexture& backend_texture =
++          dest_scoped_access->promise_image_texture(plane)->backendTexture();
++      // Venetium 0042: without texture_rg, single-channel planes are backed
++      // by LUMINANCE8 (ANGLE D3D9) or ALPHA8 textures, which Skia will not
++      // write from a kR8_unorm pixmap. Same bytes, so retype the pixmap to the
++      // backend's channel.
++      SkPixmap plane_pixmap = pixmaps[plane];
++      if (plane_pixmap.colorType() == kR8_unorm_SkColorType) {
++        const uint32_t channels =
++            backend_texture.getBackendFormat().channelMask();
++        if (channels == kGray_SkColorChannelFlag) {
++          plane_pixmap = SkPixmap(plane_pixmap.info()
++                                      .makeColorType(kGray_8_SkColorType)
++                                      .makeAlphaType(kOpaque_SkAlphaType),
++                                  plane_pixmap.addr(), plane_pixmap.rowBytes());
++        } else if (channels == kAlpha_SkColorChannelFlag) {
++          plane_pixmap = SkPixmap(plane_pixmap.info()
++                                      .makeColorType(kAlpha_8_SkColorType)
++                                      .makeAlphaType(kPremul_SkAlphaType),
++                                  plane_pixmap.addr(), plane_pixmap.rowBytes());
++        }
++      }
+       written = gr_context->updateBackendTexture(
+-          dest_scoped_access->promise_image_texture(plane)->backendTexture(),
+-          &pixmaps[plane], /*numLevels=*/1, dest_shared_image->surface_origin(),
++          backend_texture, &plane_pixmap, /*numLevels=*/1,
++          dest_shared_image->surface_origin(),
+           /*finishedProc=*/nullptr, /*finishedContext=*/nullptr);
+     } else {
+       CHECK(shared_context_state_->graphite_shared_context());
+--- a/gpu/command_buffer/service/shared_image/shared_image_format_service_utils.h
++++ b/gpu/command_buffer/service/shared_image/shared_image_format_service_utils.h
+@@ -73,6 +73,14 @@
+ GPU_GLES2_EXPORT SkColorType
+ ToClosestSkColorTypeExternalSampler(viz::SharedImageFormat format);
+ 
++// Venetium 0042: true when GL runs on ANGLE's Direct3D 9 backend. There, when
++// GL_EXT_texture_rg is unavailable, single-channel 8-bit planes of multiplanar
++// (YUV) shared images fall back to GL_LUMINANCE (native D3DFMT_L8, 1 byte per
++// pixel, as Chromium 77 used for video) instead of GL_ALPHA, which ANGLE D3D9
++// stores as 4-byte A8R8G8B8. GLFormatCaps::ToGLFormatDesc() and
++// GLCommonImageBackingFactory both key off this, so they always agree.
++GPU_GLES2_EXPORT bool UseLuminanceForSingleChannelPlanes();
++
+ // Holds capabilities and provides accessors for getting appropriate GL formats
+ // for shared images.
+ class GPU_GLES2_EXPORT GLFormatCaps {
+--- a/gpu/command_buffer/service/shared_image/shared_image_format_service_utils.cc
++++ b/gpu/command_buffer/service/shared_image/shared_image_format_service_utils.cc
+@@ -13,6 +13,7 @@
+ #include "gpu/command_buffer/service/feature_info.h"
+ #include "gpu/vulkan/vulkan_ycbcr_info.h"
+ #include "ui/gl/gl_bindings.h"
++#include "ui/gl/gl_implementation.h"
+ #include "ui/gl/gl_version_info.h"
+ 
+ #if BUILDFLAG(SKIA_USE_DAWN)
+@@ -398,16 +399,26 @@
+   return format_desc;
+ }
+ 
++bool UseLuminanceForSingleChannelPlanes() {
++  return gl::GetGLImplementation() == gl::kGLImplementationEGLANGLE &&
++         gl::GetANGLEImplementation() == gl::ANGLEImplementation::kD3D9;
++}
++
+ GLenum GLFormatCaps::GetFallbackFormatIfNotSupported(GLenum gl_format) const {
++  // Venetium 0042: without texture_rg on ANGLE D3D9, LUMINANCE (D3DFMT_L8)
++  // instead of ALPHA (A8R8G8B8 there). Must match GetMultiPlaneFormatInfo() in
++  // gl_common_image_backing_factory.cc.
++  const bool use_luminance =
++      !ext_texture_rg_ && UseLuminanceForSingleChannelPlanes();
+   // Fallback to GL_ALPHA for unsized RED format.
+   if (gl_format == GL_RED_EXT &&
+       (disable_r8_shared_images_ || !ext_texture_rg_)) {
+-    return GL_ALPHA;
++    return use_luminance ? GL_LUMINANCE : GL_ALPHA;
+   }
+   // Fallback to GL_ALPHA8 for sized R8 format.
+   if (gl_format == GL_R8_EXT &&
+       (disable_r8_shared_images_ || !ext_texture_rg_)) {
+-    return GL_ALPHA8_EXT;
++    return use_luminance ? GL_LUMINANCE8_EXT : GL_ALPHA8_EXT;
+   }
+   // No fallback for sized/unsize RG8 format without texture_rg extension.
+   if ((gl_format == GL_RG_EXT || gl_format == GL_RG8_EXT) && !ext_texture_rg_) {
+--- a/gpu/command_buffer/service/shared_image/gl_common_image_backing_factory.cc
++++ b/gpu/command_buffer/service/shared_image/gl_common_image_backing_factory.cc
+@@ -62,7 +62,14 @@
+                    GLCommonImageBackingFactory::FormatInfo>& supported_formats,
+     const GLFormatCaps& gl_format_caps,
+     viz::SharedImageFormat format) {
++  // Venetium 0042: on ANGLE D3D9 without texture_rg, R_8 planes become
++  // LUMINANCE (D3DFMT_L8) rather than ALPHA_8 (stored as A8R8G8B8 there). Must
++  // match GLFormatCaps::GetFallbackFormatIfNotSupported(GLenum), which the
++  // Skia/viz side uses for the same planes.
++  const bool use_luminance = !gl_format_caps.ext_texture_rg() &&
++                             UseLuminanceForSingleChannelPlanes();
+   std::vector<viz::SharedImageFormat> plane_formats;
++  std::vector<bool> luminance_planes;
+   for (int plane = 0; plane < format.NumberOfPlanes(); plane++) {
+     viz::SharedImageFormat plane_format =
+         GLTextureHolder::GetPlaneFormat(format, plane);
+@@ -73,17 +80,32 @@
+       // multiplane format.
+       return {};
+     }
++    luminance_planes.push_back(
++        use_luminance && plane_format == viz::SinglePlaneFormat::kR_8 &&
++        fallback_format.value() == viz::SinglePlaneFormat::kALPHA_8);
+     plane_formats.emplace_back(fallback_format.value());
+   }
+ 
+   std::vector<GLCommonImageBackingFactory::FormatInfo> plane_infos;
+   plane_infos.reserve(plane_formats.size());
+-  for (auto plane_format : plane_formats) {
+-    auto iter = supported_formats.find(plane_format);
++  for (size_t i = 0; i < plane_formats.size(); ++i) {
++    auto iter = supported_formats.find(plane_formats[i]);
+     if (iter == supported_formats.end()) {
+       return {};
+     }
+-    plane_infos.emplace_back(iter->second);
++    GLCommonImageBackingFactory::FormatInfo info = iter->second;
++    if (luminance_planes[i]) {
++      // Unsized GL_LUMINANCE via glTexImage2D (valid ES2); the sized format is
++      // what Skia sees through GLTextureHolder's format desc (kGray_8).
++      info.supports_storage = false;
++      info.gl_format = GL_LUMINANCE;
++      info.image_internal_format = GL_LUMINANCE;
++      info.adjusted_format = GL_LUMINANCE;
++      info.storage_internal_format = GL_LUMINANCE8_EXT;
++      info.adjusted_storage_internal_format = GL_LUMINANCE8_EXT;
++      info.swizzle = nullptr;
++    }
++    plane_infos.emplace_back(info);
+   }
+ 
+   return plane_infos;

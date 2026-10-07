@@ -1,0 +1,557 @@
+Venetium 0020 - crashpad on Windows ARM32: CaptureContext in armasm, and the snapshot/util port.
+
+BATCH-ARM-1 section 3D, his decisions 1 and 6 (ARM-1-DECISIONS.md: keep crash reporting on ARM; the assembler split by file type).
+- util/misc/capture_context_win_arm.asm (new): CaptureContext for the ARM32 CONTEXT, armasm syntax, byte-identical to the file checked on
+  the server before (s3/toolchain/armasm, sha256 0e4955e1...). Venetium 0016's arm asm tool is clang-cl (GAS syntax), which cannot read
+  armasm syntax, so the file gets its own build step: util/misc/run_armasm.py (new) runs MSVC 14.44's armasm.exe (/nologo /Fo /I only;
+  it rejects /c, /D, /safeseh) with environment.arm, zeroes the object's timestamp, and its .obj is added to crashpad util's sources for
+  current_cpu == "arm" (util/BUILD.gn). The x86 MASM files (capture_context_win.asm, safe_terminate_process.asm) are no longer handed to
+  the arm asm tool.
+- The Windows ARM32 snapshot/util port (~70 lines; CPUContextARM already exists upstream): util/win/context_wrappers.h,
+  util/net/http_transport_win.cc, snapshot/win/{cpu_context,exception_snapshot,process_snapshot,system_snapshot,thread_snapshot}_win.*,
+  which stopped on "#error Unsupported Windows Arch" / "Port" for ARM32; plus three test-support files so crashpad's own tests compile.
+Checked (RUNTIME, real arm-rt21 graph after gn gen): the armasm action runs and gives an ARMNT object defining
+crashpad::CaptureContext(CONTEXT*); the 8 previously failing TUs and crashpad_client_win / the handler's exception handler compile as
+ARMNT. Device-only: the captured Pc keeps the Thumb bit (as the arm64 sibling stores LR), minidump content, the handler at run time.
+
+diff --git a/third_party/crashpad/crashpad/handler/win/crashy_test_program.cc b/third_party/crashpad/crashpad/handler/win/crashy_test_program.cc
+index a144979..78fbac6 100644
+--- a/third_party/crashpad/crashpad/handler/win/crashy_test_program.cc
++++ b/third_party/crashpad/crashpad/handler/win/crashy_test_program.cc
+@@ -102,7 +102,7 @@ DWORD WINAPI NullThreadProc(void* param) {
+   return 0;
+ }
+ 
+-// Creates a suspended background thread, and sets EDI/RDI/X17 to point at
++// Creates a suspended background thread, and sets EDI/RDI/X17/R4 to point at
+ // g_test_memory so we can confirm it's available in the minidump.
+ bool CreateThreadWithRegisterPointingToTestMemory() {
+   HANDLE thread = CreateThread(
+@@ -124,6 +124,8 @@ bool CreateThreadWithRegisterPointingToTestMemory() {
+   context.Edi = reinterpret_cast<DWORD>(g_test_memory);
+ #elif defined(ARCH_CPU_ARM64)
+   context.X17 = reinterpret_cast<DWORD64>(g_test_memory);
++#elif defined(ARCH_CPU_ARMEL)
++  context.R4 = reinterpret_cast<DWORD>(g_test_memory);
+ #endif
+   if (!SetThreadContext(thread, &context)) {
+     PLOG(ERROR) << "SetThreadContext";
+diff --git a/third_party/crashpad/crashpad/snapshot/win/cpu_context_win.cc b/third_party/crashpad/crashpad/snapshot/win/cpu_context_win.cc
+index 903d4a9..c3b90f6 100644
+--- a/third_party/crashpad/crashpad/snapshot/win/cpu_context_win.cc
++++ b/third_party/crashpad/crashpad/snapshot/win/cpu_context_win.cc
+@@ -256,6 +256,39 @@ void InitializeARM64Context(const CONTEXT* context, CPUContextARM64* out) {
+   }
+ }
+ 
++#elif defined(ARCH_CPU_ARMEL)
++
++void InitializeARMContext(const CONTEXT* context, CPUContextARM* out) {
++  memset(out, 0, sizeof(*out));
++
++  LOG_IF(ERROR, !HasContextPart(context, CONTEXT_ARM)) << "non-arm context";
++
++  if (HasContextPart(context, CONTEXT_CONTROL)) {
++    out->cpsr = context->Cpsr;
++    out->pc = context->Pc;
++    out->lr = context->Lr;
++    out->sp = context->Sp;
++  }
++
++  if (HasContextPart(context, CONTEXT_INTEGER)) {
++    // CPUContextARM::regs holds r0-r10; r11 and r12 are fp and ip.
++    static_assert(offsetof(CONTEXT, R10) - offsetof(CONTEXT, R0) ==
++                      10 * sizeof(context->R0),
++                  "R0-R10 must be contiguous");
++    memcpy(&out->regs[0], &context->R0, 11 * sizeof(context->R0));
++    out->fp = context->R11;
++    out->ip = context->R12;
++  }
++
++  if (HasContextPart(context, CONTEXT_FLOATING_POINT)) {
++    static_assert(sizeof(out->vfp_regs.vfp) == sizeof(context->D),
++                  "types must be equivalent");
++    memcpy(&out->vfp_regs.vfp, &context->D, sizeof(out->vfp_regs.vfp));
++    out->vfp_regs.fpscr = context->Fpscr;
++    out->have_vfp_regs = true;
++  }
++}
++
+ #else
+ #error Unsupported Windows Arch
+ #endif  // ARCH_CPU_X86
+diff --git a/third_party/crashpad/crashpad/snapshot/win/cpu_context_win.h b/third_party/crashpad/crashpad/snapshot/win/cpu_context_win.h
+index c3cae9b..af31868 100644
+--- a/third_party/crashpad/crashpad/snapshot/win/cpu_context_win.h
++++ b/third_party/crashpad/crashpad/snapshot/win/cpu_context_win.h
+@@ -23,6 +23,7 @@ namespace crashpad {
+ 
+ struct CPUContextX86;
+ struct CPUContextX86_64;
++struct CPUContextARM;
+ struct CPUContextARM64;
+ 
+ #if defined(ARCH_CPU_X86) || DOXYGEN
+@@ -64,6 +65,14 @@ void InitializeARM64Context(const CONTEXT* context, CPUContextARM64* out);
+ 
+ #endif  // ARCH_CPU_ARM64
+ 
++#if defined(ARCH_CPU_ARMEL) || DOXYGEN
++
++//! \brief Initializes a CPUContextARM structure from a native context
++//!     structure on Windows.
++void InitializeARMContext(const CONTEXT* context, CPUContextARM* out);
++
++#endif  // ARCH_CPU_ARMEL
++
+ }  // namespace crashpad
+ 
+ #endif  // CRASHPAD_SNAPSHOT_WIN_CPU_CONTEXT_WIN_H_
+diff --git a/third_party/crashpad/crashpad/snapshot/win/exception_snapshot_win.cc b/third_party/crashpad/crashpad/snapshot/win/exception_snapshot_win.cc
+index b893144..0a0d4e7 100644
+--- a/third_party/crashpad/crashpad/snapshot/win/exception_snapshot_win.cc
++++ b/third_party/crashpad/crashpad/snapshot/win/exception_snapshot_win.cc
+@@ -47,6 +47,16 @@ void NativeContextToCPUContext32(const Context32* context_record,
+ }
+ #endif  // ARCH_CPU_X86_FAMILY
+ 
++#if defined(ARCH_CPU_ARMEL)
++void NativeContextToCPUContext32(const CONTEXT* context_record,
++                                 CPUContext* context,
++                                 CPUContextUnion* context_union) {
++  context->architecture = kCPUArchitectureARM;
++  context->arm = &context_union->arm;
++  InitializeARMContext(context_record, context->arm);
++}
++#endif  // ARCH_CPU_ARMEL
++
+ #if defined(ARCH_CPU_64_BITS)
+ void NativeContextToCPUContext64(const CONTEXT* context_record,
+                                  CPUContext* context,
+diff --git a/third_party/crashpad/crashpad/snapshot/win/exception_snapshot_win.h b/third_party/crashpad/crashpad/snapshot/win/exception_snapshot_win.h
+index 686e771..4d71662 100644
+--- a/third_party/crashpad/crashpad/snapshot/win/exception_snapshot_win.h
++++ b/third_party/crashpad/crashpad/snapshot/win/exception_snapshot_win.h
+@@ -44,6 +44,8 @@ union CPUContextUnion {
+   CPUContextX86_64 x86_64;
+ #elif defined(ARCH_CPU_ARM64)
+   CPUContextARM64 arm64;
++#elif defined(ARCH_CPU_ARMEL)
++  CPUContextARM arm;
+ #endif
+ };
+ 
+diff --git a/third_party/crashpad/crashpad/snapshot/win/process_snapshot_win.cc b/third_party/crashpad/crashpad/snapshot/win/process_snapshot_win.cc
+index 6c06165..92409b0 100644
+--- a/third_party/crashpad/crashpad/snapshot/win/process_snapshot_win.cc
++++ b/third_party/crashpad/crashpad/snapshot/win/process_snapshot_win.cc
+@@ -282,7 +282,7 @@ void ProcessSnapshotWin::InitializeUnloadedModules() {
+     return;
+   }
+   using Traits = process_types::internal::Traits64;
+-#elif defined(ARCH_CPU_X86)
++#elif defined(ARCH_CPU_X86) || defined(ARCH_CPU_ARMEL)
+   using Traits = process_types::internal::Traits32;
+ #else
+ #error port
+diff --git a/third_party/crashpad/crashpad/snapshot/win/system_snapshot_win.cc b/third_party/crashpad/crashpad/snapshot/win/system_snapshot_win.cc
+index 160c41d..a336fd6 100644
+--- a/third_party/crashpad/crashpad/snapshot/win/system_snapshot_win.cc
++++ b/third_party/crashpad/crashpad/snapshot/win/system_snapshot_win.cc
+@@ -220,6 +220,8 @@ CPUArchitecture SystemSnapshotWin::GetCPUArchitecture() const {
+                                     : kCPUArchitectureX86;
+ #elif defined(ARCH_CPU_ARM64)
+   return kCPUArchitectureARM64;
++#elif defined(ARCH_CPU_ARMEL)
++  return kCPUArchitectureARM;
+ #else
+ #error Unsupported Windows Arch
+ #endif
+@@ -246,7 +248,7 @@ uint32_t SystemSnapshotWin::CPURevision() const {
+   uint16_t adjusted_family = family + extended_family;
+   uint8_t adjusted_model = model + (extended_model << 4);
+   return (adjusted_family << 16) | (adjusted_model << 8) | stepping;
+-#elif defined(ARCH_CPU_ARM64)
++#elif defined(ARCH_CPU_ARM_FAMILY)
+   SYSTEM_INFO system_info;
+   GetSystemInfo(&system_info);
+ 
+@@ -279,7 +281,7 @@ std::string SystemSnapshotWin::CPUVendor() const {
+   *reinterpret_cast<int*>(vendor + 4) = cpu_info[3];
+   *reinterpret_cast<int*>(vendor + 8) = cpu_info[2];
+   return std::string(vendor, sizeof(vendor));
+-#elif defined(ARCH_CPU_ARM64)
++#elif defined(ARCH_CPU_ARM_FAMILY)
+   HKEY key;
+ 
+   if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+diff --git a/third_party/crashpad/crashpad/snapshot/win/system_snapshot_win_test.cc b/third_party/crashpad/crashpad/snapshot/win/system_snapshot_win_test.cc
+index 439f526..03b3cc9 100644
+--- a/third_party/crashpad/crashpad/snapshot/win/system_snapshot_win_test.cc
++++ b/third_party/crashpad/crashpad/snapshot/win/system_snapshot_win_test.cc
+@@ -63,6 +63,8 @@ TEST_F(SystemSnapshotWinTest, GetCPUArchitecture) {
+   EXPECT_EQ(cpu_architecture, kCPUArchitectureX86_64);
+ #elif defined(ARCH_CPU_ARM64)
+   EXPECT_EQ(cpu_architecture, kCPUArchitectureARM64);
++#elif defined(ARCH_CPU_ARMEL)
++  EXPECT_EQ(cpu_architecture, kCPUArchitectureARM);
+ #else
+ #error Unsupported Windows Arch
+ #endif
+@@ -76,7 +78,7 @@ TEST_F(SystemSnapshotWinTest, CPUVendor) {
+   std::string cpu_vendor = system_snapshot().CPUVendor();
+ #if defined(ARCH_CPU_X86_FAMILY)
+   EXPECT_TRUE(cpu_vendor == "GenuineIntel" || cpu_vendor == "AuthenticAMD");
+-#elif defined(ARCH_CPU_ARM64)
++#elif defined(ARCH_CPU_ARM_FAMILY)
+   EXPECT_FALSE(cpu_vendor.empty());
+ #else
+ #error Unsupported Windows Arch
+diff --git a/third_party/crashpad/crashpad/snapshot/win/thread_snapshot_win.cc b/third_party/crashpad/crashpad/snapshot/win/thread_snapshot_win.cc
+index 576d863..87f281f 100644
+--- a/third_party/crashpad/crashpad/snapshot/win/thread_snapshot_win.cc
++++ b/third_party/crashpad/crashpad/snapshot/win/thread_snapshot_win.cc
+@@ -116,6 +116,11 @@ bool ThreadSnapshotWin::Initialize(
+   context_.arm64 = &context_union_.arm64;
+   InitializeARM64Context(process_reader_thread.context.context<CONTEXT>(),
+                          context_.arm64);
++#elif defined(ARCH_CPU_ARMEL)
++  context_.architecture = kCPUArchitectureARM;
++  context_.arm = &context_union_.arm;
++  InitializeARMContext(process_reader_thread.context.context<CONTEXT>(),
++                       context_.arm);
+ #else
+ #error Unsupported Windows Arch
+ #endif  // ARCH_CPU_X86
+diff --git a/third_party/crashpad/crashpad/snapshot/win/thread_snapshot_win.h b/third_party/crashpad/crashpad/snapshot/win/thread_snapshot_win.h
+index efc16e7..9e1ba22 100644
+--- a/third_party/crashpad/crashpad/snapshot/win/thread_snapshot_win.h
++++ b/third_party/crashpad/crashpad/snapshot/win/thread_snapshot_win.h
+@@ -81,6 +81,8 @@ class ThreadSnapshotWin final : public ThreadSnapshot {
+     CPUContextX86_64 x86_64;
+ #elif defined(ARCH_CPU_ARM64)
+     CPUContextARM64 arm64;
++#elif defined(ARCH_CPU_ARMEL)
++    CPUContextARM arm;
+ #else
+ #error Unsupported Windows Arch
+ #endif
+diff --git a/third_party/crashpad/crashpad/util/BUILD.gn b/third_party/crashpad/crashpad/util/BUILD.gn
+index e95a189..e429391 100644
+--- a/third_party/crashpad/crashpad/util/BUILD.gn
++++ b/third_party/crashpad/crashpad/util/BUILD.gn
+@@ -183,6 +183,24 @@ if (crashpad_is_win) {
+   }
+ }
+ 
++if (crashpad_is_win && current_cpu == "arm") {
++  # Venetium 0020: CaptureContext() for Windows ARM32 is written in Microsoft's
++  # armasm dialect. The toolchain's asm tool for ARM32 is clang-cl, which
++  # assembles the GNU-syntax .S files of the other libraries but cannot read
++  # armasm syntax, and armasm.exe cannot read those .S files, so this file gets
++  # its own build step. The object is listed in the sources of :util below.
++  action("capture_context_win_arm") {
++    script = "misc/run_armasm.py"
++    sources = [ "misc/capture_context_win_arm.asm" ]
++    outputs = [ "$target_gen_dir/misc/capture_context_win_arm.obj" ]
++    args = [
++      "environment.arm",
++      rebase_path(outputs[0], root_build_dir),
++      rebase_path(sources[0], root_build_dir),
++    ]
++  }
++}
++
+ crashpad_static_library("util") {
+   sources = [
+     "file/delimited_file_reader.cc",
+@@ -549,7 +567,14 @@ crashpad_static_library("util") {
+       "win/xp_compat.h",
+     ]
+ 
+-    if (current_cpu != "arm64") {
++    if (current_cpu == "arm") {
++      # Venetium 0020: the object armasm.exe makes of
++      # misc/capture_context_win_arm.asm (see the capture_context_win_arm
++      # action). The x86 MASM files below cannot be assembled for ARM, and
++      # SafeTerminateProcess() is inline on every CPU but x86
++      # (win/safe_terminate_process.h), so no safe_terminate_process.asm.
++      sources += get_target_outputs(":capture_context_win_arm")
++    } else if (current_cpu != "arm64") {
+       sources += [
+         "misc/capture_context_win.asm",
+         "win/safe_terminate_process.asm",
+@@ -641,6 +666,10 @@ crashpad_static_library("util") {
+     if (current_cpu == "x86") {
+       asmflags = [ "/safeseh" ]
+     }
++
++    if (current_cpu == "arm") {
++      deps += [ ":capture_context_win_arm" ]
++    }
+   }
+ 
+   if (crashpad_is_fuchsia) {
+diff --git a/third_party/crashpad/crashpad/util/misc/capture_context_test_util_win.cc b/third_party/crashpad/crashpad/util/misc/capture_context_test_util_win.cc
+index e21d865..0c5beb2 100644
+--- a/third_party/crashpad/crashpad/util/misc/capture_context_test_util_win.cc
++++ b/third_party/crashpad/crashpad/util/misc/capture_context_test_util_win.cc
+@@ -105,7 +105,7 @@ uintptr_t StackPointerFromContext(const NativeCPUContext& context) {
+   return context.Esp;
+ #elif defined(ARCH_CPU_X86_64)
+   return context.Rsp;
+-#elif defined(ARCH_CPU_ARM64)
++#elif defined(ARCH_CPU_ARM64) || defined(ARCH_CPU_ARMEL)
+   return context.Sp;
+ #endif
+ }
+diff --git a/third_party/crashpad/crashpad/util/misc/capture_context_win_arm.asm b/third_party/crashpad/crashpad/util/misc/capture_context_win_arm.asm
+new file mode 100644
+index 0000000..9ce5fa6
+--- /dev/null
++++ b/third_party/crashpad/crashpad/util/misc/capture_context_win_arm.asm
+@@ -0,0 +1,106 @@
++; Copyright 2019 The Crashpad Authors
++;
++; Licensed under the Apache License, Version 2.0 (the "License");
++; you may not use this file except in compliance with the License.
++; You may obtain a copy of the License at
++;
++;     http://www.apache.org/licenses/LICENSE-2.0
++;
++; Unless required by applicable law or agreed to in writing, software
++; distributed under the License is distributed on an "AS IS" BASIS,
++; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++; See the License for the specific language governing permissions and
++; limitations under the License.
++
++; EXPORT the mangled name for `void crashpad::CaptureContext(CONTEXT*)`.
++; This name is specific to the MSVC ABI used by clang-cl on Windows.
++  EXPORT |?CaptureContext@crashpad@@YAXPAU_CONTEXT@@@Z|
++
++; Define the code section. READONLY is standard for code.
++  AREA |.text|, CODE, READONLY
++
++; Specify that the following code is Thumb-2. This is the standard for Win-on-ARM.
++  THUMB
++
++; Offsets into the ARM32 CONTEXT structure.
++; These values are derived from winnt.h for the ARM architecture.
++CONTEXT_R0   EQU 0x004
++CONTEXT_R1   EQU 0x008
++CONTEXT_R2   EQU 0x00c
++CONTEXT_R3   EQU 0x010
++CONTEXT_R4   EQU 0x014
++CONTEXT_R5   EQU 0x018
++CONTEXT_R6   EQU 0x01c
++CONTEXT_R7   EQU 0x020
++CONTEXT_R8   EQU 0x024
++CONTEXT_R9   EQU 0x028
++CONTEXT_R10  EQU 0x02c
++CONTEXT_R11  EQU 0x030  ; Frame Pointer (fp)
++CONTEXT_R12  EQU 0x034  ; Intra-Procedure-call scratch register (ip)
++CONTEXT_SP   EQU 0x038  ; Stack Pointer (r13)
++CONTEXT_LR   EQU 0x03c  ; Link Register (r14)
++CONTEXT_PC   EQU 0x040  ; Program Counter (r15)
++CONTEXT_CPSR EQU 0x044  ; Current Program Status Register
++
++
++|?CaptureContext@crashpad@@YAXPAU_CONTEXT@@@Z| PROC
++  ; The pointer to the CONTEXT structure is passed in r0, per ARM EABI.
++
++  ; --- Save General-Purpose Registers ---
++  ; We store r0-r12 into the CONTEXT structure.
++  ; Note: The original value of r0 from the caller is overwritten by the
++  ; context pointer argument. The value we save for r0 is this pointer.
++  ; This mirrors the behavior of the ARM64 version where "The original x0
++  ; can't be recovered".
++  str  r0, [r0, #CONTEXT_R0]
++  str  r1, [r0, #CONTEXT_R1]
++  str  r2, [r0, #CONTEXT_R2]
++  str  r3, [r0, #CONTEXT_R3]
++  str  r4, [r0, #CONTEXT_R4]
++  str  r5, [r0, #CONTEXT_R5]
++  str  r6, [r0, #CONTEXT_R6]
++  str  r7, [r0, #CONTEXT_R7]
++  str  r8, [r0, #CONTEXT_R8]
++  str  r9, [r0, #CONTEXT_R9]
++  str  r10, [r0, #CONTEXT_R10]
++  str  r11, [r0, #CONTEXT_R11]
++  str  r12, [r0, #CONTEXT_R12]
++
++  ; --- Save Control Registers ---
++  ; The Link Register (lr/r14) and Stack Pointer (sp/r13) must also be saved.
++  ; We use r1 as a scratch register to hold the value of SP.
++  mov  r1, sp
++  str  r1, [r0, #CONTEXT_SP]   ; Save current SP to context->Sp
++  str  lr, [r0, #CONTEXT_LR]   ; Save current LR to context->Lr
++
++  ; Save the "program counter". From the perspective of the captured context,
++  ; the PC is the return address of this function, which is in the Link Register.
++  str  lr, [r0, #CONTEXT_PC]   ; Save current LR to context->Pc
++
++  ; --- Save Processor State and Set ContextFlags ---
++  ; Get the Current Program Status Register (CPSR), which contains the NZCV flags.
++  mrs  r1, cpsr
++  str  r1, [r0, #CONTEXT_CPSR] ; Save CPSR to context->Cpsr
++
++  ; Set the ContextFlags field. The value is a combination of:
++  ; CONTEXT_ARM     (0x200000)
++  ; CONTEXT_CONTROL (0x000001)
++  ; CONTEXT_INTEGER (0x000002)
++  ; Total = 0x200003
++  ldr  r1, =0x200003
++  str  r1, [r0, #0]            ; Store flags at the start of the CONTEXT struct.
++
++  ; --- Cleanup and Return ---
++  ; Restore r1, which we used as a scratch register. This is good practice,
++  ; even though r1 is a caller-saved register.
++  ldr  r1, [r0, #CONTEXT_R1]
++
++  ; TODO(https://crashpad.chromium.org/bug/300): save floating-point registers
++  ; (VFP/NEON). This would involve checking CONTEXT_FLOATING_POINT and storing
++  ; the D registers and FPSCR.
++
++  ; Return to the caller.
++  bx   lr
++  ENDP
++
++  END
+\ No newline at end of file
+diff --git a/third_party/crashpad/crashpad/util/misc/run_armasm.py b/third_party/crashpad/crashpad/util/misc/run_armasm.py
+new file mode 100644
+index 0000000..f2877ae
+--- /dev/null
++++ b/third_party/crashpad/crashpad/util/misc/run_armasm.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++"""Assembles an armasm-syntax .asm file into a Windows ARM32 object.
++
++Venetium 0020. Crashpad's CaptureContext() for Windows ARM32
++(capture_context_win_arm.asm) is written in Microsoft's armasm dialect
++(EXPORT |name|, AREA, THUMB, EQU, PROC/ENDP). The Windows ARM32 'asm' tool of
++the toolchain is clang-cl, which assembles the GNU-syntax .S files of libvpx,
++webrtc, dav1d and ffmpeg but cannot read armasm syntax; armasm.exe in turn
++cannot read those .S files. So the .asm gets its own build step: this script
++runs armasm.exe, and the object it writes is listed in the sources of crashpad's
++util target (util/BUILD.gn), as upstream does with the prebuilt
++capture_context_win_arm64.obj.
++
++armasm.exe accepts /nologo, /Fo<file> and /I<dir>; it rejects /c, /D and
++/safeseh, so nothing but those is passed on.
++
++Usage:
++  run_armasm.py <environment-file> <output.obj> <input.asm> [/I<dir> ...]
++
++<environment-file> is the toolchain's environment block (environment.arm in the
++build directory, written by build/toolchain/win/setup_toolchain.py, the same file
++midl.gni and tool_wrapper.py use). Its PATH names the MSVC bin/HostX64/ARM
++directory that holds armasm.exe.
++"""
++
++import os
++import shutil
++import struct
++import subprocess
++import sys
++
++IMAGE_FILE_MACHINE_ARMNT = 0x01C4
++
++
++def ReadEnvironment(path):
++  """Reads an environment block as written by setup_toolchain.py: NUL separated
++  KEY=VALUE pairs, ended by two NULs."""
++  with open(path) as f:
++    data = f.read()
++  pairs = data[:-2].split('\0')
++  return dict(item.split('=', 1) for item in pairs)
++
++
++def FinalizeObject(obj_path):
++  """Checks that |obj_path| is a COFF object for ARMNT and sets its timestamp to
++  0 (armasm.exe embeds the time; the build is /Brepro and uses lld). Returns an
++  error string, or None."""
++  with open(obj_path, 'rb') as f:
++    data = bytearray(f.read())
++  if len(data) < 20:
++    return 'object is only %d bytes' % len(data)
++  machine, _sections, _timestamp = struct.unpack_from('<HHI', data, 0)
++  if machine != IMAGE_FILE_MACHINE_ARMNT:
++    return 'object machine is 0x%04X, expected ARMNT (0x%04X)' % (
++        machine, IMAGE_FILE_MACHINE_ARMNT)
++  struct.pack_into('<I', data, 4, 0)
++  with open(obj_path, 'wb') as f:
++    f.write(data)
++  return None
++
++
++def main(argv):
++  if len(argv) < 4:
++    sys.stderr.write(__doc__)
++    return 2
++  env_file, output, source = argv[1:4]
++  extra_args = argv[4:]
++
++  env = ReadEnvironment(env_file)
++  armasm = shutil.which('armasm.exe', path=env.get('PATH', ''))
++  if not armasm:
++    sys.stderr.write('armasm.exe not found on the PATH of %s\n' % env_file)
++    return 1
++
++  if os.path.exists(output):
++    os.remove(output)
++
++  command = [armasm, '/nologo', '/Fo' + output] + extra_args + [source]
++  process = subprocess.run(command,
++                           env=env,
++                           stdout=subprocess.PIPE,
++                           stderr=subprocess.STDOUT)
++  text = process.stdout.decode('utf-8', errors='replace')
++  if text.strip():
++    sys.stdout.write(text if text.endswith('\n') else text + '\n')
++  if process.returncode != 0:
++    return process.returncode
++
++  if not os.path.exists(output):
++    sys.stderr.write('armasm.exe reported success but wrote no %s\n' % output)
++    return 1
++  error = FinalizeObject(output)
++  if error:
++    os.remove(output)
++    sys.stderr.write('%s: %s\n' % (output, error))
++    return 1
++  return 0
++
++
++if __name__ == '__main__':
++  sys.exit(main(sys.argv))
+diff --git a/third_party/crashpad/crashpad/util/net/http_transport_win.cc b/third_party/crashpad/crashpad/util/net/http_transport_win.cc
+index d28b3a1..bb9c79c 100644
+--- a/third_party/crashpad/crashpad/util/net/http_transport_win.cc
++++ b/third_party/crashpad/crashpad/util/net/http_transport_win.cc
+@@ -71,6 +71,8 @@ std::string UserAgent() {
+     user_agent.append("x64");
+ #elif defined(ARCH_CPU_ARM64)
+     user_agent.append("arm64");
++#elif defined(ARCH_CPU_ARMEL)
++    user_agent.append("arm");
+ #else
+ #error Port
+ #endif
+diff --git a/third_party/crashpad/crashpad/util/win/context_wrappers.h b/third_party/crashpad/crashpad/util/win/context_wrappers.h
+index 4d6f58c..e9dc9b8 100644
+--- a/third_party/crashpad/crashpad/util/win/context_wrappers.h
++++ b/third_party/crashpad/crashpad/util/win/context_wrappers.h
+@@ -28,7 +28,7 @@ inline void* ProgramCounterFromCONTEXT(const CONTEXT* context) {
+   return reinterpret_cast<void*>(context->Eip);
+ #elif defined(ARCH_CPU_X86_64)
+   return reinterpret_cast<void*>(context->Rip);
+-#elif defined(ARCH_CPU_ARM64)
++#elif defined(ARCH_CPU_ARM64) || defined(ARCH_CPU_ARMEL)
+   return reinterpret_cast<void*>(context->Pc);
+ #else
+ #error Unsupported Windows Arch

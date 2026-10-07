@@ -1,0 +1,16 @@
+{
+ "wheel-png": "def8a2af",
+ "wheel-gif": "5da87330",
+ "wheel-webp": "5e1ade54",
+ "wheel-avif": "dd41dfd2",
+ "jpeg-baseline-420": "ddc1f575",
+ "jpeg-444-islow": "49309f9c",
+ "jpeg-422-ifast-opt": "674a6a47",
+ "jpeg-420-islow-prog": "0e3c4b37",
+ "jpeg-3x2-ifast-prog": "e5bf222b",
+ "jpeg-gray-islow": "050c1b05",
+ "webp-lossy": "27ec218f",
+ "avif-8bit": "0828204e",
+ "avif-10bit": "5514bfc8",
+ "avif-8bit-icc": "745c3ffd"
+}

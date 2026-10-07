@@ -1,0 +1,65 @@
+Venetium 0022 - Windows ARM32 link and platform misc.
+
+BATCH-ARM-1 section 3F, his decision 7 (ARM-1-DECISIONS.md); the three V8 _AddressOfReturnAddress sites live in Venetium 0018. 3 files:
+- content/browser/BUILD.gn: dinput8.lib is not linked for current_cpu == "arm" (no ARM32 import lib in SDK 19041; the only lib named by
+  the graph that has none). out/arm-rt21's chrome_dll link no longer lists it; x86 unchanged.
+- chrome/BUILD.gn: the small initial stack (/STACK:0x80000) for arm as for x86 - Windows ARM32 is a 32-bit build too, and
+  chrome_exe_main_win.cc already moves its main thread to a 1.5 MiB fiber under ARCH_CPU_32_BITS (it was 0x800000 = 8 MiB on arm).
+- third_party/blink/renderer/platform/wtf/stack_util.cc: GetCurrentStackPosition takes __builtin_frame_address(0) on Windows ARM32
+  (clang-cl defines _MSC_VER; _AddressOfReturnAddress is an unresolved external for thumbv7 - TOOLCHAIN-ISSUES B2), and
+  GetStackStartImpl gets its missing ARM32 branch (NT_TIB StackBase; it did not compile: non-void function without a return).
+Checked (RUNTIME, real arm-rt21 graph after gn gen): stack_util.obj compiles as ARMNT with no _AddressOfReturnAddress reference;
+chrome_initial links with /STACK:0x80000; dinput8 gone from chrome_dll's arm libs.
+
+rt2.1-fix v2: the GetCurrentStackPosition hunk is dropped (B2 -> LLVM 0012 + 0020); the GetStackStartImpl ARM32 branch stays.
+
+diff --git a/chrome/BUILD.gn b/chrome/BUILD.gn
+index 0bd5d23..896a449 100644
+--- a/chrome/BUILD.gn
++++ b/chrome/BUILD.gn
+@@ -257,7 +257,10 @@ if (!is_android && !is_mac) {
+         "//build/config/win:delayloads_not_for_child_dll",
+       ]
+ 
+-      if (current_cpu == "x86") {
++      # Venetium 0022: Windows ARM32 is a 32-bit build too (chrome_exe_main_win.cc
++      # moves its main thread to a fiber under ARCH_CPU_32_BITS), so it gets the
++      # same small initial stack as x86.
++      if (current_cpu == "x86" || current_cpu == "arm") {
+         # Set the initial stack size to 0.5MiB, instead of the 1.5MiB needed by
+         # Chrome's main thread. This saves significant memory on threads (like
+         # those in the Windows thread pool, and others) whose stack size we can
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+index d8b6077..9f224d9 100644
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -3217,9 +3217,13 @@ source_set("browser") {
+       "//third_party/isimpledom",
+       "//third_party/wtl",
+     ]
++    libs += [ "comctl32.lib" ]
++    if (current_cpu != "arm") {
++      # Venetium 0022: the Windows SDK ships no ARM32 dinput8.lib
++      # (Lib/<ver>/um/arm); nothing in the tree uses DirectInput.
++      libs += [ "dinput8.lib" ]
++    }
+     libs += [
+-      "comctl32.lib",
+-      "dinput8.lib",
+       "dwmapi.lib",
+       "dxguid.lib",
+       "imm32.lib",
+diff --git a/third_party/blink/renderer/platform/wtf/stack_util.cc b/third_party/blink/renderer/platform/wtf/stack_util.cc
+index f9e1600..88a8e84 100644
+--- a/third_party/blink/renderer/platform/wtf/stack_util.cc
++++ b/third_party/blink/renderer/platform/wtf/stack_util.cc
+@@ -149,7 +149,8 @@ void* GetStackStartImpl() {
+ #if defined(ARCH_CPU_X86_64)
+   return reinterpret_cast<void*>(
+       reinterpret_cast<NT_TIB64*>(NtCurrentTeb())->StackBase);
+-#elif defined(ARCH_CPU_X86)
++#elif defined(ARCH_CPU_X86) || defined(ARCH_CPU_ARMEL)
++  // Venetium 0022: Windows ARM32 has the 32-bit NT_TIB layout, like x86.
+   return reinterpret_cast<void*>(
+       reinterpret_cast<NT_TIB*>(NtCurrentTeb())->StackBase);
+ #elif defined(ARCH_CPU_ARM64)

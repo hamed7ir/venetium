@@ -1,0 +1,1560 @@
+Venetium 0041 - hardware H.264 decoding when ANGLE runs on Direct3D 9 (no D3D11 device), e.g. Windows ARM32 Tegra 3/4
+(BATCH MEDIA-1). cr150 deleted the D3D9 DXVA decoder and D3D11VideoDecoder needs a D3D11 device ANGLE never has on arm, so every
+codec was software-decoded. media::DXVAVideoDecoder ports Chromium 77's DXVAVideoDecodeAccelerator D3D9 path: CMSH264DecoderMFT
+from msmpeg2vdec.dll (DllGetClassObject) + IDirect3DDeviceManager9 on ANGLE's own D3D9Ex device (D3DCREATE_MULTITHREADED), each
+NV12 output StretchRect'ed into an X8R8G8B8 share-handle texture that ANGLE samples via an EGL pbuffer bound once to a GL texture
+wrapped as a SharedImage (new GLTextureImageBacking::InitializeWithExternalPassthroughTexture + GpuChannelSharedImageInterface::
+CreateSharedImageForD3D9Video). Per-device DXVA2 probe (H.264 VLD + NV12 + 1080p/720p config) decides support; any init failure
+falls back to software. GpuMojoMediaClientWin uses it only when there is no D3D11 device (x86/x64 D3D11 paths unchanged) and
+guards the D3D12 CHECK on a null device; mf_initializer preloads msmpeg2vdec.dll + dxva2.dll before the sandbox. Frames are XRGB
+(opaque) with power_efficient set. Reports VideoDecoderType::kVda: chrome://media-internals shows VDAVideoDecoder.
+
+--- /dev/null
++++ b/media/gpu/windows/dxva_video_decoder.h
+@@ -0,0 +1,174 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Venetium 0041: hardware H.264 decoding for Windows systems whose ANGLE runs
++// on Direct3D 9 (no D3D11 device), e.g. Windows 10 ARM32 on NVIDIA Tegra 3/4.
++// D3D11VideoDecoder needs a D3D11 device from ANGLE, so on these systems every
++// codec fell back to software. This decoder is the D3D9 / Media Foundation path
++// of Chromium 77's DXVAVideoDecodeAccelerator (CMSH264DecoderMFT +
++// IDirect3DDeviceManager9 on ANGLE's own D3D9Ex device, StretchRect NV12->RGB
++// into a share-handle texture that ANGLE samples through an EGL pbuffer),
++// re-hosted on the media::VideoDecoder + SharedImage interfaces of this tree.
++
++#ifndef MEDIA_GPU_WINDOWS_DXVA_VIDEO_DECODER_H_
++#define MEDIA_GPU_WINDOWS_DXVA_VIDEO_DECODER_H_
++
++#include <d3d9.h>
++#include <dxva2api.h>
++#include <mfobjects.h>
++#include <mftransform.h>
++#include <wrl/client.h>
++
++#include <memory>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/sequence_checker.h"
++#include "base/task/single_thread_task_runner.h"
++#include "gpu/config/gpu_driver_bug_workarounds.h"
++#include "gpu/config/gpu_preferences.h"
++#include "media/base/supported_video_decoder_config.h"
++#include "media/base/video_decoder.h"
++#include "media/base/video_decoder_config.h"
++#include "media/gpu/command_buffer_helper.h"
++#include "media/gpu/media_gpu_export.h"
++#include "media/gpu/windows/d3d11_video_frame_mailbox_release_helper.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/size.h"
++
++namespace gpu {
++class CommandBufferStub;
++}  // namespace gpu
++
++namespace media {
++
++class MediaLog;
++
++class MEDIA_GPU_EXPORT DXVAVideoDecoder : public VideoDecoder {
++ public:
++  using GetCommandBufferHelperCB =
++      base::RepeatingCallback<scoped_refptr<CommandBufferHelper>()>;
++
++  // Must be called on the GPU main thread.
++  static std::unique_ptr<VideoDecoder> Create(
++      scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner,
++      std::unique_ptr<MediaLog> media_log,
++      const gpu::GpuPreferences& gpu_preferences,
++      const gpu::GpuDriverBugWorkarounds& gpu_workarounds,
++      base::RepeatingCallback<gpu::CommandBufferStub*()> get_stub_cb);
++
++  // Probes this device once (ANGLE D3D9 device, msmpeg2vdec, DXVA2 H.264 VLD,
++  // NV12->RGB conversion, largest decodable size) and returns the H.264
++  // configurations it can decode, or nothing. Must be called on the GPU main
++  // thread.
++  static SupportedVideoDecoderConfigs GetSupportedVideoDecoderConfigs(
++      const gpu::GpuPreferences& gpu_preferences,
++      const gpu::GpuDriverBugWorkarounds& gpu_workarounds);
++
++  DXVAVideoDecoder(const DXVAVideoDecoder&) = delete;
++  DXVAVideoDecoder& operator=(const DXVAVideoDecoder&) = delete;
++  ~DXVAVideoDecoder() override;
++
++  // VideoDecoder implementation:
++  VideoDecoderType GetDecoderType() const override;
++  void Initialize(const VideoDecoderConfig& config,
++                  bool low_delay,
++                  CdmContext* cdm_context,
++                  InitCB init_cb,
++                  const OutputCB& output_cb,
++                  const WaitingCB& waiting_cb) override;
++  void Decode(scoped_refptr<DecoderBuffer> buffer, DecodeCB decode_cb) override;
++  void Reset(base::OnceClosure reset_cb) override;
++  bool NeedsBitstreamConversion() const override;
++  bool CanReadWithoutStalling() const override;
++  int GetMaxDecodeRequests() const override;
++  bool FramesHoldExternalResources() const override;
++
++ private:
++  class PictureBuffer;
++
++  enum class State {
++    kUninitialized,
++    kInitializing,
++    kRunning,
++    kError,
++  };
++
++  DXVAVideoDecoder(scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner,
++                   std::unique_ptr<MediaLog> media_log,
++                   const gpu::GpuDriverBugWorkarounds& gpu_workarounds,
++                   GetCommandBufferHelperCB get_helper_cb);
++
++  // Creates the device manager, the MFT and sets its media types.
++  DecoderStatus InitializeDecoder(const VideoDecoderConfig& config,
++                                  bool low_delay);
++  bool SetOutputTypeNV12();
++  void OnGpuInitComplete(
++      bool success,
++      D3D11VideoFrameMailboxReleaseHelper::ReleaseMailboxCB release_mailbox_cb);
++
++  // Pumps input into and output out of the MFT until it needs more input, a
++  // picture buffer is unavailable, or an error occurs. Re-entered whenever a
++  // picture buffer comes back from the client.
++  void DoDecode();
++
++  // Copies one decoded MFT output sample into a free picture buffer and sends
++  // the resulting VideoFrame to the client. Returns false (and leaves the
++  // sample pending) if no picture buffer is free.
++  bool OutputSample(Microsoft::WRL::ComPtr<IMFSample> sample);
++  bool EnsurePictureBuffers(const gfx::Size& size);
++  scoped_refptr<PictureBuffer> GetFreePictureBuffer();
++  void ReceivePictureBufferFromClient(scoped_refptr<PictureBuffer> buffer);
++
++  void UpdateVisibleRect();
++  void CompleteDecode(DecoderStatus status);
++  void NotifyError(DecoderStatus status, const char* what, HRESULT hr = S_OK);
++
++  std::unique_ptr<MediaLog> media_log_;
++  scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner_;
++  const gpu::GpuDriverBugWorkarounds gpu_workarounds_;
++  GetCommandBufferHelperCB get_helper_cb_;
++  scoped_refptr<D3D11VideoFrameMailboxReleaseHelper> mailbox_release_helper_;
++  D3D11VideoFrameMailboxReleaseHelper::ReleaseMailboxCB release_mailbox_cb_;
++
++  State state_ = State::kUninitialized;
++  VideoDecoderConfig config_;
++  InitCB init_cb_;
++  OutputCB output_cb_;
++
++  // Decode() request in flight: its sample (until ProcessInput accepts it), and
++  // its callback (run asynchronously once accepted, or once a drain finishes).
++  Microsoft::WRL::ComPtr<IMFSample> pending_input_;
++  DecodeCB decode_cb_;
++  bool draining_ = false;
++  // A decoded sample waiting for a free picture buffer. The MFT recycles its
++  // output surfaces, so at most one is held and input is paused meanwhile.
++  Microsoft::WRL::ComPtr<IMFSample> pending_output_;
++
++  Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> device_;  // ANGLE's device.
++  Microsoft::WRL::ComPtr<IDirect3DDeviceManager9> device_manager_;
++  UINT device_manager_reset_token_ = 0;
++  Microsoft::WRL::ComPtr<IMFTransform> decoder_;
++  // The MFT does not allocate input samples; these size ours.
++  DWORD input_min_size_ = 0;
++  DWORD input_alignment_ = 0;
++
++  // EGL config used for the pbuffers (void* keeps EGL headers out of here), and
++  // whether it binds as RGB (X8R8G8B8 textures, as Chromium 77 preferred) or
++  // only as RGBA (A8R8G8B8).
++  void* egl_config_ = nullptr;
++  bool use_rgb_texture_ = true;
++
++  std::vector<scoped_refptr<PictureBuffer>> picture_buffers_;
++  gfx::Rect visible_rect_;
++
++  SEQUENCE_CHECKER(sequence_checker_);
++  base::WeakPtrFactory<DXVAVideoDecoder> weak_factory_{this};
++};
++
++}  // namespace media
++
++#endif  // MEDIA_GPU_WINDOWS_DXVA_VIDEO_DECODER_H_
+--- /dev/null
++++ b/media/gpu/windows/dxva_video_decoder.cc
+@@ -0,0 +1,1099 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifdef UNSAFE_BUFFERS_BUILD
++// Indexes Windows-allocated (CoTaskMem) GUID/format arrays and copies into a
++// locked IMFMediaBuffer, as the Chromium 77 code this is ported from did.
++#pragma allow_unsafe_buffers
++#endif
++
++#include "media/gpu/windows/dxva_video_decoder.h"
++
++#include <evr.h>
++#include <mfapi.h>
++#include <mferror.h>
++#include <mfidl.h>
++#include <wmcodecdsp.h>
++
++#include <algorithm>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/file_version_info.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/memory/ptr_util.h"
++#include "base/memory/ref_counted.h"
++#include "base/memory/ref_counted_delete_on_sequence.h"
++#include "base/strings/stringprintf.h"
++#include "base/task/bind_post_task.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/trace_event/trace_event.h"
++#include "components/viz/common/resources/shared_image_format.h"
++#include "gpu/command_buffer/client/client_shared_image.h"
++#include "gpu/command_buffer/common/shared_image_info.h"
++#include "gpu/command_buffer/common/shared_image_usage.h"
++#include "gpu/ipc/service/command_buffer_stub.h"
++#include "gpu/ipc/service/gpu_channel_shared_image_interface.h"
++#include "gpu/ipc/service/shared_image_stub.h"
++#include "media/base/decoder_buffer.h"
++#include "media/base/media_log.h"
++#include "media/base/video_frame.h"
++#include "media/base/win/mf_helpers.h"
++#include "media/base/win/mf_initializer.h"
++#include "ui/gfx/color_space.h"
++#include "ui/gl/gl_angle_util_win.h"
++#include "ui/gl/gl_bindings.h"
++#include "ui/gl/gl_display.h"
++#include "ui/gl/gl_surface_egl.h"
++#include "ui/gl/scoped_binders.h"
++#include "ui/gl/scoped_restore_texture.h"
++
++namespace media {
++
++namespace {
++
++// GUIDs copied from the Windows SDK 10.0.26100 headers, so this file does not
++// depend on which import library happens to define them.
++// dxva2api.h: DXVA2_ModeH264_E / DXVA2_ModeH264_F (H.264 VLD, no FGT / FGT).
++constexpr GUID kDxva2ModeH264E = {
++    0x1b81be68,
++    0xa0c7,
++    0x11d3,
++    {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}};
++constexpr GUID kDxva2ModeH264F = {
++    0x1b81be69,
++    0xa0c7,
++    0x11d3,
++    {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}};
++// codecapi.h: CODECAPI_AVDecVideoAcceleration_H264, CODECAPI_AVLowLatencyMode.
++constexpr GUID kCodecApiAVDecVideoAccelerationH264 = {
++    0xf7db8a2f,
++    0x4f48,
++    0x4ee8,
++    {0xae, 0x31, 0x8b, 0x6e, 0xbe, 0x55, 0x8a, 0xe2}};
++constexpr GUID kCodecApiAVLowLatencyMode = {
++    0x9c27891a,
++    0xed7a,
++    0x40e1,
++    {0x88, 0xe8, 0xb2, 0x27, 0x27, 0xa0, 0x24, 0xee}};
++
++constexpr D3DFORMAT kNV12 =
++    static_cast<D3DFORMAT>(MAKEFOURCC('N', 'V', '1', '2'));
++
++// Frames the client may hold at once (VideoRendererImpl queues a few ahead of
++// the frame being composited). A 1080p X8R8G8B8 picture is ~8 MB.
++constexpr size_t kNumPictureBuffers = 8;
++// Every output sample is copied out of the MFT before the next one is pulled,
++// but one may be held while waiting for a free picture buffer.
++constexpr UINT32 kMinOutputSamples = 2;
++// Bound on MF_E_TRANSFORM_STREAM_CHANGE renegotiations in one DoDecode() pass.
++constexpr int kMaxStreamChanges = 10;
++// Bound on S_OK-without-a-sample results in one DoDecode() pass.
++constexpr int kMaxNullSamples = 3;
++constexpr gfx::Size kMinDecodeSize(64, 64);
++
++// Holder so that we don't keep creating CommandBufferHelpers every time the
++// callback runs; it can only be created on the GPU main thread. Same as
++// D3D11VideoDecoder's.
++struct CommandBufferHelperHolder
++    : base::RefCountedDeleteOnSequence<CommandBufferHelperHolder> {
++  explicit CommandBufferHelperHolder(
++      scoped_refptr<base::SequencedTaskRunner> task_runner)
++      : base::RefCountedDeleteOnSequence<CommandBufferHelperHolder>(
++            std::move(task_runner)) {}
++
++  CommandBufferHelperHolder(const CommandBufferHelperHolder&) = delete;
++  CommandBufferHelperHolder& operator=(const CommandBufferHelperHolder&) =
++      delete;
++
++  scoped_refptr<CommandBufferHelper> helper;
++
++ private:
++  ~CommandBufferHelperHolder() = default;
++  friend class base::RefCountedDeleteOnSequence<CommandBufferHelperHolder>;
++  friend class base::DeleteHelper<CommandBufferHelperHolder>;
++};
++
++scoped_refptr<CommandBufferHelper> CreateCommandBufferHelper(
++    base::RepeatingCallback<gpu::CommandBufferStub*()> get_stub_cb,
++    scoped_refptr<CommandBufferHelperHolder> holder) {
++  gpu::CommandBufferStub* stub = get_stub_cb.Run();
++  if (!stub) {
++    return nullptr;
++  }
++  DCHECK(holder);
++  if (!holder->helper) {
++    holder->helper = CommandBufferHelper::Create(stub);
++  }
++  return holder->helper;
++}
++
++// Mimics CoCreateInstance without initializing COM on the GPU main thread
++// (Chromium 77, dxva_video_decode_accelerator_win.cc CreateCOMObjectFromDll).
++HRESULT CreateCOMObjectFromDll(HMODULE dll,
++                               const CLSID& clsid,
++                               const IID& iid,
++                               void** object) {
++  if (!dll || !object) {
++    return E_INVALIDARG;
++  }
++  using GetClassObject =
++      HRESULT(WINAPI*)(const CLSID& clsid, const IID& iid, void** object);
++  auto get_class_object = reinterpret_cast<GetClassObject>(
++      ::GetProcAddress(dll, "DllGetClassObject"));
++  if (!get_class_object) {
++    return E_FAIL;
++  }
++  Microsoft::WRL::ComPtr<IClassFactory> factory;
++  HRESULT hr = get_class_object(clsid, IID_PPV_ARGS(&factory));
++  if (FAILED(hr)) {
++    return hr;
++  }
++  return factory->CreateInstance(nullptr, iid, object);
++}
++
++Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> GetAngleD3D9DeviceEx() {
++  Microsoft::WRL::ComPtr<IDirect3DDevice9> device =
++      gl::QueryD3D9DeviceObjectFromANGLE();
++  Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> device_ex;
++  if (!device || FAILED(device.As(&device_ex))) {
++    return nullptr;
++  }
++  return device_ex;
++}
++
++// Probes this GPU process's ANGLE D3D9 device once: msmpeg2vdec.dll preloaded,
++// NV12 -> X8R8G8B8 StretchRect supported, a DXVA2 H.264 VLD mode with NV12
++// render targets, and the largest of 1920x1088 / 1280x720 the driver offers a
++// decoder configuration for. Returns an empty size if any step fails. Tegra 3
++// and Tegra 4 (and any other D3D9-only GPU) are told apart only by what their
++// drivers answer here, never by vendor or device id.
++gfx::Size ProbeMaxDecodeSize() {
++  static const gfx::Size kMaxSize = []() -> gfx::Size {
++    Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> device = GetAngleD3D9DeviceEx();
++    if (!device) {
++      VLOG(1) << "DXVAVideoDecoder: no ANGLE D3D9Ex device";
++      return gfx::Size();
++    }
++    if (!::GetModuleHandle(L"msmpeg2vdec.dll")) {
++      VLOG(1) << "DXVAVideoDecoder: msmpeg2vdec.dll was not preloaded";
++      return gfx::Size();
++    }
++    Microsoft::WRL::ComPtr<IDirect3D9> d3d9;
++    D3DDEVICE_CREATION_PARAMETERS params = {};
++    if (FAILED(device->GetDirect3D(&d3d9)) ||
++        FAILED(device->GetCreationParameters(&params))) {
++      return gfx::Size();
++    }
++    HRESULT hr = d3d9->CheckDeviceFormatConversion(
++        params.AdapterOrdinal, params.DeviceType, kNV12, D3DFMT_X8R8G8B8);
++    if (FAILED(hr)) {
++      VLOG(1) << "DXVAVideoDecoder: no NV12->X8R8G8B8 conversion, hr=0x"
++              << std::hex << hr;
++      return gfx::Size();
++    }
++    Microsoft::WRL::ComPtr<IDirectXVideoDecoderService> service;
++    hr = DXVA2CreateVideoService(device.Get(), IID_PPV_ARGS(&service));
++    if (FAILED(hr)) {
++      VLOG(1) << "DXVAVideoDecoder: DXVA2CreateVideoService failed, hr=0x"
++              << std::hex << hr;
++      return gfx::Size();
++    }
++    UINT guid_count = 0;
++    GUID* guids = nullptr;
++    if (FAILED(service->GetDecoderDeviceGuids(&guid_count, &guids))) {
++      return gfx::Size();
++    }
++    GUID mode = GUID_NULL;
++    for (UINT i = 0; i < guid_count; ++i) {
++      if (guids[i] == kDxva2ModeH264E || guids[i] == kDxva2ModeH264F) {
++        mode = guids[i];
++        break;
++      }
++    }
++    ::CoTaskMemFree(guids);
++    if (mode == GUID_NULL) {
++      VLOG(1) << "DXVAVideoDecoder: driver has no DXVA2 H.264 VLD mode";
++      return gfx::Size();
++    }
++    UINT format_count = 0;
++    D3DFORMAT* formats = nullptr;
++    if (FAILED(
++            service->GetDecoderRenderTargets(mode, &format_count, &formats))) {
++      return gfx::Size();
++    }
++    bool has_nv12 = false;
++    for (UINT i = 0; i < format_count; ++i) {
++      has_nv12 |= formats[i] == kNV12;
++    }
++    ::CoTaskMemFree(formats);
++    if (!has_nv12) {
++      VLOG(1) << "DXVAVideoDecoder: H.264 VLD mode has no NV12 render target";
++      return gfx::Size();
++    }
++    for (const gfx::Size size : {gfx::Size(1920, 1088), gfx::Size(1280, 720)}) {
++      DXVA2_VideoDesc desc = {};
++      desc.SampleWidth = size.width();
++      desc.SampleHeight = size.height();
++      desc.Format = kNV12;
++      desc.SampleFormat.SampleFormat = DXVA2_SampleProgressiveFrame;
++      desc.InputSampleFreq = {30, 1};
++      desc.OutputFrameFreq = {30, 1};
++      UINT config_count = 0;
++      DXVA2_ConfigPictureDecode* configs = nullptr;
++      hr = service->GetDecoderConfigurations(mode, &desc, nullptr,
++                                             &config_count, &configs);
++      ::CoTaskMemFree(configs);
++      if (SUCCEEDED(hr) && config_count > 0) {
++        VLOG(1) << "DXVAVideoDecoder: hardware H.264 up to "
++                << size.ToString();
++        return size;
++      }
++    }
++    VLOG(1) << "DXVAVideoDecoder: no H.264 decoder configuration";
++    return gfx::Size();
++  }();
++  return kMaxSize;
++}
++
++// Picks the pbuffer EGLConfig the way Chromium 77 did: 8-bit RGB, no alpha,
++// pbuffer-capable; RGB binding decides X8R8G8B8 vs A8R8G8B8 textures.
++bool ChooseEglConfig(EGLDisplay display,
++                     EGLConfig* config_out,
++                     bool* use_rgb_out) {
++  const EGLint attribs[] = {EGL_BUFFER_SIZE,  32, EGL_RED_SIZE,     8,
++                            EGL_GREEN_SIZE,   8,  EGL_BLUE_SIZE,    8,
++                            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,  EGL_ALPHA_SIZE,
++                            0,                EGL_NONE};
++  EGLint num_configs = 0;
++  if (!eglChooseConfig(display, attribs, nullptr, 0, &num_configs) ||
++      num_configs <= 0) {
++    return false;
++  }
++  std::vector<EGLConfig> configs(num_configs);
++  if (!eglChooseConfig(display, attribs, configs.data(), num_configs,
++                       &num_configs) ||
++      num_configs <= 0) {
++    return false;
++  }
++  EGLConfig chosen = configs[0];
++  for (EGLint i = 0; i < num_configs; ++i) {
++    EGLint red_bits = 0;
++    eglGetConfigAttrib(display, configs[i], EGL_RED_SIZE, &red_bits);
++    if (red_bits == 8) {
++      chosen = configs[i];
++      break;
++    }
++  }
++  EGLint bind_rgb = EGL_TRUE;
++  eglGetConfigAttrib(display, chosen, EGL_BIND_TO_TEXTURE_RGB, &bind_rgb);
++  *config_out = chosen;
++  *use_rgb_out = bind_rgb == EGL_TRUE;
++  return true;
++}
++
++// Runs from ~GLTextureImageBacking, before the GL texture is deleted.
++void ReleasePbuffer(EGLDisplay display, EGLSurface pbuffer, bool have_context) {
++  if (have_context) {
++    eglReleaseTexImage(display, pbuffer, EGL_BACK_BUFFER);
++  }
++  eglDestroySurface(display, pbuffer);
++}
++
++}  // namespace
++
++// One output picture: an RGB render-target texture on ANGLE's D3D9 device,
++// opened by ANGLE through its share handle as an EGL pbuffer, bound once to a
++// GL texture that a SharedImage wraps. The pbuffer stays bound for the
++// SharedImage's whole life: in this tree's ANGLE, eglReleaseTexImage empties the
++// texture, and viz keeps its read access open across frames, so Chromium 77's
++// per-frame bind/release cannot be used.
++class DXVAVideoDecoder::PictureBuffer
++    : public base::RefCounted<DXVAVideoDecoder::PictureBuffer> {
++ public:
++  PictureBuffer() = default;
++  PictureBuffer(const PictureBuffer&) = delete;
++  PictureBuffer& operator=(const PictureBuffer&) = delete;
++
++  bool Init(CommandBufferHelper* helper,
++            IDirect3DDevice9Ex* device,
++            EGLConfig egl_config,
++            bool use_rgb_texture,
++            const gfx::Size& size) {
++    size_ = size;
++    gpu::SharedImageStub* stub = helper->GetSharedImageStub();
++    if (!stub || !stub->MakeContextCurrent(/*needs_gl=*/true)) {
++      LOG(ERROR) << "DXVAVideoDecoder: cannot make the GL context current";
++      return false;
++    }
++
++    HANDLE share_handle = nullptr;
++    HRESULT hr = device->CreateTexture(
++        size.width(), size.height(), 1, D3DUSAGE_RENDERTARGET,
++        use_rgb_texture ? D3DFMT_X8R8G8B8 : D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
++        &texture_, &share_handle);
++    if (FAILED(hr) || !share_handle) {
++      LOG(ERROR) << "DXVAVideoDecoder: CreateTexture failed, hr=0x" << std::hex
++                 << hr;
++      return false;
++    }
++    hr = texture_->GetSurfaceLevel(0, &surface_);
++    if (FAILED(hr)) {
++      return false;
++    }
++
++    EGLDisplay display = gl::GLSurfaceEGL::GetGLDisplayEGL()->GetDisplay();
++    const EGLint attribs[] = {EGL_WIDTH,
++                              size.width(),
++                              EGL_HEIGHT,
++                              size.height(),
++                              EGL_TEXTURE_FORMAT,
++                              use_rgb_texture ? EGL_TEXTURE_RGB
++                                              : EGL_TEXTURE_RGBA,
++                              EGL_TEXTURE_TARGET,
++                              EGL_TEXTURE_2D,
++                              EGL_NONE};
++    EGLSurface pbuffer = eglCreatePbufferFromClientBuffer(
++        display, EGL_D3D_TEXTURE_2D_SHARE_HANDLE_ANGLE, share_handle,
++        egl_config, attribs);
++    if (pbuffer == EGL_NO_SURFACE) {
++      LOG(ERROR) << "DXVAVideoDecoder: eglCreatePbufferFromClientBuffer failed"
++                 << ", egl error 0x" << std::hex << eglGetError();
++      return false;
++    }
++
++    // A mutable texture (no glTexStorage): ANGLE refuses to bind a pbuffer to
++    // an immutable one.
++    gl::GLApi* api = gl::g_current_gl_context;
++    GLuint texture_id = 0;
++    {
++      gl::ScopedActiveTexture active_texture(GL_TEXTURE0);
++      gl::ScopedRestoreTexture restore_texture(api, GL_TEXTURE_2D);
++      api->glGenTexturesFn(1, &texture_id);
++      api->glBindTextureFn(GL_TEXTURE_2D, texture_id);
++      api->glTexParameteriFn(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++      api->glTexParameteriFn(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++      api->glTexParameteriFn(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
++                             GL_CLAMP_TO_EDGE);
++      api->glTexParameteriFn(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
++                             GL_CLAMP_TO_EDGE);
++      if (!eglBindTexImage(display, pbuffer, EGL_BACK_BUFFER)) {
++        LOG(ERROR) << "DXVAVideoDecoder: eglBindTexImage failed, egl error 0x"
++                   << std::hex << eglGetError();
++        api->glDeleteTexturesFn(1, &texture_id);
++        eglDestroySurface(display, pbuffer);
++        return false;
++      }
++    }
++
++    // From here on the SharedImage backing owns `texture_id` and releases the
++    // pbuffer before deleting it.
++    gpu::SharedImageInfo si_info(
++        viz::SinglePlaneFormat::kBGRA_8888, size, gfx::ColorSpace::CreateSRGB(),
++        gpu::SHARED_IMAGE_USAGE_GLES2_READ | gpu::SHARED_IMAGE_USAGE_RASTER_READ |
++            gpu::SHARED_IMAGE_USAGE_DISPLAY_READ,
++        "DXVAVideoDecoderPicture");
++    shared_image_ = stub->shared_image_interface()->CreateSharedImageForD3D9Video(
++        si_info, texture_id, base::BindOnce(&ReleasePbuffer, display, pbuffer));
++    if (!shared_image_) {
++      LOG(ERROR) << "DXVAVideoDecoder: CreateSharedImageForD3D9Video failed";
++      return false;
++    }
++    return true;
++  }
++
++  IDirect3DSurface9* d3d_surface() const { return surface_.Get(); }
++  const scoped_refptr<gpu::ClientSharedImage>& shared_image() const {
++    return shared_image_;
++  }
++  const gfx::Size& size() const { return size_; }
++  bool in_client_use() const { return in_client_use_; }
++  void set_in_client_use(bool in_client_use) { in_client_use_ = in_client_use; }
++
++ private:
++  friend class base::RefCounted<PictureBuffer>;
++  ~PictureBuffer() = default;
++
++  gfx::Size size_;
++  Microsoft::WRL::ComPtr<IDirect3DTexture9> texture_;
++  Microsoft::WRL::ComPtr<IDirect3DSurface9> surface_;
++  scoped_refptr<gpu::ClientSharedImage> shared_image_;
++  bool in_client_use_ = false;
++};
++
++// static
++std::unique_ptr<VideoDecoder> DXVAVideoDecoder::Create(
++    scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner,
++    std::unique_ptr<MediaLog> media_log,
++    const gpu::GpuPreferences& gpu_preferences,
++    const gpu::GpuDriverBugWorkarounds& gpu_workarounds,
++    base::RepeatingCallback<gpu::CommandBufferStub*()> get_stub_cb) {
++  auto get_helper_cb = base::BindRepeating(
++      CreateCommandBufferHelper, std::move(get_stub_cb),
++      base::MakeRefCounted<CommandBufferHelperHolder>(gpu_task_runner));
++  return base::WrapUnique<VideoDecoder>(
++      new DXVAVideoDecoder(std::move(gpu_task_runner), std::move(media_log),
++                           gpu_workarounds, std::move(get_helper_cb)));
++}
++
++// static
++SupportedVideoDecoderConfigs DXVAVideoDecoder::GetSupportedVideoDecoderConfigs(
++    const gpu::GpuPreferences& gpu_preferences,
++    const gpu::GpuDriverBugWorkarounds& gpu_workarounds) {
++  SupportedVideoDecoderConfigs configs;
++  if (gpu_preferences.disable_accelerated_video_decode ||
++      gpu_workarounds.disable_accelerated_h264_decode) {
++    return configs;
++  }
++  const gfx::Size max_size = ProbeMaxDecodeSize();
++  if (max_size.IsEmpty()) {
++    return configs;
++  }
++  // msmpeg2vdec handles Baseline, Main and High (not Extended), as in
++  // Chromium 77's kSupportedProfiles.
++  configs.emplace_back(H264PROFILE_BASELINE, H264PROFILE_MAIN, kMinDecodeSize,
++                       max_size, /*allow_encrypted=*/false,
++                       /*require_encrypted=*/false);
++  configs.emplace_back(H264PROFILE_HIGH, H264PROFILE_HIGH, kMinDecodeSize,
++                       max_size, /*allow_encrypted=*/false,
++                       /*require_encrypted=*/false);
++  return configs;
++}
++
++DXVAVideoDecoder::DXVAVideoDecoder(
++    scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner,
++    std::unique_ptr<MediaLog> media_log,
++    const gpu::GpuDriverBugWorkarounds& gpu_workarounds,
++    GetCommandBufferHelperCB get_helper_cb)
++    : media_log_(std::move(media_log)),
++      gpu_task_runner_(std::move(gpu_task_runner)),
++      gpu_workarounds_(gpu_workarounds),
++      get_helper_cb_(std::move(get_helper_cb)),
++      mailbox_release_helper_(
++          base::MakeRefCounted<D3D11VideoFrameMailboxReleaseHelper>(
++              media_log_->Clone(),
++              get_helper_cb_)) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++}
++
++DXVAVideoDecoder::~DXVAVideoDecoder() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (decoder_) {
++    decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
++  }
++  // Picture buffers still held by the client stay alive through their release
++  // callbacks; their SharedImages are destroyed when those run.
++  picture_buffers_.clear();
++}
++
++VideoDecoderType DXVAVideoDecoder::GetDecoderType() const {
++  // Reuses the "VDA" type (only ChromeOS code special-cases it): this is
++  // Chromium 77's DXVA VideoDecodeAccelerator logic. chrome://media-internals
++  // shows it as VDAVideoDecoder.
++  return VideoDecoderType::kVda;
++}
++
++void DXVAVideoDecoder::Initialize(const VideoDecoderConfig& config,
++                                  bool low_delay,
++                                  CdmContext* cdm_context,
++                                  InitCB init_cb,
++                                  const OutputCB& output_cb,
++                                  const WaitingCB& waiting_cb) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  TRACE_EVENT0("gpu", "DXVAVideoDecoder::Initialize");
++
++  // On D3D9 the media service lives on the GPU main thread (there is no
++  // dedicated media thread without a D3D11 device). GL, EGL and SharedImage
++  // work below relies on that.
++  if (!gpu_task_runner_->BelongsToCurrentThread()) {
++    std::move(init_cb).Run(DecoderStatus(
++        DecoderStatus::Codes::kFailedToCreateDecoder,
++        "DXVAVideoDecoder must run on the GPU main thread"));
++    return;
++  }
++  if (config.is_encrypted()) {
++    std::move(init_cb).Run(DecoderStatus::Codes::kUnsupportedEncryptionMode);
++    return;
++  }
++  if (config.codec() != VideoCodec::kH264 ||
++      (config.profile() != H264PROFILE_BASELINE &&
++       config.profile() != H264PROFILE_MAIN &&
++       config.profile() != H264PROFILE_HIGH)) {
++    std::move(init_cb).Run(DecoderStatus::Codes::kUnsupportedProfile);
++    return;
++  }
++
++  // Reinitialization drops everything in flight.
++  DCHECK(!decode_cb_);
++  pending_input_.Reset();
++  pending_output_.Reset();
++  draining_ = false;
++  decoder_.Reset();
++  device_manager_.Reset();
++
++  config_ = config;
++  output_cb_ = output_cb;
++  visible_rect_ = config.visible_rect();
++
++  DecoderStatus status = InitializeDecoder(config, low_delay);
++  if (!status.is_ok()) {
++    MEDIA_LOG(INFO, media_log_)
++        << "DXVAVideoDecoder: hardware H.264 unavailable ("
++        << status.message() << "); software decoding will be used";
++    state_ = State::kUninitialized;
++    decoder_.Reset();
++    device_manager_.Reset();
++    std::move(init_cb).Run(std::move(status));
++    return;
++  }
++
++  MEDIA_LOG(INFO, media_log_)
++      << "Video is supported by DXVAVideoDecoder (D3D9 + Media Foundation)";
++  state_ = State::kInitializing;
++  init_cb_ = std::move(init_cb);
++  if (release_mailbox_cb_) {
++    OnGpuInitComplete(true, release_mailbox_cb_);
++    return;
++  }
++  mailbox_release_helper_->Initialize(base::BindOnce(
++      &DXVAVideoDecoder::OnGpuInitComplete, weak_factory_.GetWeakPtr()));
++}
++
++DecoderStatus DXVAVideoDecoder::InitializeDecoder(
++    const VideoDecoderConfig& config,
++    bool low_delay) {
++  auto fail = [](const std::string& what, HRESULT hr = S_OK) {
++    std::string message = "DXVAVideoDecoder: " + what;
++    if (FAILED(hr)) {
++      message += base::StringPrintf(" (hr=0x%08lx)", static_cast<long>(hr));
++    }
++    return DecoderStatus(DecoderStatus::Codes::kFailedToCreateDecoder,
++                         message);
++  };
++
++  if (!InitializeMediaFoundation()) {
++    return fail("Media Foundation unavailable");
++  }
++
++  device_ = GetAngleD3D9DeviceEx();
++  if (!device_) {
++    return fail("no ANGLE D3D9Ex device");
++  }
++
++  gl::GLDisplayEGL* display = gl::GLSurfaceEGL::GetGLDisplayEGL();
++  if (!display || !display->ext->b_EGL_ANGLE_surface_d3d_texture_2d_share_handle) {
++    return fail("EGL_ANGLE_surface_d3d_texture_2d_share_handle unavailable");
++  }
++  if (!egl_config_) {
++    EGLConfig egl_config = nullptr;
++    bool use_rgb = true;
++    if (!ChooseEglConfig(display->GetDisplay(), &egl_config, &use_rgb)) {
++      return fail("no suitable pbuffer EGLConfig");
++    }
++    egl_config_ = egl_config;
++    use_rgb_texture_ = use_rgb;
++    MEDIA_LOG(INFO, media_log_)
++        << "DXVAVideoDecoder: pictures are "
++        << (use_rgb ? "X8R8G8B8 / EGL_TEXTURE_RGB"
++                    : "A8R8G8B8 / EGL_TEXTURE_RGBA");
++  }
++
++  // The decoder MFT comes from msmpeg2vdec.dll, preloaded before the sandbox
++  // (media::PreSandboxMediaFoundationInitialization).
++  HMODULE dll = ::GetModuleHandle(L"msmpeg2vdec.dll");
++  if (!dll) {
++    return fail("msmpeg2vdec.dll was not preloaded");
++  }
++  // Windows 7's 6.1.7140 crashes a lot (crbug.com/403440), as in Chromium 77.
++  std::unique_ptr<FileVersionInfo> version_info =
++      FileVersionInfo::CreateFileVersionInfoForModule(dll);
++  if (!version_info) {
++    return fail("cannot read the msmpeg2vdec.dll version");
++  }
++  if (version_info->file_version().find(u"6.1.7140") != std::u16string::npos) {
++    return fail("blocklisted msmpeg2vdec.dll 6.1.7140");
++  }
++
++  HRESULT hr = CreateCOMObjectFromDll(dll, __uuidof(CMSH264DecoderMFT),
++                                      IID_PPV_ARGS(&decoder_));
++  if (FAILED(hr)) {
++    return fail("cannot create CMSH264DecoderMFT", hr);
++  }
++
++  Microsoft::WRL::ComPtr<IMFAttributes> attributes;
++  hr = decoder_->GetAttributes(&attributes);
++  if (FAILED(hr)) {
++    return fail("IMFTransform::GetAttributes", hr);
++  }
++  UINT32 d3d_aware = 0;
++  hr = attributes->GetUINT32(MF_SA_D3D_AWARE, &d3d_aware);
++  if (FAILED(hr) || !d3d_aware) {
++    return fail("decoder MFT is not D3D aware", hr);
++  }
++  hr = attributes->SetUINT32(kCodecApiAVDecVideoAccelerationH264, TRUE);
++  if (FAILED(hr)) {
++    return fail("cannot enable DXVA H.264 acceleration", hr);
++  }
++  if (low_delay) {
++    attributes->SetUINT32(kCodecApiAVLowLatencyMode, TRUE);
++  }
++  attributes->SetUINT32(MF_SA_MINIMUM_OUTPUT_SAMPLE_COUNT, kMinOutputSamples);
++  attributes->SetUINT32(MF_SA_MINIMUM_OUTPUT_SAMPLE_COUNT_PROGRESSIVE,
++                        kMinOutputSamples);
++
++  // Decode on ANGLE's own D3D9Ex device (created D3DCREATE_MULTITHREADED), as
++  // Chromium 77 did whenever ANGLE ran on D3D9: decoder surfaces, the
++  // StretchRect and ANGLE's draws then share one in-order command stream, so no
++  // cross-device synchronization is needed.
++  hr = DXVA2CreateDirect3DDeviceManager9(&device_manager_reset_token_,
++                                         &device_manager_);
++  if (FAILED(hr)) {
++    return fail("DXVA2CreateDirect3DDeviceManager9", hr);
++  }
++  hr = device_manager_->ResetDevice(device_.Get(), device_manager_reset_token_);
++  if (FAILED(hr)) {
++    return fail("IDirect3DDeviceManager9::ResetDevice", hr);
++  }
++  hr = decoder_->ProcessMessage(
++      MFT_MESSAGE_SET_D3D_MANAGER,
++      reinterpret_cast<ULONG_PTR>(device_manager_.Get()));
++  if (FAILED(hr)) {
++    return fail("MFT rejected the D3D9 device manager (no DXVA H.264)", hr);
++  }
++
++  Microsoft::WRL::ComPtr<IMFMediaType> input_type;
++  hr = MFCreateMediaType(&input_type);
++  if (FAILED(hr)) {
++    return fail("MFCreateMediaType", hr);
++  }
++  input_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
++  input_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
++  input_type->SetUINT32(MF_MT_INTERLACE_MODE,
++                        MFVideoInterlace_MixedInterlaceOrProgressive);
++  hr = decoder_->SetInputType(0, input_type.Get(), 0);
++  if (FAILED(hr)) {
++    return fail("SetInputType(H.264)", hr);
++  }
++  if (!SetOutputTypeNV12()) {
++    return fail("decoder offers no NV12 output");
++  }
++
++  MFT_INPUT_STREAM_INFO input_info = {};
++  hr = decoder_->GetInputStreamInfo(0, &input_info);
++  if (FAILED(hr)) {
++    return fail("GetInputStreamInfo", hr);
++  }
++  input_min_size_ = input_info.cbSize;
++  input_alignment_ = input_info.cbAlignment;
++
++  // With DXVA active the MFT allocates its own (D3D surface) output samples.
++  // Chromium 77 CHECKed this (0x107); here it is a soft failure, so a driver
++  // that silently falls back to software decode in the MFT just means the
++  // regular software decoders are used instead.
++  MFT_OUTPUT_STREAM_INFO output_info = {};
++  hr = decoder_->GetOutputStreamInfo(0, &output_info);
++  if (FAILED(hr)) {
++    return fail("GetOutputStreamInfo", hr);
++  }
++  if (!(output_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
++    return fail(base::StringPrintf(
++        "MFT is not decoding through DXVA (output flags 0x%lx)",
++        static_cast<unsigned long>(output_info.dwFlags)));
++  }
++
++  hr = decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
++  if (FAILED(hr)) {
++    return fail("MFT_MESSAGE_NOTIFY_BEGIN_STREAMING", hr);
++  }
++  hr = decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
++  if (FAILED(hr)) {
++    return fail("MFT_MESSAGE_NOTIFY_START_OF_STREAM", hr);
++  }
++  return DecoderStatus::Codes::kOk;
++}
++
++bool DXVAVideoDecoder::SetOutputTypeNV12() {
++  for (DWORD i = 0;; ++i) {
++    Microsoft::WRL::ComPtr<IMFMediaType> type;
++    HRESULT hr = decoder_->GetOutputAvailableType(0, i, &type);
++    if (hr == MF_E_NO_MORE_TYPES || FAILED(hr)) {
++      return false;
++    }
++    GUID subtype = GUID_NULL;
++    if (FAILED(type->GetGUID(MF_MT_SUBTYPE, &subtype)) ||
++        subtype != MFVideoFormat_NV12) {
++      continue;
++    }
++    if (FAILED(decoder_->SetOutputType(0, type.Get(), 0))) {
++      return false;
++    }
++    UpdateVisibleRect();
++    return true;
++  }
++}
++
++void DXVAVideoDecoder::UpdateVisibleRect() {
++  Microsoft::WRL::ComPtr<IMFMediaType> type;
++  if (FAILED(decoder_->GetOutputCurrentType(0, &type))) {
++    return;
++  }
++  MFVideoArea area = {};
++  if (SUCCEEDED(type->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE,
++                              reinterpret_cast<UINT8*>(&area), sizeof(area),
++                              nullptr)) &&
++      area.Area.cx > 0 && area.Area.cy > 0) {
++    visible_rect_ = gfx::Rect(area.OffsetX.value, area.OffsetY.value,
++                              area.Area.cx, area.Area.cy);
++    return;
++  }
++  UINT32 width = 0;
++  UINT32 height = 0;
++  if (SUCCEEDED(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &width,
++                                   &height)) &&
++      width && height) {
++    visible_rect_ = gfx::Rect(width, height);
++  }
++}
++
++void DXVAVideoDecoder::OnGpuInitComplete(
++    bool success,
++    D3D11VideoFrameMailboxReleaseHelper::ReleaseMailboxCB release_mailbox_cb) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!init_cb_) {
++    return;
++  }
++  if (!success) {
++    state_ = State::kError;
++    std::move(init_cb_).Run(DecoderStatus(
++        DecoderStatus::Codes::kFailedToCreateDecoder,
++        "DXVAVideoDecoder: could not initialize the GPU-side release helper"));
++    return;
++  }
++  release_mailbox_cb_ = std::move(release_mailbox_cb);
++  state_ = State::kRunning;
++  std::move(init_cb_).Run(DecoderStatus::Codes::kOk);
++}
++
++void DXVAVideoDecoder::Decode(scoped_refptr<DecoderBuffer> buffer,
++                              DecodeCB decode_cb) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  TRACE_EVENT0("gpu", "DXVAVideoDecoder::Decode");
++  DCHECK(!decode_cb_) << "GetMaxDecodeRequests() is 1";
++
++  decode_cb_ = base::BindPostTaskToCurrentDefault(std::move(decode_cb));
++  if (state_ != State::kRunning) {
++    CompleteDecode(DecoderStatus::Codes::kPlatformDecodeFailure);
++    return;
++  }
++
++  if (buffer->end_of_stream()) {
++    draining_ = true;
++    decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
++    HRESULT hr = decoder_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
++    if (FAILED(hr)) {
++      return NotifyError(DecoderStatus::Codes::kPlatformDecodeFailure,
++                         "MFT_MESSAGE_COMMAND_DRAIN", hr);
++    }
++    DoDecode();
++    return;
++  }
++
++  base::span<const uint8_t> data(*buffer);
++  Microsoft::WRL::ComPtr<IMFSample> sample = CreateEmptySampleWithBuffer(
++      std::max<uint32_t>(input_min_size_, data.size()), input_alignment_);
++  if (!sample) {
++    return NotifyError(DecoderStatus::Codes::kPlatformDecodeFailure,
++                       "CreateEmptySampleWithBuffer");
++  }
++  Microsoft::WRL::ComPtr<IMFMediaBuffer> media_buffer;
++  HRESULT hr = sample->GetBufferByIndex(0, &media_buffer);
++  if (FAILED(hr)) {
++    return NotifyError(DecoderStatus::Codes::kPlatformDecodeFailure,
++                       "IMFSample::GetBufferByIndex", hr);
++  }
++  BYTE* destination = nullptr;
++  DWORD max_length = 0;
++  hr = media_buffer->Lock(&destination, &max_length, nullptr);
++  if (FAILED(hr) || max_length < data.size()) {
++    return NotifyError(DecoderStatus::Codes::kPlatformDecodeFailure,
++                       "IMFMediaBuffer::Lock", hr);
++  }
++  std::copy(data.begin(), data.end(), destination);
++  media_buffer->Unlock();
++  media_buffer->SetCurrentLength(data.size());
++  sample->SetSampleTime(TimeDeltaToMfTime(buffer->timestamp()));
++
++  pending_input_ = std::move(sample);
++  DoDecode();
++}
++
++void DXVAVideoDecoder::DoDecode() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  TRACE_EVENT0("gpu", "DXVAVideoDecoder::DoDecode");
++  int stream_changes = 0;
++  int null_samples = 0;
++  while (state_ == State::kRunning) {
++    // A held sample goes first; while it waits for a picture buffer, nothing
++    // else is pulled (the MFT recycles its output surfaces).
++    if (pending_output_) {
++      if (!OutputSample(pending_output_)) {
++        return;
++      }
++      pending_output_.Reset();
++      continue;
++    }
++
++    if (pending_input_) {
++      HRESULT hr = decoder_->ProcessInput(0, pending_input_.Get(), 0);
++      if (SUCCEEDED(hr)) {
++        pending_input_.Reset();
++        CompleteDecode(DecoderStatus::Codes::kOk);
++      } else if (hr != MF_E_NOTACCEPTING) {
++        return NotifyError(DecoderStatus::Codes::kPlatformDecodeFailure,
++                           "IMFTransform::ProcessInput", hr);
++      }
++      // On MF_E_NOTACCEPTING, drain output first, then retry the input.
++    }
++
++    MFT_OUTPUT_DATA_BUFFER output = {};
++    DWORD status = 0;
++    HRESULT hr = decoder_->ProcessOutput(0, 1, &output, &status);
++    if (output.pEvents) {
++      output.pEvents->Release();
++    }
++    Microsoft::WRL::ComPtr<IMFSample> sample;
++    sample.Attach(output.pSample);
++
++    if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
++      if (pending_input_) {
++        // Neither accepting input nor producing output: give up rather than
++        // spin.
++        return NotifyError(DecoderStatus::Codes::kPlatformDecodeFailure,
++                           "MFT neither accepts input nor produces output");
++      }
++      if (draining_) {
++        draining_ = false;
++        decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
++        CompleteDecode(DecoderStatus::Codes::kOk);
++      }
++      return;
++    }
++    if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
++      if (++stream_changes > kMaxStreamChanges || !SetOutputTypeNV12()) {
++        return NotifyError(DecoderStatus::Codes::kPlatformDecodeFailure,
++                           "cannot renegotiate NV12 output after a stream "
++                           "change");
++      }
++      continue;
++    }
++    if (FAILED(hr)) {
++      // Chromium 77 ignored a spurious E_FAIL here (crbug.com/839057, some
++      // desktop drivers). Tolerate it only when nothing waits on this pass (no
++      // pending input, no drain), so it can never leave a Decode() unanswered.
++      if (hr == E_FAIL && !pending_input_ && !draining_) {
++        DVLOG(1) << "DXVAVideoDecoder: ignoring E_FAIL from ProcessOutput";
++        return;
++      }
++      return NotifyError(DecoderStatus::Codes::kPlatformDecodeFailure,
++                         "IMFTransform::ProcessOutput", hr);
++    }
++    if (!sample) {
++      // S_OK without a sample breaks the MFT contract (it provides samples);
++      // bounded so a misbehaving MFT cannot spin the GPU main thread.
++      if (++null_samples > kMaxNullSamples) {
++        return NotifyError(DecoderStatus::Codes::kPlatformDecodeFailure,
++                           "MFT returned success without a sample");
++      }
++      continue;
++    }
++    if (!OutputSample(sample)) {
++      pending_output_ = std::move(sample);
++      return;
++    }
++  }
++}
++
++bool DXVAVideoDecoder::OutputSample(Microsoft::WRL::ComPtr<IMFSample> sample) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  TRACE_EVENT0("gpu", "DXVAVideoDecoder::OutputSample");
++
++  Microsoft::WRL::ComPtr<IMFMediaBuffer> media_buffer;
++  HRESULT hr = sample->GetBufferByIndex(0, &media_buffer);
++  Microsoft::WRL::ComPtr<IDirect3DSurface9> surface;
++  if (SUCCEEDED(hr)) {
++    hr = MFGetService(media_buffer.Get(), MR_BUFFER_SERVICE,
++                      IID_PPV_ARGS(&surface));
++  }
++  if (FAILED(hr) || !surface) {
++    NotifyError(DecoderStatus::Codes::kPlatformDecodeFailure,
++                "no D3D9 surface in the output sample", hr);
++    return true;
++  }
++  D3DSURFACE_DESC desc = {};
++  surface->GetDesc(&desc);
++  const gfx::Size coded_size(desc.Width, desc.Height);
++  if (!EnsurePictureBuffers(coded_size)) {
++    NotifyError(DecoderStatus::Codes::kPlatformDecodeFailure,
++                "cannot create picture buffers");
++    return true;
++  }
++  scoped_refptr<PictureBuffer> picture_buffer = GetFreePictureBuffer();
++  if (!picture_buffer) {
++    return false;
++  }
++
++  // NV12 -> RGB on the GPU (driver colour matrix). Same device as ANGLE, so
++  // this is ordered before any draw that samples the picture.
++  hr = device_->StretchRect(surface.Get(), nullptr,
++                            picture_buffer->d3d_surface(), nullptr,
++                            D3DTEXF_NONE);
++  if (FAILED(hr)) {
++    NotifyError(DecoderStatus::Codes::kPlatformDecodeFailure,
++                "StretchRect (NV12 -> RGB)", hr);
++    return true;
++  }
++
++  LONGLONG sample_time = 0;
++  sample->GetSampleTime(&sample_time);
++
++  gfx::Rect visible_rect = visible_rect_;
++  if (visible_rect.IsEmpty() || !gfx::Rect(coded_size).Contains(visible_rect)) {
++    visible_rect = gfx::IntersectRects(config_.visible_rect(),
++                                       gfx::Rect(coded_size));
++    if (visible_rect.IsEmpty()) {
++      visible_rect = gfx::Rect(coded_size);
++    }
++  }
++  const gfx::Size natural_size =
++      config_.aspect_ratio().GetNaturalSize(visible_rect);
++
++  const scoped_refptr<gpu::ClientSharedImage>& shared_image =
++      picture_buffer->shared_image();
++  // XRGB: the frame is opaque, so whatever alpha the driver's NV12 -> RGB
++  // conversion leaves in the texture is never blended.
++  scoped_refptr<VideoFrame> frame = VideoFrame::WrapSharedImage(
++      PIXEL_FORMAT_XRGB, shared_image, shared_image->creation_sync_token(),
++      VideoFrame::ReleaseMailboxCB(), visible_rect, natural_size,
++      MfTimeToTimeDelta(sample_time));
++  if (!frame) {
++    NotifyError(DecoderStatus::Codes::kFailedToGetVideoFrame,
++                "VideoFrame::WrapSharedImage");
++    return true;
++  }
++
++  picture_buffer->set_in_client_use(true);
++  auto wait_complete_cb = base::BindPostTaskToCurrentDefault(
++      base::BindOnce(&DXVAVideoDecoder::ReceivePictureBufferFromClient,
++                     weak_factory_.GetWeakPtr(), picture_buffer));
++  frame->SetReleaseMailboxCB(
++      base::BindOnce(release_mailbox_cb_, std::move(wait_complete_cb)));
++  frame->metadata().power_efficient = true;
++  frame->metadata().allow_overlay = false;
++  frame->set_color_space(gfx::ColorSpace::CreateSRGB());
++  output_cb_.Run(std::move(frame));
++  return true;
++}
++
++bool DXVAVideoDecoder::EnsurePictureBuffers(const gfx::Size& size) {
++  if (!picture_buffers_.empty() && picture_buffers_.front()->size() == size) {
++    return true;
++  }
++  // Buffers the client still holds stay alive through their release callbacks.
++  picture_buffers_.clear();
++  scoped_refptr<CommandBufferHelper> helper = get_helper_cb_.Run();
++  if (!helper) {
++    return false;
++  }
++  for (size_t i = 0; i < kNumPictureBuffers; ++i) {
++    auto picture_buffer = base::MakeRefCounted<PictureBuffer>();
++    if (!picture_buffer->Init(helper.get(), device_.Get(),
++                              static_cast<EGLConfig>(egl_config_),
++                              use_rgb_texture_, size)) {
++      picture_buffers_.clear();
++      return false;
++    }
++    picture_buffers_.push_back(std::move(picture_buffer));
++  }
++  return true;
++}
++
++scoped_refptr<DXVAVideoDecoder::PictureBuffer>
++DXVAVideoDecoder::GetFreePictureBuffer() {
++  for (const auto& picture_buffer : picture_buffers_) {
++    if (!picture_buffer->in_client_use()) {
++      return picture_buffer;
++    }
++  }
++  return nullptr;
++}
++
++void DXVAVideoDecoder::ReceivePictureBufferFromClient(
++    scoped_refptr<PictureBuffer> buffer) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  buffer->set_in_client_use(false);
++  DoDecode();
++}
++
++void DXVAVideoDecoder::Reset(base::OnceClosure reset_cb) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  TRACE_EVENT0("gpu", "DXVAVideoDecoder::Reset");
++  pending_input_.Reset();
++  pending_output_.Reset();
++  draining_ = false;
++  CompleteDecode(DecoderStatus::Codes::kAborted);
++  if (decoder_ && state_ == State::kRunning) {
++    decoder_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
++  }
++  // CompleteDecode() posted, so the aborted decode callback runs first.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE,
++                                                           std::move(reset_cb));
++}
++
++bool DXVAVideoDecoder::NeedsBitstreamConversion() const {
++  // msmpeg2vdec wants Annex B with SPS/PPS in band.
++  return true;
++}
++
++bool DXVAVideoDecoder::CanReadWithoutStalling() const {
++  if (picture_buffers_.empty()) {
++    return true;
++  }
++  return std::any_of(picture_buffers_.begin(), picture_buffers_.end(),
++                     [](const auto& b) { return !b->in_client_use(); });
++}
++
++int DXVAVideoDecoder::GetMaxDecodeRequests() const {
++  return 1;
++}
++
++bool DXVAVideoDecoder::FramesHoldExternalResources() const {
++  return true;
++}
++
++void DXVAVideoDecoder::CompleteDecode(DecoderStatus status) {
++  if (decode_cb_) {
++    // `decode_cb_` was wrapped with BindPostTaskToCurrentDefault, so this never
++    // runs it re-entrantly from inside Decode().
++    std::move(decode_cb_).Run(std::move(status));
++  }
++}
++
++void DXVAVideoDecoder::NotifyError(DecoderStatus status,
++                                   const char* what,
++                                   HRESULT hr) {
++  MEDIA_LOG(ERROR, media_log_)
++      << "DXVAVideoDecoder: " << what << " failed"
++      << (FAILED(hr) ? base::StringPrintf(", hr=0x%08lx", static_cast<long>(hr))
++                     : std::string());
++  state_ = State::kError;
++  pending_input_.Reset();
++  pending_output_.Reset();
++  draining_ = false;
++  CompleteDecode(std::move(status));
++}
++
++}  // namespace media
+--- a/media/gpu/BUILD.gn
++++ b/media/gpu/BUILD.gn
+@@ -225,6 +225,8 @@
+       "windows/d3d11_video_decoder.cc",
+       "windows/d3d11_video_decoder.h",
+       "windows/d3d11_video_decoder_client.h",
++      "windows/dxva_video_decoder.cc",
++      "windows/dxva_video_decoder.h",
+       "windows/d3d11_video_decoder_wrapper.cc",
+       "windows/d3d11_video_decoder_wrapper.h",
+       "windows/d3d11_video_device_format_support.cc",
+--- a/media/base/win/mf_initializer.cc
++++ b/media/base/win/mf_initializer.cc
+@@ -175,6 +175,23 @@
+       ::CreateMutex(/*lpMutexAttributes=*/nullptr, /*bInitialOwner=*/false,
+                     L"mfx_d3d_mutex"));
+ 
++  // Venetium 0041: the DXVA (Media Foundation MFT + D3D9) H.264 decoder, used
++  // when ANGLE has no D3D11 device (Windows ARM32 / Tegra 4), instantiates
++  // CMSH264DecoderMFT from msmpeg2vdec.dll and uses dxva2.dll. Load both before
++  // the GPU process lowers its token, as Chromium 77 did in
++  // DXVAVideoDecodeAccelerator::PreSandboxInitialization(). Best effort: if
++  // either is missing (e.g. Windows N), the software decoders stay in use.
++  {
++    ScopedAllowBlockingForMediaFoundation allow_io_to_load_library;
++    for (const wchar_t* dll : {L"msmpeg2vdec.dll", L"dxva2.dll"}) {
++      base::NativeLibraryLoadError error;
++      if (!base::LoadSystemLibrary(dll, &error)) {
++        DVLOG(1) << "Venetium 0041: could not preload " << dll << ": "
++                 << error.ToString();
++      }
++    }
++  }
++
+   return LoadMediaFoundationLibraries();
+ }
+ 
+--- a/media/mojo/services/gpu_mojo_media_client_win.cc
++++ b/media/mojo/services/gpu_mojo_media_client_win.cc
+@@ -28,6 +28,7 @@
+ #include "media/gpu/ipc/service/media_gpu_channel_manager.h"
+ #include "media/gpu/windows/d3d11_video_decoder.h"
+ #include "media/gpu/windows/d3d12_helpers.h"
++#include "media/gpu/windows/dxva_video_decoder.h"
+ #include "media/gpu/windows/mf_audio_encoder.h"
+ 
+ namespace media {
+@@ -48,6 +49,15 @@
+  protected:
+   std::unique_ptr<VideoDecoder> CreatePlatformVideoDecoder(
+       VideoDecoderTraits& traits) final {
++    // Venetium 0041: without a D3D11 device from ANGLE (ANGLE on D3D9, e.g.
++    // Windows ARM32 / Tegra) D3D11VideoDecoder can never initialize; use the
++    // D3D9 + Media Foundation decoder instead. It probes the device itself and
++    // fails Initialize() cleanly (software fallback) where it cannot decode.
++    if (!d3d11_device_) {
++      return DXVAVideoDecoder::Create(
++          gpu_task_runner_, traits.media_log->Clone(), gpu_preferences_,
++          gpu_workarounds_, traits.get_command_buffer_stub_cb);
++    }
+     if (gpu_workarounds_.disable_d3d11_video_decoder) {
+       return nullptr;
+     }
+@@ -116,6 +126,12 @@
+     if (gpu_preferences_.disable_accelerated_video_decode) {
+       return supported_configs;
+     }
++    // Venetium 0041: no D3D11 device (ANGLE on D3D9) -> the D3D9 decoder's
++    // per-device probe decides what, if anything, is hardware-decoded.
++    if (!d3d11_device_) {
++      return DXVAVideoDecoder::GetSupportedVideoDecoderConfigs(
++          gpu_preferences_, gpu_workarounds_);
++    }
+     if (!gpu_workarounds_.disable_d3d11_video_decoder) {
+       supported_configs = D3D11VideoDecoder::GetSupportedVideoDecoderConfigs(
+           gpu_preferences_, gpu_workarounds_, GetD3DDeviceCallback());
+@@ -130,7 +146,9 @@
+   }
+ 
+   VideoDecoderType GetPlatformDecoderImplementationType() final {
+-    return VideoDecoderType::kD3D11;
++    // Venetium 0041: DXVAVideoDecoder reports the (otherwise ChromeOS-only)
++    // VDA type.
++    return d3d11_device_ ? VideoDecoderType::kD3D11 : VideoDecoderType::kVda;
+   }
+ 
+  private:
+@@ -144,7 +162,10 @@
+     }
+ 
+     d3d11_device_ = shared_context_state->GetD3D11Device();
+-    if (base::FeatureList::IsEnabled(kD3D12VideoDecoder)) {
++    // Venetium 0041: there is no D3D11 device when ANGLE runs on D3D9, and the
++    // CHECKs below would then crash the GPU process if kD3D12VideoDecoder were
++    // enabled (it is off by default).
++    if (d3d11_device_ && base::FeatureList::IsEnabled(kD3D12VideoDecoder)) {
+       Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device;
+       CHECK_EQ(d3d11_device_.As(&dxgi_device), S_OK);
+       Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+--- a/gpu/command_buffer/service/shared_image/gl_texture_image_backing.h
++++ b/gpu/command_buffer/service/shared_image/gl_texture_image_backing.h
+@@ -5,16 +5,21 @@
+ #ifndef GPU_COMMAND_BUFFER_SERVICE_SHARED_IMAGE_GL_TEXTURE_IMAGE_BACKING_H_
+ #define GPU_COMMAND_BUFFER_SERVICE_SHARED_IMAGE_GL_TEXTURE_IMAGE_BACKING_H_
+ 
++#include "base/functional/callback.h"
+ #include "gpu/command_buffer/common/shared_image_info.h"
+ #include "gpu/command_buffer/service/shared_image/gl_common_image_backing_factory.h"
+ #include "gpu/command_buffer/service/shared_image/gl_texture_holder.h"
++#include "gpu/gpu_gles2_export.h"
+ 
+ class GrPromiseImageTexture;
+ 
+ namespace gpu {
+ 
+ // Implementation of SharedImageBacking that uses GL Textures as storage.
+-class GLTextureImageBacking : public ClearTrackingSharedImageBacking {
++// Venetium 0041: exported, since //gpu/ipc/service now constructs it
++// (GpuChannelSharedImageInterface::CreateSharedImageForD3D9Video).
++class GPU_GLES2_EXPORT GLTextureImageBacking
++    : public ClearTrackingSharedImageBacking {
+  public:
+   static bool SupportsPixelUploadWithFormat(viz::SharedImageFormat format);
+   static bool SupportsPixelReadbackWithFormat(viz::SharedImageFormat format);
+@@ -32,6 +37,17 @@
+       gl::ProgressReporter* progress_reporter,
+       bool framebuffer_attachment_angle);
+ 
++  // Venetium 0041: wraps a single-plane passthrough GL texture created
++  // elsewhere (DXVAVideoDecoder's texture bound to an ANGLE D3D9 pbuffer) and
++  // takes ownership of its GL name. `pre_delete_cb` runs from the destructor,
++  // before the texture is deleted, with whether a GL context is current, so the
++  // owner can release what the texture is bound to. Needs a current context.
++  void InitializeWithExternalPassthroughTexture(
++      const GLFormatDesc& format_desc,
++      scoped_refptr<gles2::TexturePassthrough> texture,
++      gl::ProgressReporter* progress_reporter,
++      base::OnceCallback<void(bool have_context)> pre_delete_cb);
++
+   // Determines if access for a given stream and parameters is supported.
+   static bool CheckSupportForAccessStream(SharedImageAccessStream stream,
+                                           const AccessParams& params);
+@@ -78,6 +94,7 @@
+ 
+   std::vector<GLTextureHolder> textures_;
+   std::vector<sk_sp<GrPromiseImageTexture>> cached_promise_textures_;
++  base::OnceCallback<void(bool have_context)> pre_delete_cb_;
+ };
+ 
+ }  // namespace gpu
+--- a/gpu/command_buffer/service/shared_image/gl_texture_image_backing.cc
++++ b/gpu/command_buffer/service/shared_image/gl_texture_image_backing.cc
+@@ -277,13 +277,35 @@
+ }
+ 
+ GLTextureImageBacking::~GLTextureImageBacking() {
+-  if (!have_context()) {
++  const bool context = have_context();
++  // Venetium 0041: let the owner of an external texture release what it is
++  // bound to (e.g. an EGL pbuffer) while the texture still exists; `textures_`
++  // is destroyed, and the GL name deleted, after this body.
++  if (pre_delete_cb_) {
++    std::move(pre_delete_cb_).Run(context);
++  }
++  if (!context) {
+     for (auto& texture : textures_) {
+       texture.SetContextLost();
+     }
+   }
+ }
+ 
++void GLTextureImageBacking::InitializeWithExternalPassthroughTexture(
++    const GLFormatDesc& format_desc,
++    scoped_refptr<gles2::TexturePassthrough> texture,
++    gl::ProgressReporter* progress_reporter,
++    base::OnceCallback<void(bool have_context)> pre_delete_cb) {
++  CHECK(is_passthrough_);
++  CHECK(format().is_single_plane());
++  CHECK(textures_.empty());
++  textures_.emplace_back(format(), size(), /*is_passthrough=*/true,
++                         progress_reporter);
++  // CHECKs that a GL context is current.
++  textures_.back().InitializeWithTexture(format_desc, std::move(texture));
++  pre_delete_cb_ = std::move(pre_delete_cb);
++}
++
+ bool GLTextureImageBacking::CheckSupportForAccessStream(
+     SharedImageAccessStream stream,
+     const AccessParams& params) {
+--- a/gpu/ipc/service/gpu_channel_shared_image_interface.h
++++ b/gpu/ipc/service/gpu_channel_shared_image_interface.h
+@@ -61,6 +61,16 @@
+       scoped_refptr<gpu::DXGISharedHandleState> dxgi_shared_handle_state,
+       size_t array_slice,
+       const bool is_thread_safe);
++
++  // Venetium 0041: the D3D9 (ANGLE-D3D9, no D3D11 device) twin of the above,
++  // for media::DXVAVideoDecoder. Wraps `service_id`, a mutable GL_TEXTURE_2D
++  // already bound to an ANGLE D3D9 pbuffer, in a GLTextureImageBacking that
++  // takes ownership of the GL name; `pre_delete_cb` releases the pbuffer before
++  // that name is deleted. GPU main thread only.
++  scoped_refptr<ClientSharedImage> CreateSharedImageForD3D9Video(
++      const SharedImageInfo& si_info,
++      uint32_t service_id,
++      base::OnceCallback<void(bool have_context)> pre_delete_cb);
+ #endif
+ 
+   SequenceId sequence() { return sequence_; }
+--- a/gpu/ipc/service/gpu_channel_shared_image_interface.cc
++++ b/gpu/ipc/service/gpu_channel_shared_image_interface.cc
+@@ -23,6 +23,13 @@
+ #include "gpu/command_buffer/service/stream_texture_shared_image_interface.h"
+ #endif
+ 
++#if BUILDFLAG(IS_WIN)
++#include "gpu/command_buffer/service/shared_context_state.h"
++#include "gpu/command_buffer/service/shared_image/gl_texture_image_backing.h"
++#include "gpu/command_buffer/service/shared_image/shared_image_format_service_utils.h"
++#include "gpu/command_buffer/service/texture_manager.h"
++#endif
++
+ namespace gpu {
+ 
+ namespace {
+@@ -143,6 +150,45 @@
+       new ClientSharedImage(mailbox, si_info, GenVerifiedSyncToken(), holder_,
+                             GL_TEXTURE_EXTERNAL_OES));
+ }
++
++scoped_refptr<ClientSharedImage>
++GpuChannelSharedImageInterface::CreateSharedImageForD3D9Video(
++    const SharedImageInfo& si_info,
++    uint32_t service_id,
++    base::OnceCallback<void(bool have_context)> pre_delete_cb) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(gpu_sequence_checker_);
++
++  // The backing owns `service_id` from here, so on any failure below the
++  // pbuffer must still be released before the name is deleted.
++  auto texture = base::MakeRefCounted<gles2::TexturePassthrough>(
++      service_id, GL_TEXTURE_2D);
++  if (!shared_image_stub_ ||
++      !shared_image_stub_->MakeContextCurrent(/*needs_gl=*/true)) {
++    texture->MarkContextLost();
++    std::move(pre_delete_cb).Run(/*have_context=*/false);
++    return nullptr;
++  }
++
++  auto mailbox = Mailbox::Generate();
++  SharedContextState* context_state =
++      shared_image_stub_->shared_context_state().get();
++  auto backing = std::make_unique<GLTextureImageBacking>(
++      mailbox, si_info, /*is_passthrough=*/true);
++  backing->InitializeWithExternalPassthroughTexture(
++      context_state->GetGLFormatCaps().ToGLFormatDesc(si_info.format,
++                                                      /*plane_index=*/0),
++      std::move(texture), context_state->progress_reporter(),
++      std::move(pre_delete_cb));
++  // The decoder writes every picture (StretchRect) before it is ever read.
++  backing->SetCleared();
++  DCHECK(shared_image_stub_->channel()
++             ->gpu_channel_manager()
++             ->shared_image_manager());
++  shared_image_stub_->factory()->RegisterBacking(std::move(backing));
++
++  return base::WrapRefCounted<ClientSharedImage>(new ClientSharedImage(
++      mailbox, si_info, GenVerifiedSyncToken(), holder_, GL_TEXTURE_2D));
++}
+ #endif
+ 
+ SharedImageFactory*

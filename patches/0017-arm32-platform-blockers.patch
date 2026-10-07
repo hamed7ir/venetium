@@ -1,0 +1,470 @@
+Venetium 0017 - Windows ARM32: platform compile blockers and ELF-directive guards.
+
+BATCH-ARM-1 section 3A, as widened by the recon (ARM-1-PLAN.md) and his decision 3 (ARM-1-DECISIONS.md). These are what stop the
+ARM32 compile from starting; one purpose: code that has an x86/x64/arm64 branch gets its Windows ARM32 (Thumb-2) branch. 18 files:
+- The crash trap: base/immediate_crash.h, build/rust/allocator/immediate_crash.h, PartitionAlloc's partition_alloc_base/immediate_crash.h,
+  pdfium core/fxcrt/immediate_crash.h, v8/src/base/immediate-crash.h fall to x86 int3/ud2 on Windows ARM32 (clang-cl defines _MSC_VER
+  and __ARMEL__, not __GNUC__), which rt2.1 rejects for thumbv7; Windows ARM32 gets the trap instruction (udf #0xfe, as CR109 had it).
+  The batch listed two of these five copies.
+- ELF-only assembler directives (.type/.hidden/.size) guarded for COFF: PartitionAlloc's stack/asm/arm/push_registers_asm.cc and
+  webrtc rtc_base/system/asm_defines.h.
+- libvpx: ads2gas.pl gets -noelf -thumb on Windows, and run_perl.py forwards options to it (it forwarded none). Implicit IT blocks come
+  from Venetium 0016's arm asm tool (-mimplicit-it=always), not per target.
+- boringssl: OPENSSL_NO_ASM for is_win && current_cpu == "arm" (its ARM32 perlasm is __ELF__-only and assembles to empty objects on COFF).
+- //base, media and perfetto compile blockers no list had: base/functional/bind_internal.h (the __stdcall/__fastcall specializations are x86-only,
+  on ARM32 they redefine the plain ones), base/debug/stack_trace_win.cc (ARM32 CONTEXT: Pc/R11/Sp, IMAGE_FILE_MACHINE_ARMNT),
+  base/debug/invalid_access_win.cc (Thumb nop is 2 bytes; no "ret" on 32-bit Arm), base/profiler/win32_stack_frame_unwinder.h (ContextPC),
+  media/base/win/media_foundation_package_locator_helper.cc (the "arm" package directory); and, found by this patch's own compile
+  check, the x86-only time stamp counter (__rdtsc) in base/time/time_win.cc, PartitionAlloc's time_win.cc and perfetto's time.cc,
+  which excluded ARM64 only: the generic Windows-on-Arm branch (GetThreadTimes) now covers the whole Arm family.
+Every hunk is Arm-scoped (ARCH_CPU_ARMEL, _M_ARM, current_cpu == "arm", or the Arm family where arm64 already took that branch):
+the x86, x64 and arm64 builds do not change.
+
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/immediate_crash.h b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/immediate_crash.h
+index e0ee3ec..7f59fb2 100644
+--- a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/immediate_crash.h
++++ b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/immediate_crash.h
+@@ -101,6 +101,16 @@
+ // https://crbug.com/958373
+ #define PA_TRAP_SEQUENCE2_() __asm volatile("")
+ 
++#elif PA_BUILDFLAG(PA_ARCH_CPU_ARMEL)
++
++// Windows ARM (ARMNT) uses "UDF #0xFE" (a.k.a. TRAP) as its breakpoint
++// instruction. clang's __debugbreak() emits "BKPT #0" instead, so spell the
++// instruction out.
++#define PA_TRAP_SEQUENCE1_() asm volatile("TRAP")
++// Intentionally empty: __builtin_unreachable() is always part of the sequence
++// (see PA_IMMEDIATE_CRASH below).
++#define PA_TRAP_SEQUENCE2_() __asm volatile("")
++
+ #else
+ 
+ #define PA_TRAP_SEQUENCE1_() asm volatile("int3")
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/time/time_win.cc b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/time/time_win.cc
+index bf37a99..1a11508 100644
+--- a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/time/time_win.cc
++++ b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/time/time_win.cc
+@@ -411,7 +411,7 @@ ThreadTicks ThreadTicks::GetForThread(
+     const PlatformThreadHandle& thread_handle) {
+   PA_BASE_DCHECK(IsSupported());
+ 
+-#if PA_BUILDFLAG(PA_ARCH_CPU_ARM64)
++#if PA_BUILDFLAG(PA_ARCH_CPU_ARM_FAMILY)
+   // QueryThreadCycleTime versus TSCTicksPerSecond doesn't have much relation to
+   // actual elapsed time on Windows on Arm, because QueryThreadCycleTime is
+   // backed by the actual number of CPU cycles executed, rather than a
+@@ -446,7 +446,7 @@ ThreadTicks ThreadTicks::GetForThread(
+ 
+ // static
+ bool ThreadTicks::IsSupportedWin() {
+-#if PA_BUILDFLAG(PA_ARCH_CPU_ARM64)
++#if PA_BUILDFLAG(PA_ARCH_CPU_ARM_FAMILY)
+   // The Arm implementation does not use QueryThreadCycleTime and therefore does
+   // not care about the time stamp counter.
+   return true;
+@@ -457,7 +457,7 @@ bool ThreadTicks::IsSupportedWin() {
+ 
+ // static
+ void ThreadTicks::WaitUntilInitializedWin() {
+-#if !PA_BUILDFLAG(PA_ARCH_CPU_ARM64)
++#if !PA_BUILDFLAG(PA_ARCH_CPU_ARM_FAMILY)
+   while (time_internal::TSCTicksPerSecond() == 0) {
+     ::Sleep(10);
+   }
+@@ -493,7 +493,7 @@ ABI::Windows::Foundation::DateTime TimeDelta::ToWinrtDateTime() const {
+   return date_time;
+ }
+ 
+-#if !PA_BUILDFLAG(PA_ARCH_CPU_ARM64)
++#if !PA_BUILDFLAG(PA_ARCH_CPU_ARM_FAMILY)
+ namespace time_internal {
+ 
+ bool HasConstantRateTSC() {
+@@ -562,6 +562,6 @@ double TSCTicksPerSecond() {
+ }
+ 
+ }  // namespace time_internal
+-#endif  // PA_BUILDFLAG(PA_ARCH_CPU_ARM64)
++#endif  // PA_BUILDFLAG(PA_ARCH_CPU_ARM_FAMILY)
+ 
+ }  // namespace partition_alloc::internal::base
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/stack/asm/arm/push_registers_asm.cc b/base/allocator/partition_allocator/src/partition_alloc/stack/asm/arm/push_registers_asm.cc
+index 4a0e0cb..3bb72ee 100644
+--- a/base/allocator/partition_allocator/src/partition_alloc/stack/asm/arm/push_registers_asm.cc
++++ b/base/allocator/partition_allocator/src/partition_alloc/stack/asm/arm/push_registers_asm.cc
+@@ -14,9 +14,12 @@
+ // Calling convention source:
+ // https://en.wikipedia.org/wiki/Calling_convention#ARM_(A32)
+ // http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.faqs/ka4127.html
+-asm(".globl PAPushAllRegistersAndIterateStack             \n"
++asm(
++    ".globl PAPushAllRegistersAndIterateStack             \n"
++#if !defined(_WIN32)
+     ".type PAPushAllRegistersAndIterateStack, %function   \n"
+     ".hidden PAPushAllRegistersAndIterateStack            \n"
++#endif  // !defined(_WIN32)
+     "PAPushAllRegistersAndIterateStack:                   \n"
+     // Push all callee-saved registers and save return address.
+     // Only {r4-r11} are callee-saved registers. Push r3 in addition to align
+diff --git a/base/debug/invalid_access_win.cc b/base/debug/invalid_access_win.cc
+index 661eb92..b993c7c 100644
+--- a/base/debug/invalid_access_win.cc
++++ b/base/debug/invalid_access_win.cc
+@@ -26,15 +26,25 @@ static constexpr int kNopInstructionSize = 1;
+ #elif defined(ARCH_CPU_ARM64)
+ // On Arm systems, all instructions are 4 bytes, fixed size.
+ static constexpr int kNopInstructionSize = 4;
++#elif defined(ARCH_CPU_ARMEL)
++// Windows on 32-bit Arm runs Thumb-2, where a (narrow) nop is 2 bytes.
++static constexpr int kNopInstructionSize = 2;
+ #else
+ #error "Unsupported architecture"
+ #endif
+ 
+ // Function that can be jumped midway into safely.
+ __attribute__((naked)) int nop_sled() {
++#if defined(ARCH_CPU_ARMEL)
++  // 32-bit Arm has no "ret" instruction.
++  asm("nop\n"
++      "nop\n"
++      "bx lr\n");
++#else
+   asm("nop\n"
+       "nop\n"
+       "ret\n");
++#endif
+ }
+ 
+ using FuncType = decltype(&nop_sled);
+diff --git a/base/debug/stack_trace_win.cc b/base/debug/stack_trace_win.cc
+index 9b5f34c..b63e519 100644
+--- a/base/debug/stack_trace_win.cc
++++ b/base/debug/stack_trace_win.cc
+@@ -425,6 +425,12 @@ void StackTrace::InitTrace(const CONTEXT* context_record) {
+   stack_frame.AddrPC.Offset = context_record->Eip;
+   stack_frame.AddrFrame.Offset = context_record->Ebp;
+   stack_frame.AddrStack.Offset = context_record->Esp;
++#elif defined(ARCH_CPU_ARMEL)
++  // Windows on 32-bit Arm (Thumb-2): r11 is the frame pointer.
++  DWORD machine_type = IMAGE_FILE_MACHINE_ARMNT;
++  stack_frame.AddrPC.Offset = context_record->Pc;
++  stack_frame.AddrFrame.Offset = context_record->R11;
++  stack_frame.AddrStack.Offset = context_record->Sp;
+ #else
+ #error Unsupported Windows Arch
+ #endif
+diff --git a/base/functional/bind_internal.h b/base/functional/bind_internal.h
+index eeb7d1e..c81be2c 100644
+--- a/base/functional/bind_internal.h
++++ b/base/functional/bind_internal.h
+@@ -678,7 +678,7 @@ template <typename R, typename... Args, typename... BoundArgs>
+ struct DecayedFunctorTraits<R (*)(Args...) noexcept, BoundArgs...>
+     : DecayedFunctorTraits<R (*)(Args...), BoundArgs...> {};
+ 
+-#if BUILDFLAG(IS_WIN) && !defined(ARCH_CPU_64_BITS)
++#if BUILDFLAG(IS_WIN) && defined(ARCH_CPU_X86)
+ 
+ // `__stdcall` and `__fastcall` functions.
+ #define BIND_INTERNAL_DECAYED_FUNCTOR_TRAITS_WITH_CONV_AND_QUALS(conv, quals) \
+@@ -692,7 +692,7 @@ BIND_INTERNAL_DECAYED_FUNCTOR_TRAITS_WITH_CONV_AND_QUALS(__fastcall, );
+ BIND_INTERNAL_DECAYED_FUNCTOR_TRAITS_WITH_CONV_AND_QUALS(__fastcall, noexcept);
+ 
+ #undef BIND_INTERNAL_DECAYED_FUNCTOR_TRAITS_WITH_CONV_AND_QUALS
+-#endif  // BUILDFLAG(IS_WIN) && !defined(ARCH_CPU_64_BITS)
++#endif  // BUILDFLAG(IS_WIN) && defined(ARCH_CPU_X86)
+ 
+ #if __OBJC__ && HAS_FEATURE(objc_arc)
+ 
+@@ -764,7 +764,7 @@ BIND_INTERNAL_DECAYED_FUNCTOR_TRAITS_WITH_CONST_AND_QUALS(const, noexcept);
+ 
+ #undef BIND_INTERNAL_DECAYED_FUNCTOR_TRAITS_WITH_CONST_AND_QUALS
+ 
+-#if BUILDFLAG(IS_WIN) && !defined(ARCH_CPU_64_BITS)
++#if BUILDFLAG(IS_WIN) && defined(ARCH_CPU_X86)
+ 
+ // `__stdcall` methods.
+ #define BIND_INTERNAL_DECAYED_FUNCTOR_TRAITS_STDCALL_WITH_QUALS(quals)  \
+@@ -782,7 +782,7 @@ BIND_INTERNAL_DECAYED_FUNCTOR_TRAITS_STDCALL_WITH_QUALS(const noexcept);
+ 
+ #undef BIND_INTERNAL_DECAYED_FUNCTOR_TRAITS_STDCALL_WITH_QUALS
+ 
+-#endif  // BUILDFLAG(IS_WIN) && !defined(ARCH_CPU_64_BITS)
++#endif  // BUILDFLAG(IS_WIN) && defined(ARCH_CPU_X86)
+ 
+ // `IgnoreResult`s.
+ template <typename T, typename... BoundArgs>
+diff --git a/base/immediate_crash.h b/base/immediate_crash.h
+index 1ba59b0..a591faa 100644
+--- a/base/immediate_crash.h
++++ b/base/immediate_crash.h
+@@ -118,6 +118,16 @@ extern "C" int __attribute__((weak)) __llvm_profile_write_file(void);
+ // https://crbug.com/958373
+ #define TRAP_SEQUENCE2_() __asm volatile("")
+ 
++#elif defined(ARCH_CPU_ARMEL)
++
++// Windows ARM (ARMNT) uses "UDF #0xFE" (a.k.a. TRAP) as its breakpoint
++// instruction. clang's __debugbreak() emits "BKPT #0" instead, so spell the
++// instruction out.
++#define TRAP_SEQUENCE1_() asm volatile("TRAP")
++// Intentionally empty: __builtin_unreachable() is always part of the sequence
++// (see IMMEDIATE_CRASH below).
++#define TRAP_SEQUENCE2_() __asm volatile("")
++
+ #else
+ 
+ #define TRAP_SEQUENCE1_() asm volatile("int3")
+diff --git a/base/profiler/win32_stack_frame_unwinder.h b/base/profiler/win32_stack_frame_unwinder.h
+index 975169f..f34fe6d 100644
+--- a/base/profiler/win32_stack_frame_unwinder.h
++++ b/base/profiler/win32_stack_frame_unwinder.h
+@@ -30,7 +30,7 @@ inline ULONG64 ContextPC(CONTEXT* context) {
+   return context->Rip;
+ #elif defined(ARCH_CPU_X86)
+   return context->Eip;
+-#elif defined(ARCH_CPU_ARM64)
++#elif defined(ARCH_CPU_ARM64) || defined(ARCH_CPU_ARMEL)
+   return context->Pc;
+ #else
+ #error Unsupported Windows Arch
+diff --git a/base/time/time_win.cc b/base/time/time_win.cc
+index fcdcb81..1f0bceb 100644
+--- a/base/time/time_win.cc
++++ b/base/time/time_win.cc
+@@ -166,7 +166,7 @@ int64_t QPCNowRaw() {
+   return perf_counter_now.QuadPart;
+ }
+ 
+-#if !defined(ARCH_CPU_ARM64)
++#if !defined(ARCH_CPU_ARM_FAMILY)
+ // Returns the performance frequency.
+ int64_t QPFRaw() {
+   LARGE_INTEGER perf_counter_frequency = {};
+@@ -777,7 +777,7 @@ ThreadTicks ThreadTicks::GetForThread(
+     const PlatformThreadHandle& thread_handle) {
+   DCHECK(IsSupported());
+ 
+-#if defined(ARCH_CPU_ARM64)
++#if defined(ARCH_CPU_ARM_FAMILY)
+   // QueryThreadCycleTime versus TSCTicksPerSecond doesn't have much relation to
+   // actual elapsed time on Windows on Arm, because QueryThreadCycleTime is
+   // backed by the actual number of CPU cycles executed, rather than a
+@@ -812,7 +812,7 @@ ThreadTicks ThreadTicks::GetForThread(
+ 
+ // static
+ bool ThreadTicks::IsSupportedWin() {
+-#if defined(ARCH_CPU_ARM64)
++#if defined(ARCH_CPU_ARM_FAMILY)
+   // The Arm implementation does not use QueryThreadCycleTime and therefore does
+   // not care about the time stamp counter.
+   return true;
+@@ -823,7 +823,7 @@ bool ThreadTicks::IsSupportedWin() {
+ 
+ // static
+ void ThreadTicks::WaitUntilInitializedWin() {
+-#if !defined(ARCH_CPU_ARM64)
++#if !defined(ARCH_CPU_ARM_FAMILY)
+   while (time_internal::TSCTicksPerSecond() == 0) {
+     ::Sleep(10);
+   }
+@@ -926,7 +926,7 @@ ABI::Windows::Foundation::TimeSpan TimeDelta::ToWinrtTimeSpan() const {
+   return time_span;
+ }
+ 
+-#if !defined(ARCH_CPU_ARM64)
++#if !defined(ARCH_CPU_ARM_FAMILY)
+ namespace time_internal {
+ 
+ bool HasConstantRateTSC() {
+@@ -991,6 +991,6 @@ double TSCTicksPerSecond() {
+ }
+ 
+ }  // namespace time_internal
+-#endif  // defined(ARCH_CPU_ARM64)
++#endif  // defined(ARCH_CPU_ARM_FAMILY)
+ 
+ }  // namespace base
+diff --git a/build/rust/allocator/immediate_crash.h b/build/rust/allocator/immediate_crash.h
+index 616f552..4f52548 100644
+--- a/build/rust/allocator/immediate_crash.h
++++ b/build/rust/allocator/immediate_crash.h
+@@ -104,6 +104,16 @@
+ // https://crbug.com/958373
+ #define TRAP_SEQUENCE2_() __asm volatile("")
+ 
++#elif defined(ARCH_CPU_ARMEL)
++
++// Windows ARM (ARMNT) uses "UDF #0xFE" (a.k.a. TRAP) as its breakpoint
++// instruction. clang's __debugbreak() emits "BKPT #0" instead, so spell the
++// instruction out.
++#define TRAP_SEQUENCE1_() asm volatile("TRAP")
++// Intentionally empty: __builtin_unreachable() is always part of the sequence
++// (see IMMEDIATE_CRASH below).
++#define TRAP_SEQUENCE2_() __asm volatile("")
++
+ #else
+ 
+ #define TRAP_SEQUENCE1_() asm volatile("int3")
+diff --git a/media/base/win/media_foundation_package_locator_helper.cc b/media/base/win/media_foundation_package_locator_helper.cc
+index 5e1806f..a89fbd8 100644
+--- a/media/base/win/media_foundation_package_locator_helper.cc
++++ b/media/base/win/media_foundation_package_locator_helper.cc
+@@ -21,6 +21,8 @@ constexpr std::array<std::wstring_view, 1> kArchSubDirs = {L"x64"};
+ constexpr std::array<std::wstring_view, 2> kArchSubDirs = {L"x86", L"win32"};
+ #elif defined(_M_ARM64)
+ constexpr std::array<std::wstring_view, 1> kArchSubDirs = {L"arm64"};
++#elif defined(_M_ARM)
++constexpr std::array<std::wstring_view, 1> kArchSubDirs = {L"arm"};
+ #else
+ #error Unsupported processor type.
+ #endif
+diff --git a/third_party/boringssl/BUILD.gn b/third_party/boringssl/BUILD.gn
+index 30aa77b..2028408 100644
+--- a/third_party/boringssl/BUILD.gn
++++ b/third_party/boringssl/BUILD.gn
+@@ -110,10 +110,13 @@ if (enable_rust) {
+   }
+ }
+ 
+-if (is_msan) {
++if (is_msan || (is_win && current_cpu == "arm")) {
+   # MSan instrumentation is incompatible with assembly optimizations.
+   # BoringSSL's GAS-compatible assembly knows how to detect MSan, but the NASM
+   # assembly does not, so we check for MSan explicitly.
++  #
++  # Windows ARM32 has no BoringSSL assembly: the ARM32 perlasm output
++  # (gen/bcm/*-armv4-linux.S etc.) is guarded by __ELF__ and is empty on COFF.
+   source_set("boringssl_asm") {
+     visibility = [ ":*" ]
+     public_configs = [ ":no_asm_config" ]
+diff --git a/third_party/libvpx/BUILD.gn b/third_party/libvpx/BUILD.gn
+index 3437424..9661be8 100644
+--- a/third_party/libvpx/BUILD.gn
++++ b/third_party/libvpx/BUILD.gn
+@@ -438,6 +438,16 @@ if (current_cpu == "arm" && arm_assembly_sources != []) {
+       "-o",
+       rebase_path(gen_file, root_build_dir),
+     ]
++    if (is_win) {
++      # COFF has no ELF directives (.type/.size/.eabi_attribute/.note.GNU-stack)
++      # and Windows ARM is Thumb-2 only (".thumb" instead of ".arm"). Everything
++      # after "--" is passed on to ads2gas.pl by run_perl.py.
++      args += [
++        "--",
++        "-noelf",
++        "-thumb",
++      ]
++    }
+   }
+ 
+   static_library("libvpx_assembly_arm") {
+diff --git a/third_party/libvpx/run_perl.py b/third_party/libvpx/run_perl.py
+index ac036f4..74d1434 100644
+--- a/third_party/libvpx/run_perl.py
++++ b/third_party/libvpx/run_perl.py
+@@ -23,6 +23,6 @@ if (not options.script or not options.input or not options.output):
+   sys.exit(1)
+ 
+ with open(options.output, 'w') as fo, open(options.input, 'r') as fi:
+-  subprocess.check_call(['perl', options.script], stdout=fo, stdin=fi)
++  subprocess.check_call(['perl', options.script] + args, stdout=fo, stdin=fi)
+ 
+ sys.exit(0)
+diff --git a/third_party/pdfium/core/fxcrt/immediate_crash.h b/third_party/pdfium/core/fxcrt/immediate_crash.h
+index 45660ef..2f2f1bb 100644
+--- a/third_party/pdfium/core/fxcrt/immediate_crash.h
++++ b/third_party/pdfium/core/fxcrt/immediate_crash.h
+@@ -95,6 +95,16 @@
+ // https://crbug.com/958373
+ #define TRAP_SEQUENCE2_() __asm volatile("")
+ 
++#elif defined(ARCH_CPU_ARMEL)
++
++// Windows ARM (ARMNT) uses "UDF #0xFE" (a.k.a. TRAP) as its breakpoint
++// instruction. clang's __debugbreak() emits "BKPT #0" instead, so spell the
++// instruction out.
++#define TRAP_SEQUENCE1_() asm volatile("TRAP")
++// Intentionally empty: __builtin_unreachable() is always part of the sequence
++// (see IMMEDIATE_CRASH below).
++#define TRAP_SEQUENCE2_() __asm volatile("")
++
+ #else
+ 
+ #define TRAP_SEQUENCE1_() asm volatile("int3")
+diff --git a/third_party/perfetto/src/base/time.cc b/third_party/perfetto/src/base/time.cc
+index fbd9a23..818577e 100644
+--- a/third_party/perfetto/src/base/time.cc
++++ b/third_party/perfetto/src/base/time.cc
+@@ -32,7 +32,7 @@ namespace perfetto {
+ namespace base {
+ 
+ #if PERFETTO_BUILDFLAG(PERFETTO_OS_WIN)
+-#if !PERFETTO_BUILDFLAG(PERFETTO_ARCH_CPU_ARM64)
++#if !PERFETTO_BUILDFLAG(PERFETTO_ARCH_CPU_ARM64) && !defined(_M_ARM)
+ namespace {
+ 
+ // Returns the current value of the performance counter.
+@@ -124,7 +124,7 @@ TimeNanos GetWallTimeNs() {
+ }
+ 
+ TimeNanos GetThreadCPUTimeNs() {
+-#if PERFETTO_BUILDFLAG(PERFETTO_ARCH_CPU_ARM64)
++#if PERFETTO_BUILDFLAG(PERFETTO_ARCH_CPU_ARM64) || defined(_M_ARM)
+   // QueryThreadCycleTime versus TSCTicksPerSecond doesn't have much relation to
+   // actual elapsed time on Windows on Arm, because QueryThreadCycleTime is
+   // backed by the actual number of CPU cycles executed, rather than a
+@@ -168,7 +168,7 @@ void SleepMicroseconds(unsigned interval_us) {
+ }
+ 
+ void InitializeTime() {
+-#if !PERFETTO_BUILDFLAG(PERFETTO_ARCH_CPU_ARM64)
++#if !PERFETTO_BUILDFLAG(PERFETTO_ARCH_CPU_ARM64) && !defined(_M_ARM)
+   // Make an early first call to TSCTicksPerSecond() to start 50 ms elapsed time
+   // (see comment in TSCTicksPerSecond()).
+   TSCTicksPerSecond();
+diff --git a/third_party/webrtc/rtc_base/system/asm_defines.h b/third_party/webrtc/rtc_base/system/asm_defines.h
+index 681c612..8f389e5 100644
+--- a/third_party/webrtc/rtc_base/system/asm_defines.h
++++ b/third_party/webrtc/rtc_base/system/asm_defines.h
+@@ -41,7 +41,9 @@ bl _\name
+ #else
+ .macro GLOBAL_FUNCTION name
+ .global \name
++#if defined(__ELF__)
+ .hidden \name
++#endif
+ .endm
+ .macro DEFINE_FUNCTION name
+ #if defined(__linux__) && defined(__ELF__)
+@@ -54,7 +56,9 @@ bl \name
+ .endm
+ .macro GLOBAL_LABEL name
+ .global \name
++#if defined(__ELF__)
+ .hidden \name
++#endif
+ .endm
+ #endif
+ 
+diff --git a/v8/src/base/immediate-crash.h b/v8/src/base/immediate-crash.h
+index 9c25a7d..6fa9115 100644
+--- a/v8/src/base/immediate-crash.h
++++ b/v8/src/base/immediate-crash.h
+@@ -125,6 +125,16 @@
+ // https://crbug.com/958373
+ #define TRAP_SEQUENCE2_() __asm volatile("")
+ 
++#elif V8_HOST_ARCH_ARM
++
++// Windows ARM (ARMNT) uses "UDF #0xFE" (a.k.a. TRAP) as its breakpoint
++// instruction. clang's __debugbreak() emits "BKPT #0" instead, so spell the
++// instruction out.
++#define TRAP_SEQUENCE1_() asm volatile("TRAP")
++// Intentionally empty: __builtin_unreachable() is always part of the sequence
++// (see IMMEDIATE_CRASH below).
++#define TRAP_SEQUENCE2_() __asm volatile("")
++
+ #else
+ 
+ #define TRAP_SEQUENCE1_() asm volatile("int3")

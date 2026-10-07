@@ -1,0 +1,419 @@
+Venetium 0025 - Windows ARM32 build-fix round: the 17 compile failures of the first full ARM32 chrome build.
+
+BATCH-ARM-1 section 5. His decisions (ARM-1-DECISIONS.md, "section 5 build - fix round", 2026-10-03): one patch; the fxdiv
+workaround is logged first in TOOLCHAIN-ISSUES.md (B3); SwiftShader-off here completes 0021; cpuinfo is ported but reports only the
+ARMv7 baseline; the installer suffix and the SODA indicator take arm names (Live Caption / SODA is not available on ARM32 - Google
+ships no Windows ARM32 SODA). The full build (ninja -k 0 chrome, 16 h, 77,889 / 79,766 steps) stopped on 17 objects. 14 files:
+- base/profiler/register_context_registers.h: Windows ARM32 (ARCH_CPU_ARMEL) branches - Sp, R11 (the Windows-on-ARM frame
+  pointer), Pc. The sampling profiler stays off on 32-bit Windows as on x86 (StackSampler::Create returns nullptr); 4 objects
+  (stack_copier_suspend, native_unwinder_win, stack_sampler, chrome renderer v8_unwinder) stopped on its #error.
+- chrome/renderer/v8_unwinder.cc: on Windows ARM32 base::RegisterContext is ::CONTEXT, whose callee-saved registers are named
+  R4..R10; ARM_CALLEE_SAVED_REGISTER picks that name there and arm_r4..arm_r10 on Linux/Android (unchanged).
+- v8/src/base/platform/time.cc, time.h: Windows ARM32 takes the Windows-on-Arm ThreadTicks path (GetThreadTimes, no TSC, no
+  __rdtsc) - the change 0017 made in base/time/time_win.cc.
+- v8/src/libsampler/sampler.cc: Windows ARM32 register state (Pc, Sp, R11, Lr) instead of the x86 Eip/Esp/Ebp fallback.
+- third_party/skia/src/opts/SkRasterPipeline_opts.h: Windows ARM32 leaves the pcs("aapcs-vfp") ABI branch (clang rejects pcs for
+  Windows targets, an error under -Werror) and takes the _MSC_VER branch as Windows ARM64 does - narrow stages either way, and
+  Windows on ARM always uses AAPCS-VFP (TOOLCHAIN-ISSUES, Chromium-side quirks).
+- third_party/fxdiv/src/include/fxdiv.h: clang skips the _MulUnsignedHigh branch (TOOLCHAIN-ISSUES B3: undeclared on every clang
+  target) for the portable branch, which rt2.1 compiles to the same single umull as MSVC's intrinsic (4 pthreadpool objects).
+- ui/gfx/BUILD.gn: gfx depends on //extensions/buildflags and //third_party/widevine/cdm:buildflags. Supermium's
+  paint_vector_icon.cc (ui_part_2.patch) includes chrome/common/chrome_paths.h, which includes both generated headers; in the V8
+  snapshot toolchain (clang_x86_v8_arm) nothing ordered them before gfx.
+- ui/gl/BUILD.gn: the Windows block's SwiftShader data_deps honour enable_swiftshader (unchanged where it is true). With
+  dawn_use_swiftshader = false in venetium/args/out-arm-rt21.gn, SwiftShader leaves the ARM graph (gn gen 38,240 -> 38,183
+  targets; the 2 SwiftShader objects that failed are no longer built).
+- third_party/cpuinfo/BUILD.gn, src/src/cpuinfo/internal-api.h, src/src/arm/windows/init.c: Windows ARM32 uses the Windows-on-Arm
+  init (registry MIDR, GetLogicalProcessorInformationEx topology) and set_cpuinfo_isa_fields reports only the ARMv7 baseline the
+  Microsoft ARM32 ABI guarantees (Thumb-2, VFPv3-D32, NEON). chrome reaches cpuinfo through TFLite/ruy (webrtc, services/audio,
+  webnn, ...) even with use_on_device_model_service = false. init.c is CRLF upstream and stays CRLF: this patch carries CRLF lines
+  for it, so git apply keeps them both ways (it was captured with GIT_ATTR_SOURCE=<empty tree>, because .gitattributes says
+  "*.c text eol=lf"; applying needs nothing special).
+- chrome/installer/util/additional_parameters.cc: kArchSuffix L"-arch_arm", stable L"stable-arch_arm" (cosmetic; Venetium does not
+  use Google Update).
+- chrome/browser/component_updater/soda_component_installer.cc: kSodaIndicatorFile "SODAFiles/arch_arm" (compiles; no ARM32 SODA).
+Every hunk leaves Windows x86, x64 and arm64 and Linux/Android ARM32 unchanged (reviewed by four read-only lenses before capture).
+Checked (RUNTIME, real arm-rt21 graph after gn gen): the 15 remaining failed objects and cpuinfo's 3 ARM objects compile, 0 FAILED;
+the ARM objects are ARMNT, the snapshot-toolchain paint_vector_icon.obj is I386; no object references _MulUnsignedHigh.
+
+diff --git a/base/profiler/register_context_registers.h b/base/profiler/register_context_registers.h
+index a600208..409aa7c 100644
+--- a/base/profiler/register_context_registers.h
++++ b/base/profiler/register_context_registers.h
+@@ -45,6 +45,8 @@ inline uintptr_t RegisterContextStackPointer(::CONTEXT* context) {
+   return context->Rsp;
+ #elif defined(ARCH_CPU_ARM64)
+   return context->Sp;
++#elif defined(ARCH_CPU_ARMEL)
++  return context->Sp;
+ #elif defined(ARCH_CPU_X86)
+   return context->Esp;
+ #else
+@@ -57,6 +59,8 @@ inline void SetRegisterContextStackPointer(::CONTEXT* context, uintptr_t val) {
+   context->Rsp = val;
+ #elif defined(ARCH_CPU_ARM64)
+   context->Sp = val;
++#elif defined(ARCH_CPU_ARMEL)
++  context->Sp = val;
+ #elif defined(ARCH_CPU_X86)
+   context->Esp = val;
+ #else
+@@ -69,6 +73,9 @@ inline uintptr_t RegisterContextFramePointer(::CONTEXT* context) {
+   return context->Rbp;
+ #elif defined(ARCH_CPU_ARM64)
+   return context->Fp;
++#elif defined(ARCH_CPU_ARMEL)
++  // Venetium 0025: Windows on ARM32 uses r11 as the frame pointer.
++  return context->R11;
+ #elif defined(ARCH_CPU_X86)
+   return context->Ebp;
+ #else
+@@ -81,6 +88,8 @@ inline void SetRegisterContextFramePointer(::CONTEXT* context, uintptr_t val) {
+   context->Rbp = val;
+ #elif defined(ARCH_CPU_ARM64)
+   context->Fp = val;
++#elif defined(ARCH_CPU_ARMEL)
++  context->R11 = val;
+ #elif defined(ARCH_CPU_X86)
+   context->Ebp = val;
+ #else
+@@ -93,6 +102,8 @@ inline uintptr_t RegisterContextInstructionPointer(::CONTEXT* context) {
+   return context->Rip;
+ #elif defined(ARCH_CPU_ARM64)
+   return context->Pc;
++#elif defined(ARCH_CPU_ARMEL)
++  return context->Pc;
+ #elif defined(ARCH_CPU_X86)
+   return context->Eip;
+ #else
+@@ -106,6 +117,8 @@ inline void SetRegisterContextInstructionPointer(::CONTEXT* context,
+   context->Rip = val;
+ #elif defined(ARCH_CPU_ARM64)
+   context->Pc = val;
++#elif defined(ARCH_CPU_ARMEL)
++  context->Pc = val;
+ #elif defined(ARCH_CPU_X86)
+   context->Eip = val;
+ #else
+diff --git a/chrome/browser/component_updater/soda_component_installer.cc b/chrome/browser/component_updater/soda_component_installer.cc
+index ffb33fa..087894d 100644
+--- a/chrome/browser/component_updater/soda_component_installer.cc
++++ b/chrome/browser/component_updater/soda_component_installer.cc
+@@ -63,6 +63,10 @@ constexpr base::FilePath::CharType kSodaIndicatorFile[] =
+     FILE_PATH_LITERAL("SODAFiles/arch_x64");
+ #elif defined(ARCH_CPU_ARM64)
+     FILE_PATH_LITERAL("SODAFiles/arch_arm64");
++#elif defined(ARCH_CPU_ARMEL)
++    // Venetium 0025: Google ships no Windows ARM32 SODA, so Live Caption is not
++    // available there; the name only lets this compile.
++    FILE_PATH_LITERAL("SODAFiles/arch_arm");
+ #else
+     {};
+ #endif
+diff --git a/chrome/installer/util/additional_parameters.cc b/chrome/installer/util/additional_parameters.cc
+index 8364018..0b9263f 100644
+--- a/chrome/installer/util/additional_parameters.cc
++++ b/chrome/installer/util/additional_parameters.cc
+@@ -211,6 +211,9 @@ std::wstring GetChannelIdentifier(version_info::Channel channel,
+   static constexpr std::wstring_view kArchSuffix = L"-arch_x86";
+ #elif defined(ARCH_CPU_ARM64)
+   static constexpr std::wstring_view kArchSuffix = L"-arch_arm64";
++#elif defined(ARCH_CPU_ARMEL)
++  // Venetium 0025: Windows ARM32 (no Google Update for Venetium; cosmetic).
++  static constexpr std::wstring_view kArchSuffix = L"-arch_arm";
+ #else
+ #error unsupported processor architecture.
+ #endif
+@@ -249,6 +252,8 @@ std::wstring GetChannelIdentifier(version_info::Channel channel,
+       return L"stable-arch_x86";
+ #elif defined(ARCH_CPU_ARM64)
+       return L"arm64-stable";
++#elif defined(ARCH_CPU_ARMEL)
++      return L"stable-arch_arm";
+ #else
+ #error unsupported processor architecture.
+ #endif
+diff --git a/chrome/renderer/v8_unwinder.cc b/chrome/renderer/v8_unwinder.cc
+index 15c436e..f024edf 100644
+--- a/chrome/renderer/v8_unwinder.cc
++++ b/chrome/renderer/v8_unwinder.cc
+@@ -20,6 +20,16 @@
+ #include "v8/include/v8-unwinder-state.h"
+ #endif
+ 
++#if defined(ARCH_CPU_ARM_FAMILY) && defined(ARCH_CPU_32_BITS)
++#if BUILDFLAG(IS_WIN)
++// Venetium 0025: on Windows ARM32 base::RegisterContext is ::CONTEXT, which
++// names the callee-saved registers R4..R10.
++#define ARM_CALLEE_SAVED_REGISTER(context, n) (context).R##n
++#else
++#define ARM_CALLEE_SAVED_REGISTER(context, n) (context).arm_r##n
++#endif
++#endif
++
+ namespace {
+ 
+ class V8Module : public base::ModuleCache::Module {
+@@ -96,19 +106,19 @@ void CopyCalleeSavedRegisterFromRegisterContext(
+   // https://crbug.com/v8/10799.
+   DCHECK(callee_saved_registers);
+   callee_saved_registers->arm_r4 =
+-      reinterpret_cast<void*>(register_context.arm_r4);
++      reinterpret_cast<void*>(ARM_CALLEE_SAVED_REGISTER(register_context, 4));
+   callee_saved_registers->arm_r5 =
+-      reinterpret_cast<void*>(register_context.arm_r5);
++      reinterpret_cast<void*>(ARM_CALLEE_SAVED_REGISTER(register_context, 5));
+   callee_saved_registers->arm_r6 =
+-      reinterpret_cast<void*>(register_context.arm_r6);
++      reinterpret_cast<void*>(ARM_CALLEE_SAVED_REGISTER(register_context, 6));
+   callee_saved_registers->arm_r7 =
+-      reinterpret_cast<void*>(register_context.arm_r7);
++      reinterpret_cast<void*>(ARM_CALLEE_SAVED_REGISTER(register_context, 7));
+   callee_saved_registers->arm_r8 =
+-      reinterpret_cast<void*>(register_context.arm_r8);
++      reinterpret_cast<void*>(ARM_CALLEE_SAVED_REGISTER(register_context, 8));
+   callee_saved_registers->arm_r9 =
+-      reinterpret_cast<void*>(register_context.arm_r9);
++      reinterpret_cast<void*>(ARM_CALLEE_SAVED_REGISTER(register_context, 9));
+   callee_saved_registers->arm_r10 =
+-      reinterpret_cast<void*>(register_context.arm_r10);
++      reinterpret_cast<void*>(ARM_CALLEE_SAVED_REGISTER(register_context, 10));
+ #endif
+ }
+ 
+@@ -117,19 +127,19 @@ void CopyCalleeSavedRegisterToRegisterContext(
+     base::RegisterContext& register_context) {
+ #if defined(ARCH_CPU_ARM_FAMILY) && defined(ARCH_CPU_32_BITS)
+   DCHECK(callee_saved_registers);
+-  register_context.arm_r4 =
++  ARM_CALLEE_SAVED_REGISTER(register_context, 4) =
+       reinterpret_cast<uintptr_t>(callee_saved_registers->arm_r4);
+-  register_context.arm_r5 =
++  ARM_CALLEE_SAVED_REGISTER(register_context, 5) =
+       reinterpret_cast<uintptr_t>(callee_saved_registers->arm_r5);
+-  register_context.arm_r6 =
++  ARM_CALLEE_SAVED_REGISTER(register_context, 6) =
+       reinterpret_cast<uintptr_t>(callee_saved_registers->arm_r6);
+-  register_context.arm_r7 =
++  ARM_CALLEE_SAVED_REGISTER(register_context, 7) =
+       reinterpret_cast<uintptr_t>(callee_saved_registers->arm_r7);
+-  register_context.arm_r8 =
++  ARM_CALLEE_SAVED_REGISTER(register_context, 8) =
+       reinterpret_cast<uintptr_t>(callee_saved_registers->arm_r8);
+-  register_context.arm_r9 =
++  ARM_CALLEE_SAVED_REGISTER(register_context, 9) =
+       reinterpret_cast<uintptr_t>(callee_saved_registers->arm_r9);
+-  register_context.arm_r10 =
++  ARM_CALLEE_SAVED_REGISTER(register_context, 10) =
+       reinterpret_cast<uintptr_t>(callee_saved_registers->arm_r10);
+ #endif
+ }
+diff --git a/third_party/cpuinfo/BUILD.gn b/third_party/cpuinfo/BUILD.gn
+index 1fd7f0f..a30907f 100644
+--- a/third_party/cpuinfo/BUILD.gn
++++ b/third_party/cpuinfo/BUILD.gn
+@@ -241,7 +241,9 @@ source_set("cpu_and_os_specific") {
+     sources = [ "src/src/x86/windows/init.c" ]
+   }
+ 
+-  if (is_win && current_cpu == "arm64") {
++  # Venetium 0025: Windows ARM32 shares the Windows-on-Arm init (it reports the
++  # ARMv7 baseline there).
++  if (is_win && (current_cpu == "arm64" || current_cpu == "arm")) {
+     sources = [
+       "src/src/arm/windows/init-by-logical-sys-info.c",
+       "src/src/arm/windows/init.c",
+diff --git a/third_party/cpuinfo/src/src/arm/windows/init.c b/third_party/cpuinfo/src/src/arm/windows/init.c
+index a07fbe4..c53dc1d 100644
+--- a/third_party/cpuinfo/src/src/arm/windows/init.c
++++ b/third_party/cpuinfo/src/src/arm/windows/init.c
+@@ -209,6 +209,21 @@ static struct woa_chip_info* get_system_info_from_registry(void) {
+ }
+ 
+ static void set_cpuinfo_isa_fields(void) {
++#if CPUINFO_ARCH_ARM
++	/* Venetium 0025: Windows on ARM32 requires ARMv7-A with Thumb-2, VFPv3-D32 and
++	 * NEON (the Microsoft ARM32 ABI). Report exactly that baseline: the ARMv8+ probes
++	 * below describe features an ARMv7 part (Tegra 4 / Cortex-A15) does not have. */
++	cpuinfo_isa.thumb = true;
++	cpuinfo_isa.thumb2 = true;
++	cpuinfo_isa.armv5e = true;
++	cpuinfo_isa.armv6 = true;
++	cpuinfo_isa.armv6k = true;
++	cpuinfo_isa.armv7 = true;
++	cpuinfo_isa.vfpv2 = true;
++	cpuinfo_isa.vfpv3 = true;
++	cpuinfo_isa.d32 = true;
++	cpuinfo_isa.neon = true;
++#else
+ 	cpuinfo_isa.atomics = IsProcessorFeaturePresent(PF_ARM_V81_ATOMIC_INSTRUCTIONS_AVAILABLE) != 0;
+ 
+ 	const bool dotprod = IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE) != 0;
+@@ -265,4 +280,5 @@ static void set_cpuinfo_isa_fields(void) {
+ 	cpuinfo_isa.pmull = crypto;
+ 
+ 	cpuinfo_isa.crc32 = IsProcessorFeaturePresent(PF_ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE) != 0;
++#endif /* CPUINFO_ARCH_ARM */
+ }
+diff --git a/third_party/cpuinfo/src/src/cpuinfo/internal-api.h b/third_party/cpuinfo/src/src/cpuinfo/internal-api.h
+index d84b26a..b5151aa 100644
+--- a/third_party/cpuinfo/src/src/cpuinfo/internal-api.h
++++ b/third_party/cpuinfo/src/src/cpuinfo/internal-api.h
+@@ -51,7 +51,7 @@ CPUINFO_PRIVATE void cpuinfo_x86_mach_init(void);
+ CPUINFO_PRIVATE void cpuinfo_x86_linux_init(void);
+ CPUINFO_PRIVATE void cpuinfo_x86_freebsd_init(void);
+ #if defined(_WIN32) || defined(__CYGWIN__)
+-#if CPUINFO_ARCH_ARM64
++#if CPUINFO_ARCH_ARM64 || CPUINFO_ARCH_ARM
+ CPUINFO_PRIVATE BOOL CALLBACK cpuinfo_arm_windows_init(PINIT_ONCE init_once, PVOID parameter, PVOID* context);
+ #else
+ CPUINFO_PRIVATE BOOL CALLBACK cpuinfo_x86_windows_init(PINIT_ONCE init_once, PVOID parameter, PVOID* context);
+diff --git a/third_party/fxdiv/src/include/fxdiv.h b/third_party/fxdiv/src/include/fxdiv.h
+index 2c35038..ac70a9b 100644
+--- a/third_party/fxdiv/src/include/fxdiv.h
++++ b/third_party/fxdiv/src/include/fxdiv.h
+@@ -38,7 +38,9 @@ static inline uint32_t fxdiv_mulhi_uint32_t(uint32_t a, uint32_t b) {
+ 	return (uint32_t) __umulhi((unsigned int) a, (unsigned int) b);
+ #elif defined(_MSC_VER) && defined(_M_IX86)
+ 	return (uint32_t) (__emulu((unsigned int) a, (unsigned int) b) >> 32);
+-#elif defined(_MSC_VER) && defined(_M_ARM)
++#elif defined(_MSC_VER) && defined(_M_ARM) && !defined(__clang__)
++	/* Venetium 0025: clang has no _MulUnsignedHigh (TOOLCHAIN-ISSUES B3); it takes
++	 * the portable branch below, which it compiles to the same single umull. */
+ 	return (uint32_t) _MulUnsignedHigh((unsigned long) a, (unsigned long) b);
+ #else
+ 	return (uint32_t) (((uint64_t) a * (uint64_t) b) >> 32);
+diff --git a/third_party/skia/src/opts/SkRasterPipeline_opts.h b/third_party/skia/src/opts/SkRasterPipeline_opts.h
+index 4ce92e7..09e8e5d 100644
+--- a/third_party/skia/src/opts/SkRasterPipeline_opts.h
++++ b/third_party/skia/src/opts/SkRasterPipeline_opts.h
+@@ -1520,7 +1520,10 @@ static constexpr size_t N = sizeof(F) / sizeof(float);
+ 
+ // Any custom ABI to use for all (non-externally-facing) stage functions?
+ // Also decide here whether to use narrow (compromise) or wide (ideal) stages.
+-#if defined(SK_CPU_ARM32) && defined(SKRP_CPU_NEON)
++// Venetium 0025: not on Windows ARM32. clang rejects pcs("aapcs-vfp") for Windows
++// targets, and Windows on ARM always uses the AAPCS-VFP convention anyway; it takes
++// the _MSC_VER branch below, as Windows ARM64 does.
++#if defined(SK_CPU_ARM32) && defined(SKRP_CPU_NEON) && !defined(_WIN32)
+     // This lets us pass vectors more efficiently on 32-bit ARM.
+     // We can still only pass 16 floats, so best as 4x {r,g,b,a}.
+     #define ABI __attribute__((pcs("aapcs-vfp")))
+diff --git a/ui/gfx/BUILD.gn b/ui/gfx/BUILD.gn
+index f669a4b..ffe0d89 100644
+--- a/ui/gfx/BUILD.gn
++++ b/ui/gfx/BUILD.gn
+@@ -189,6 +189,14 @@ component("gfx") {
+     "//base:i18n",
+     "//build:blink_buildflags",
+     "//device/vr/buildflags",
++
++    # Venetium 0025: Supermium's paint_vector_icon.cc includes
++    # chrome/common/chrome_paths.h, which includes these two generated headers;
++    # the deps make them prerequisites of gfx in every toolchain (in the V8
++    # snapshot toolchain nothing else ordered them before gfx).
++    "//extensions/buildflags",
++    "//third_party/widevine/cdm:buildflags",
++
+     "//mojo/public/cpp/bindings:struct_traits",
+     "//skia",
+     "//third_party/zlib",
+diff --git a/ui/gl/BUILD.gn b/ui/gl/BUILD.gn
+index 1cb6619..1f2009e 100644
+--- a/ui/gl/BUILD.gn
++++ b/ui/gl/BUILD.gn
+@@ -300,10 +300,14 @@ component("gl") {
+       "//ui/gfx/mojom:dxgi_info",
+     ]
+ 
+-    data_deps += [
+-      "//third_party/swiftshader/src/Vulkan:icd_file",
+-      "//third_party/swiftshader/src/Vulkan:swiftshader_libvulkan",
+-    ]
++    # Venetium 0025: honour enable_swiftshader here too. Venetium's Windows ARM32
++    # args set it false: ARM32 renders through ANGLE's D3D9 backend (Venetium 0021).
++    if (enable_swiftshader) {
++      data_deps += [
++        "//third_party/swiftshader/src/Vulkan:icd_file",
++        "//third_party/swiftshader/src/Vulkan:swiftshader_libvulkan",
++      ]
++    }
+     if (!use_static_angle) {
+       data_deps += [
+         "//third_party/angle:libEGL",
+diff --git a/v8/src/base/platform/time.cc b/v8/src/base/platform/time.cc
+index 8c824e3..f35ab9b 100644
+--- a/v8/src/base/platform/time.cc
++++ b/v8/src/base/platform/time.cc
+@@ -703,7 +703,7 @@ TimeTicks InitialTimeTicksNowFunction() {
+   return g_time_ticks_now_function();
+ }
+ 
+-#if V8_HOST_ARCH_ARM64
++#if V8_HOST_ARCH_ARM64 || V8_HOST_ARCH_ARM
+ // From MSDN, FILETIME "Contains a 64-bit value representing the number of
+ // 100-nanosecond intervals since January 1, 1601 (UTC)."
+ int64_t FileTimeToMicroseconds(const FILETIME& ft) {
+@@ -821,7 +821,7 @@ ThreadTicks ThreadTicks::Now() {
+ ThreadTicks ThreadTicks::GetForThread(const HANDLE& thread_handle) {
+   DCHECK(IsSupported());
+ 
+-#if V8_HOST_ARCH_ARM64
++#if V8_HOST_ARCH_ARM64 || V8_HOST_ARCH_ARM
+   // QueryThreadCycleTime versus TSCTicksPerSecond doesn't have much relation to
+   // actual elapsed time on Windows on Arm, because QueryThreadCycleTime is
+   // backed by the actual number of CPU cycles executed, rather than a
+@@ -859,12 +859,12 @@ bool ThreadTicks::IsSupportedWin() {
+ 
+ // static
+ void ThreadTicks::WaitUntilInitializedWin() {
+-#ifndef V8_HOST_ARCH_ARM64
++#if !defined(V8_HOST_ARCH_ARM64) && !defined(V8_HOST_ARCH_ARM)
+   while (TSCTicksPerSecond() == 0) ::Sleep(10);
+ #endif
+ }
+ 
+-#ifndef V8_HOST_ARCH_ARM64
++#if !defined(V8_HOST_ARCH_ARM64) && !defined(V8_HOST_ARCH_ARM)
+ double ThreadTicks::TSCTicksPerSecond() {
+   DCHECK(IsSupported());
+ 
+@@ -923,7 +923,7 @@ double ThreadTicks::TSCTicksPerSecond() {
+ 
+   return tsc_ticks_per_second;
+ }
+-#endif  // !defined(V8_HOST_ARCH_ARM64)
++#endif  // !defined(V8_HOST_ARCH_ARM64) && !defined(V8_HOST_ARCH_ARM)
+ #endif  // V8_OS_WIN
+ 
+ }  // namespace base
+diff --git a/v8/src/base/platform/time.h b/v8/src/base/platform/time.h
+index 813241e..d204cbb 100644
+--- a/v8/src/base/platform/time.h
++++ b/v8/src/base/platform/time.h
+@@ -498,7 +498,7 @@ class V8_BASE_EXPORT ThreadTicks final
+   explicit constexpr ThreadTicks(int64_t ticks) : TimeBase(ticks) {}
+ 
+ #if V8_OS_WIN
+-#if V8_HOST_ARCH_ARM64
++#if V8_HOST_ARCH_ARM64 || V8_HOST_ARCH_ARM
+   // TSCTicksPerSecond is not supported on Windows on Arm systems because the
+   // cycle-counting methods use the actual CPU cycle count, and not a consistent
+   // incrementing counter.
+diff --git a/v8/src/libsampler/sampler.cc b/v8/src/libsampler/sampler.cc
+index 16cd153..a8dde19 100644
+--- a/v8/src/libsampler/sampler.cc
++++ b/v8/src/libsampler/sampler.cc
+@@ -633,6 +633,12 @@ void Sampler::DoSample() {
+     state.pc = reinterpret_cast<void*>(context.Pc);
+     state.sp = reinterpret_cast<void*>(context.Sp);
+     state.fp = reinterpret_cast<void*>(context.Fp);
++#elif V8_HOST_ARCH_ARM
++    // Venetium 0025: Windows on ARM32 uses r11 as the frame pointer.
++    state.pc = reinterpret_cast<void*>(context.Pc);
++    state.sp = reinterpret_cast<void*>(context.Sp);
++    state.fp = reinterpret_cast<void*>(context.R11);
++    state.lr = reinterpret_cast<void*>(context.Lr);
+ #else
+     state.pc = reinterpret_cast<void*>(context.Eip);
+     state.sp = reinterpret_cast<void*>(context.Esp);

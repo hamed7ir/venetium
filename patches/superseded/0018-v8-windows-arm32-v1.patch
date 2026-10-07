@@ -1,0 +1,253 @@
+Venetium 0018 - V8 on Windows ARM32 (thumbv7-pc-windows-msvc).
+
+BATCH-ARM-1 section 3B, his decisions 4 and 7 (ARM-1-DECISIONS.md), drafted against 150's own code (not CR109's). 10 files:
+- codegen/arm/constants-arm.h: the "ARM EABI support is required" #error does not apply to _M_ARM (clang-cl's Windows ARM32 target
+  does not define __ARM_EABI__, and defining it would be wrong: Windows ARM32 is not the EABI).
+- codegen/arm/cpu-arm.cc: FlushICache via FlushInstructionCache(GetCurrentProcess(), start, size) on Windows.
+- base/cpu/cpu-arm.cc: Windows ARM32 feature detection with IsProcessorFeaturePresent: NEON (PF 19), VFP 32 D-registers (PF 18),
+  integer divide only from PF_ARM_DIVIDE_INSTRUCTION_AVAILABLE (24; Tegra 3 has none), ARMv8 (29).
+- base/debug/stack_trace_win.cc: the ARM CONTEXT (Pc/R11/Sp, IMAGE_FILE_MACHINE_ARMNT) instead of the IA32 one.
+- snapshot/embedded/platform-embedded-file-writer-win.cc: the symbol prefix chosen at run time by the target architecture - no "_" for
+  arm (the "_" broke the link: undefined v8_blob), unchanged for the x86 targets, so out/x86-arm-sim keeps working.
+- execution/isolate.cc: the embedded blob base is read with bit 0 masked on a Windows ARM host (lld, like link.exe, sets the Thumb bit
+  on code-section symbols; the blob is data). Host predicate: isolate.cc also compiles into the x86 mksnapshot.
+- heap/base/asm/arm/push_registers_asm.cc: ELF-only .type/.hidden/.size guarded for COFF.
+- base/platform/platform-win32.cc: OS::ArmUsingHardFloat() for Windows returns true (Windows ARM32 is hard-float; #error if the
+  compiler ever stops defining __ARM_PCS_VFP) - it had no Windows definition (a link error).
+- _AddressOfReturnAddress: the three V8 sites (platform-win32.cc, platform.h, utils.cc) take __builtin_frame_address(0) on a
+  Windows ARM host: clang-cl defines _MSC_VER, and for thumbv7 that intrinsic is an unresolved external (TOOLCHAIN-ISSUES B2).
+  (Moved here from 0022 so every V8 file lives in one patch; Blink's site stays in 0022.)
+x86/x64/arm64 objects are unchanged (checked for the x86 snapshot toolchain object by object).
+
+diff --git a/v8/src/base/cpu/cpu-arm.cc b/v8/src/base/cpu/cpu-arm.cc
+index 2b6a9c8..0868d1d 100644
+--- a/v8/src/base/cpu/cpu-arm.cc
++++ b/v8/src/base/cpu/cpu-arm.cc
+@@ -323,6 +323,23 @@ void CPU::DetectFeatures() {
+   }
+   has_idiva_ = (cpu_flags & ARM_CPU_FLAG_IDIV) != 0;
+ 
++#elif V8_OS_WIN
++
++  // Windows on ARM (ARMNT) requires ARMv7-A with Thumb-2 and VFPv3. The OS
++  // reports the optional features: NEON, the 32-register VFP bank and hardware
++  // integer divide. Do not assume divide: it is absent on e.g. Cortex-A9.
++  architecture_ = 7;
++  has_thumb2_ = true;
++  has_fpu_ = true;
++  has_vfp_ = true;
++  has_vfp3_ = true;
++  has_neon_ = IsProcessorFeaturePresent(PF_ARM_NEON_INSTRUCTIONS_AVAILABLE);
++  has_vfp3_d32_ = IsProcessorFeaturePresent(PF_ARM_VFP_32_REGISTERS_AVAILABLE);
++  has_idiva_ = IsProcessorFeaturePresent(PF_ARM_DIVIDE_INSTRUCTION_AVAILABLE);
++  if (IsProcessorFeaturePresent(PF_ARM_V8_INSTRUCTIONS_AVAILABLE)) {
++    architecture_ = 8;
++  }
++
+ #endif  // V8_OS_LINUX
+ #elif V8_HOST_ARCH_ARM64
+ #ifdef V8_OS_WIN
+diff --git a/v8/src/base/debug/stack_trace_win.cc b/v8/src/base/debug/stack_trace_win.cc
+index f981bec..1349df9 100644
+--- a/v8/src/base/debug/stack_trace_win.cc
++++ b/v8/src/base/debug/stack_trace_win.cc
+@@ -207,6 +207,11 @@ void StackTrace::InitTrace(const CONTEXT* context_record) {
+ #else
+ #error Unsupported Arch
+ #endif
++#elif defined(_M_ARM)
++  int machine_type = IMAGE_FILE_MACHINE_ARMNT;
++  stack_frame.AddrPC.Offset = context_record->Pc;
++  stack_frame.AddrFrame.Offset = context_record->R11;
++  stack_frame.AddrStack.Offset = context_record->Sp;
+ #else
+   int machine_type = IMAGE_FILE_MACHINE_I386;
+   stack_frame.AddrPC.Offset = context_record->Eip;
+diff --git a/v8/src/base/platform/platform-win32.cc b/v8/src/base/platform/platform-win32.cc
+index 11f9772..a10e54f 100644
+--- a/v8/src/base/platform/platform-win32.cc
++++ b/v8/src/base/platform/platform-win32.cc
+@@ -1717,6 +1717,18 @@ int OS::ActivationFrameAlignment() {
+ #endif
+ }
+ 
++#ifdef __arm__
++// Windows on ARM (ARMNT) passes floating-point arguments and results in VFP
++// registers (hard float); clang-cl reports that as __ARM_PCS_VFP. The POSIX,
++// QNX and Starboard definitions are not built on Windows. Answering wrongly
++// would silently corrupt floating-point calls, so fail the build rather than
++// guess when the compiler does not report the hard-float ABI.
++#if !defined(__ARM_PCS_VFP)
++#error "Windows ARM32 is expected to use the VFP hard-float ABI."
++#endif
++bool OS::ArmUsingHardFloat() { return true; }
++#endif  // __arm__
++
+ #if defined(V8_OS_WIN)
+ void EnsureConsoleOutputWin32() {
+   UINT new_flags =
+@@ -1934,7 +1946,9 @@ void Stack::SetCurrentThreadStackBounds(uintptr_t limit, uintptr_t base) {
+ 
+ // static
+ Stack::StackSlot Stack::GetCurrentStackPosition() {
+-#if V8_CC_MSVC
++  // On ARM32 clang-cl does not expand _AddressOfReturnAddress() (the call stays
++  // unresolved at link time), so use the frame address there.
++#if V8_CC_MSVC && !V8_HOST_ARCH_ARM
+   return _AddressOfReturnAddress();
+ #else
+   return __builtin_frame_address(0);
+diff --git a/v8/src/base/platform/platform.h b/v8/src/base/platform/platform.h
+index f2cf576..950fec9 100644
+--- a/v8/src/base/platform/platform.h
++++ b/v8/src/base/platform/platform.h
+@@ -703,7 +703,9 @@ class V8_BASE_EXPORT Stack {
+   // return an address significantly above the actual current stack position.
+   static V8_NOINLINE StackSlot GetCurrentStackPosition();
+ 
+-#if V8_CC_MSVC
++  // On ARM32 clang-cl does not expand _AddressOfReturnAddress() (the call stays
++  // unresolved at link time), so use the frame address there.
++#if V8_CC_MSVC && !V8_HOST_ARCH_ARM
+ #define DEFAULT_CURRENT_FRAME_ADDRESS _AddressOfReturnAddress()
+ #else
+ #define DEFAULT_CURRENT_FRAME_ADDRESS __builtin_frame_address(0)
+diff --git a/v8/src/codegen/arm/constants-arm.h b/v8/src/codegen/arm/constants-arm.h
+index 64446a0..11a1c96 100644
+--- a/v8/src/codegen/arm/constants-arm.h
++++ b/v8/src/codegen/arm/constants-arm.h
+@@ -14,8 +14,9 @@
+ #include "src/utils/boxed-float.h"
+ #include "src/utils/utils.h"
+ 
+-// ARM EABI is required.
+-#if defined(__arm__) && !defined(__ARM_EABI__)
++// ARM EABI is required. Windows on ARM (_M_ARM) follows the AAPCS VFP
++// (hard-float) calling convention, but clang-cl does not define __ARM_EABI__.
++#if defined(__arm__) && !defined(__ARM_EABI__) && !defined(_M_ARM)
+ #error ARM EABI support is required.
+ #endif
+ 
+diff --git a/v8/src/codegen/arm/cpu-arm.cc b/v8/src/codegen/arm/cpu-arm.cc
+index 6fc1dd9..007becb 100644
+--- a/v8/src/codegen/arm/cpu-arm.cc
++++ b/v8/src/codegen/arm/cpu-arm.cc
+@@ -12,6 +12,8 @@
+ #include <sys/types.h>
+ #elif V8_OS_STARBOARD
+ #define __ARM_NR_cacheflush 0x0f0002
++#elif defined(_WIN32)
++#include <windows.h>  // for FlushInstructionCache().
+ #else
+ #include <sys/syscall.h>  // for cache flushing.
+ #endif
+@@ -34,6 +36,8 @@ V8_NOINLINE void CpuFeatures::FlushICache(void* start, size_t size) {
+   struct arm_sync_icache_args args = {
+       .addr = reinterpret_cast<uintptr_t>(start), .len = size};
+   sysarch(ARM_SYNC_ICACHE, reinterpret_cast<void*>(&args));
++#elif V8_OS_WIN
++  ::FlushInstructionCache(GetCurrentProcess(), start, size);
+ #else
+   register uint32_t beg asm("r0") = reinterpret_cast<uint32_t>(start);
+   register uint32_t end asm("r1") = beg + size;
+diff --git a/v8/src/execution/isolate.cc b/v8/src/execution/isolate.cc
+index 80e39c7..5b381b9 100644
+--- a/v8/src/execution/isolate.cc
++++ b/v8/src/execution/isolate.cc
+@@ -205,7 +205,19 @@ namespace internal {
+ #endif
+ 
+ const uint8_t* DefaultEmbeddedBlobCode() {
++#if defined(V8_HOST_ARCH_ARM) && defined(V8_OS_WIN)
++  // The linker sets bit 0 (the Thumb bit) in the address of any symbol that
++  // lives in an executable section, so the raw address of the embedded blob is
++  // odd. The blob is A32 code: strip the bit so that every builtin entry point
++  // derived from it is even and runs in ARM state. This is keyed on the host
++  // architecture: isolate.cc also builds into the x86 mksnapshot, which has
++  // V8_TARGET_ARCH_ARM but an ordinary x86 data symbol here.
++  return reinterpret_cast<const uint8_t*>(
++      reinterpret_cast<uintptr_t>(v8_Default_embedded_blob_code_) &
++      ~uintptr_t{1});
++#else
+   return v8_Default_embedded_blob_code_;
++#endif
+ }
+ uint32_t DefaultEmbeddedBlobCodeSize() {
+   return v8_Default_embedded_blob_code_size_;
+diff --git a/v8/src/heap/base/asm/arm/push_registers_asm.cc b/v8/src/heap/base/asm/arm/push_registers_asm.cc
+index ccf0444..2ef9100 100644
+--- a/v8/src/heap/base/asm/arm/push_registers_asm.cc
++++ b/v8/src/heap/base/asm/arm/push_registers_asm.cc
+@@ -18,8 +18,10 @@
+ // https://en.wikipedia.org/wiki/Calling_convention#ARM_(A32)
+ // http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.faqs/ka4127.html
+ asm(".globl PushAllRegistersAndIterateStack             \n"
++#if !defined(_WIN32)
+     ".type PushAllRegistersAndIterateStack, %function   \n"
+     ".hidden PushAllRegistersAndIterateStack            \n"
++#endif  // !defined(_WIN32)
+     "PushAllRegistersAndIterateStack:                   \n"
+     // Push all callee-saved registers and save return address.
+     // Only {r4-r11} are callee-saved registers. Push r3 in addition to align
+@@ -37,9 +39,9 @@ asm(".globl PushAllRegistersAndIterateStack             \n"
+     "  add sp, sp, #36                                  \n"
+     // Pop lr into pc which returns and switches mode if needed.
+     "  pop {pc}                                         \n"
+-#if !defined(__APPLE__)
++#if !defined(__APPLE__) && !defined(_WIN32)
+     ".Lfunc_end0:                                       \n"
+     ".size PushAllRegistersAndIterateStack, "
+     ".Lfunc_end0-PushAllRegistersAndIterateStack\n"
+-#endif  // !defined(__APPLE__)
++#endif  // !defined(__APPLE__) && !defined(_WIN32)
+     );
+diff --git a/v8/src/snapshot/embedded/platform-embedded-file-writer-win.cc b/v8/src/snapshot/embedded/platform-embedded-file-writer-win.cc
+index bf76435..4a64ee0 100644
+--- a/v8/src/snapshot/embedded/platform-embedded-file-writer-win.cc
++++ b/v8/src/snapshot/embedded/platform-embedded-file-writer-win.cc
+@@ -41,12 +41,19 @@ namespace internal {
+ // https://docs.microsoft.com/en-us/cpp/assembler/arm/arm-assembler-reference
+ 
+ // Name mangling.
+-// Symbols are prefixed with an underscore on 32-bit architectures.
++// Symbols are prefixed with an underscore on 32-bit architectures, except for
++// ARM32, whose COFF C symbols are undecorated. The ARM32 case is decided at run
++// time from the target architecture rather than from V8_TARGET_ARCH_ARM: the
++// mksnapshot that writes the ARM blob is an x86 binary built with
++// V8_TARGET_ARCH_ARM, and the same binary writes an x86 blob with
++// --target_arch=x86 (the x86 simulator build), which needs the underscore.
+ #if !defined(V8_TARGET_ARCH_X64) && !defined(V8_TARGET_ARCH_ARM64)
+-#define SYMBOL_PREFIX "_"
++#define SYMBOL_PREFIX_DEFAULT "_"
+ #else
+-#define SYMBOL_PREFIX ""
++#define SYMBOL_PREFIX_DEFAULT ""
+ #endif
++#define SYMBOL_PREFIX \
++  (target_arch_ == EmbeddedTargetArch::kArm ? "" : SYMBOL_PREFIX_DEFAULT)
+ 
+ // Notes:
+ //
+@@ -707,6 +714,7 @@ int PlatformEmbeddedFileWriterWin::WriteByteChunk(const uint8_t* data) {
+ }
+ 
+ #undef SYMBOL_PREFIX
++#undef SYMBOL_PREFIX_DEFAULT
+ #undef V8_ASSEMBLER_IS_MASM
+ #undef V8_ASSEMBLER_IS_MARMASM
+ #undef V8_COMPILER_IS_MSVC
+diff --git a/v8/src/utils/utils.cc b/v8/src/utils/utils.cc
+index e59717a..b2dbd6a 100644
+--- a/v8/src/utils/utils.cc
++++ b/v8/src/utils/utils.cc
+@@ -214,7 +214,9 @@ bool DoubleToBoolean(double d) {
+ }
+ 
+ uintptr_t GetCurrentStackPosition() {
+-#if V8_CC_MSVC
++  // On ARM32 clang-cl does not expand _AddressOfReturnAddress() (the call stays
++  // unresolved at link time), so use the frame address there.
++#if V8_CC_MSVC && !V8_HOST_ARCH_ARM
+   return reinterpret_cast<uintptr_t>(_AddressOfReturnAddress());
+ #else
+   return reinterpret_cast<uintptr_t>(__builtin_frame_address(0));

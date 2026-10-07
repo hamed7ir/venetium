@@ -1,0 +1,394 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Venetium kit &mdash; wasm</title>
+<script src="lib/configs.js"></script>
+<script src="lib/build.js"></script>
+<script src="lib/kit.js"></script>
+<script src="data/wasm-data.js"></script>
+<script src="lib/wasm-asm.js"></script>
+<script src="lib/wasm-cases.js"></script>
+<script>
+// WebAssembly. The cases of s10/jit/wasm.js (BATCH-V8SIM-2 3.6) - a module of i32 and i64 add / mul / div_s - with the module bytes
+// inline (data/wasm-data.js, base64) and the host's answers embedded (s10/jit/expected.py == expected.txt == node-x64.txt), plus
+// extra cases for what a 32-bit target does differently: 64-bit operators (i64 shifts and rotates by variable and by constant amounts
+// around 31/32/33), i64 <-> f32/f64, bounds-checked memory (narrow / extending / unaligned / float / static-offset / constant-address
+// loads and stores: a script of about 1,400 steps in 5 phases whose wants come from a python model, replayed in Node = V8 on x64 by the generator), hot loops.
+// The shape of what runs is asserted too: the generator writes the phase list with its step counts (data ext.mem.expect) and the operator groups with
+// their counts (ext.expect); the page counts what it actually executed and FAILS unless the executed phases / steps / functions / groups equal that
+// record, so a data file that lost the float or the offset / constant-address phase cannot pass by omission (lib/wasm-cases.js memShape / opsShape).
+// Which configurations apply: every one where WebAssembly exists. --jitless exposes no WebAssembly in this build (V8 gates it, and
+// the build has no wasm interpreter): there every case is n/a, and real checks prove WebAssembly really is absent.
+// The wasm tier (BATCH-DEVICE-1). Every configuration except `default` has --allow-natives-syntax (lib/wasm-tier.js, loaded only then),
+// so the page reads the tier of the functions it runs and compares it with the expectation of lib/configs.js (cfg.wasmTier, host side):
+//   liftoff-only (--liftoff-only): everything must still be Liftoff as called, and the hot loops must still be Liftoff after a soak of
+//                  hot calls (default tiering would have promoted them in that time: that is what tells a dropped flag from a kept one);
+//   no-liftoff  (--no-liftoff): everything must be TurboFan from the first call;
+//   the other natives configurations (default tiering): every function must be compiled code as called (liftoff or turbofan, never
+//                  uncompiled), the tier is reported, not asserted (promotion is a background compile: timing-dependent);
+//   default (no natives): no tier claim at all - Kit.na, plus timings as information.
+// In every natives configuration the page then forces TurboFan with %WasmTierUpFunction and runs the cases again (on a fresh instance of
+// the same module for the memory script: the code, and its tier, belongs to the module). The labels of the phases are MEASURED.
+(async () => {
+  // start once the body exists, so that the kit's table lists the rows in the order the checks ran
+  if (document.readyState === 'loading') await new Promise(r => document.addEventListener('DOMContentLoaded', r));
+  const D = window.KIT_WASM, C = window.KitWasmCases, cfg = Kit.cfg;
+  const HP = D.s10.host_python, HN = D.s10.host_node_x64;
+  // ---- the wasm tier, asserted: cfg.wasmTier is 'liftoff' (--liftoff-only), 'turbofan' (--no-liftoff) or absent (default tiering: not asserted)
+  const WANT = cfg.wasmTier || null;
+  const SOAK_MS = 6000;           // liftoff-only: how long the hot loops are kept hot before the tier is read (it stops at the first TurboFan)
+  const extra = { tier: '', wasm: { expectedTier: WANT, natives: Kit.natives, tierAssert: { want: WANT }, stepMs: {} } };
+  let finished = false;
+  const finish = async () => { if (finished) return; finished = true; clearTimeout(watchdog); await Kit.done(extra); };
+  const watchdog = setTimeout(async () => {
+    if (finished) return;
+    Kit.check('page finished within its time budget', 'under 100 s', 'still running after 100 s', false);
+    await finish();
+  }, 100000);
+  const t00 = performance.now();
+  const timeout = (p, ms, what) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timed out after ' + ms / 1000 + ' s: ' + what)), ms))]);
+  const errs = e => (e && e.name ? e.name + ': ' + e.message : String(e));
+  // every step is timed (extra.wasm.stepMs): the device's time budget is reported, not assumed
+  const step = async (name, fn) => {
+    const t0 = performance.now();
+    try { await fn(); } catch (e) { Kit.check(name + ': ran to the end', 'no exception', errs(e), false); }
+    extra.wasm.stepMs[name] = Math.round(performance.now() - t0);
+  };
+  let N = null;                                                       // the natives (lib/wasm-tier.js), once loaded
+  const same = (n, t) => Array(n).fill(t).join();
+  const tally = fns => { const c = {}; fns.forEach(f => { const s = N.status(f); c[s] = (c[s] || 0) + 1; }); return c; };   // only called with natives (N set)
+  const tierText = c => { const k = Object.keys(c); return k.length === 1 ? k[0] : k.map(t => t + '=' + c[t]).join(' '); };
+  const plus1 = s => s.replace(/^-?\d+/, m => String(Number(m) + 1));      // the planted wrong answer: the sum + 1
+  const JS_NAMES = D.s10.exports;
+  const A = await Kit.arch();                                         // never rejects (3 s timeout)
+  extra.wasm.arch = A; extra.wasm.build = Kit.build;
+  Kit.info('configuration', Kit.config + '; js-flags: ' + (cfg.flags.join(' ') || '(none)') + '; natives ' + Kit.natives +
+           '; wasm tier by flags: ' + (cfg.nowasm ? '(no WebAssembly under --jitless)' : WANT || 'default tiering (Liftoff first, TurboFan when hot)') +
+           (cfg.tier ? '; JS tier flag ' + cfg.tier + ' (this page proves a WASM tier only, the JS flag does not change it' + (cfg.ia32 === 'n/a' ? (A.ia32 ? '; this browser is ia32 and V8 has no Maglev there, so the flag is a no-op' : '; V8 builds no Maglev for ia32, and this browser is not ia32') : '') + ')' : ''));
+  Kit.info('CPU the browser reports (userAgentData) and the build record', 'architecture ' + JSON.stringify(A.architecture) + ', bitness ' + JSON.stringify(A.bitness) + ', wow64 ' + A.wow64 +
+           ', ia32 ' + A.ia32 + (A.note ? ' (' + A.note + ')' : '') + '; KIT_BUILD ' + (Kit.build ? JSON.stringify(Kit.build) : 'null (no build record in this copy of the kit)'));
+
+  // ============================================================ --jitless: no WebAssembly
+  if (cfg.nowasm) {
+    const wantType = Kit.want('undefined', 'object');                       // the planted expectation of this configuration
+    const gotType = typeof WebAssembly;
+    Kit.check('typeof WebAssembly under --jitless (V8 does not expose it)', wantType, gotType, gotType === wantType);
+    let use;
+    try { WebAssembly.validate(C.bytes(D.s10.b64)); use = 'usable (validate returned)'; } catch (e) { use = e.name; }
+    Kit.check('using WebAssembly under --jitless throws ReferenceError', 'ReferenceError', use, use === 'ReferenceError');
+    Kit.check("'WebAssembly' in globalThis, and no WebAssembly.Module either", 'false,false',
+              ('WebAssembly' in globalThis) + ',' + (typeof globalThis.WebAssembly !== 'undefined' && typeof globalThis.WebAssembly.Module !== 'undefined'),
+              !('WebAssembly' in globalThis) && !(typeof globalThis.WebAssembly !== 'undefined' && typeof globalThis.WebAssembly.Module !== 'undefined'));
+    // not vacuous: prove --jitless is really what is in effect in this renderer (natives are on in this configuration)
+    await step('natives', async () => {
+      await Kit.loadScript('lib/wasm-tier.js');
+      const j = window.KitWasmNatives.jit();
+      Kit.check('--jitless is in effect: %IsTurbofanEnabled / %IsSparkplugEnabled / %IsMaglevEnabled', 'false,false,false', [j.turbofan, j.sparkplug, j.maglev].join(),
+                !j.turbofan && !j.sparkplug && !j.maglev);
+    });
+    const why = 'WebAssembly is not available under --jitless';
+    Kit.na('wasm_i32 (s10 case)', why); Kit.na('wasm_i64 (s10 case)', why);
+    Kit.na('i32/i64 traps and boundary values', why); Kit.na('async compile / instantiate / streaming', why); Kit.na('invalid modules are rejected', why);
+    Kit.na('ext: i64 / i32 operator digests (every group) and the group / operator counts', why); Kit.na('ext: i64 shift and rotate digests (variable and constant amounts, 31/32/33)', why);
+    Kit.na('ext: memory loads and stores, bounds-check traps, growth', why); Kit.na('ext: memory script (narrow, extending, unaligned, float, offset, constant-address accesses) and its phase / step counts', why);
+    Kit.na('ext: hot loops (spin, memloop, tier-up timing)', why); Kit.na('wasm tier', why);
+    extra.tier = 'n/a (no WebAssembly under --jitless)';
+    await finish();
+    return;
+  }
+
+  // ============================================================ WebAssembly present
+  const API = ['Module', 'Instance', 'Memory', 'Table', 'Global', 'validate', 'compile', 'instantiate', 'compileStreaming', 'instantiateStreaming', 'RuntimeError', 'CompileError', 'LinkError'];
+  const missing = typeof WebAssembly === 'undefined' ? ['WebAssembly itself'] : API.filter(n => typeof WebAssembly[n] !== 'function');
+  Kit.check('WebAssembly API: ' + API.join(', '), 'all present', missing.length ? 'missing: ' + missing.join(', ') : 'all present', missing.length === 0);
+  if (missing.length) { extra.tier = 'no WebAssembly'; await finish(); return; }
+
+  // feature probes (information only): wasm-feature-detect's minimal modules
+  const FEAT = {
+    simd: [0,97,115,109,1,0,0,0,1,5,1,96,0,1,123,3,2,1,0,10,10,1,8,0,65,0,253,15,253,98,11],
+    threads: [0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,5,4,1,3,1,1,10,11,1,9,0,65,0,254,16,2,0,26,11],
+    'bulk-memory': [0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,5,3,1,0,1,10,14,1,12,0,65,0,65,0,65,0,252,10,0,0,11],
+    'reference-types': [0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,10,7,1,5,0,208,112,26,11],
+    exceptions: [0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,10,8,1,6,0,6,64,25,11,11],
+    'tail-call': [0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,10,6,1,4,0,18,0,11],
+  };
+  const feat = {};
+  for (const k in FEAT) { try { feat[k] = WebAssembly.validate(new Uint8Array(FEAT[k])); } catch (e) { feat[k] = errs(e); } }
+  extra.wasm.features = feat;
+  Kit.info('wasm features (WebAssembly.validate of minimal modules)', Object.keys(feat).map(k => k + '=' + feat[k]).join(', '));
+
+  // ------------------------------------------------------------ s10 module
+  const embedded = C.bytes(D.s10.b64);
+  let e = null;
+  await step('s10 module', async () => {
+    const asm = KitWasmAsm.s10Bytes();
+    const ident = asm.length === embedded.length && asm.every((b, i) => b === embedded[i]);
+    Kit.check("STRUCTURAL: the embedded bytes are what s10/jit/wasm.js's assembler builds", embedded.length + ' bytes, identical',
+              asm.length + ' bytes, ' + (ident ? 'identical' : 'DIFFERENT'), ident);
+    const v = WebAssembly.validate(embedded);
+    Kit.check('WebAssembly.validate(module bytes)', true, v, v === true);
+    const mod = new WebAssembly.Module(embedded);
+    const exp = WebAssembly.Module.exports(mod).map(x => x.name + ':' + x.kind).join();
+    Kit.eq('WebAssembly.Module.exports(module)', JS_NAMES.map(n => n + ':function').join(), exp);
+    e = new WebAssembly.Instance(mod).exports;
+    const shape = Object.keys(e).join() + ' / ' + JS_NAMES.map(n => typeof e[n] + e[n].length).join();
+    Kit.eq('instance.exports: the six functions in order, each of arity 2', JS_NAMES.join() + ' / ' + JS_NAMES.map(() => 'function2').join(), shape);
+  });
+  if (e) {
+    await step('wasm_i32', async () => {
+      const vals = C.reps(() => C.caseI32(e)), last = vals[vals.length - 1];
+      const want = Kit.want(HP.wasm_i32, plus1(HP.wasm_i32));               // PLANTED when armed: the host's wasm_i32 answer + 1
+      Kit.check('wasm_i32 (s10 case, 4 repetitions, last value) = the host (python, expected.py)', want, last, last === want);
+      Kit.check('wasm_i32: the 4 repetitions agree (s10 reports UNSTABLE otherwise)', 'one value, 4 times', vals.join(' | '), vals.every(x => x === vals[0]));
+      Kit.check('wasm_i32 = the host\'s V8 on x64 (the original wasm.js run in Node)', HN.wasm_i32, last, last === HN.wasm_i32);
+      extra.wasm.wasm_i32 = last;
+    });
+    await step('wasm_i64', async () => {
+      const vals = C.reps(() => C.caseI64(e)), last = vals[vals.length - 1];
+      Kit.check('wasm_i64 (s10 case, 4 repetitions, last value) = the host (python, expected.py)', HP.wasm_i64, last, last === HP.wasm_i64);
+      Kit.check('wasm_i64: the 4 repetitions agree (s10 reports UNSTABLE otherwise)', 'one value, 4 times', vals.join(' | '), vals.every(x => x === vals[0]));
+      Kit.check('wasm_i64 = the host\'s V8 on x64 (the original wasm.js run in Node)', HN.wasm_i64, last, last === HN.wasm_i64);
+      extra.wasm.wasm_i64 = last;
+    });
+    await step('spot values and traps', async () => {
+      Kit.eq('i32 spot values: add32(0x7fffffff,1) mul32(65536,65536) mul32(-1,-1) div32(-7,2) div32(7,-2)', '-2147483648,0,1,-3,-3',
+             [e.add32(0x7fffffff, 1), e.mul32(65536, 65536), e.mul32(-1, -1), e.div32(-7, 2), e.div32(7, -2)].join());
+      Kit.eq('i64 spot values: add64(2^63-1,1) mul64(2^32,2^32) mul64(-1,-1) div64(-7,2) div64(7,-2)', '-9223372036854775808,0,1,-3,-3',
+             [e.add64(0x7fffffffffffffffn, 1n), e.mul64(0x100000000n, 0x100000000n), e.mul64(-1n, -1n), e.div64(-7n, 2n), e.div64(7n, -2n)].join());
+      Kit.eq('an i64 result is a BigInt, an i32 result a Number', 'bigint,number', typeof e.add64(1n, 2n) + ',' + typeof e.add32(1, 2));
+      Kit.eq('a Number for an i64 parameter is a TypeError (no implicit Number -> BigInt)', 'TypeError', C.trap(() => e.add64(1, 2)));
+      const t = [C.trap(() => e.div32(1, 0)), C.trap(() => e.div32(-2147483648, -1)), C.trap(() => e.div64(1n, 0n)), C.trap(() => e.div64(-9223372036854775808n, -1n))];
+      Kit.eq('traps: div32 by 0, div32 INT32_MIN/-1, div64 by 0, div64 INT64_MIN/-1 are each a WebAssembly.RuntimeError', 'RuntimeError,RuntimeError,RuntimeError,RuntimeError', t.join());
+      let msgs = [];
+      for (const f of [() => e.div32(1, 0), () => e.div32(-2147483648, -1)]) { try { f(); } catch (x) { msgs.push(x.message); } }
+      Kit.info('trap messages (div32 by 0, div32 INT32_MIN/-1)', msgs.join(' | '));
+    });
+  }
+
+  // ------------------------------------------------------------ async compile, streaming, invalid modules
+  await step('async compile', async () => {
+    const r = await timeout(WebAssembly.instantiate(embedded), 30000, 'WebAssembly.instantiate(bytes)');
+    Kit.check('WebAssembly.instantiate(bytes) resolves with {module, instance}', 'Module + Instance',
+              (r.module instanceof WebAssembly.Module) + '/' + (r.instance instanceof WebAssembly.Instance), r.module instanceof WebAssembly.Module && r.instance instanceof WebAssembly.Instance);
+    const a32 = C.caseI32(r.instance.exports), a64 = C.caseI64(r.instance.exports);
+    Kit.check('async instance: wasm_i32 and wasm_i64 = the host', HP.wasm_i32 + ' | ' + HP.wasm_i64, a32 + ' | ' + a64, a32 === HP.wasm_i32 && a64 === HP.wasm_i64);
+    const m = await timeout(WebAssembly.compile(embedded), 30000, 'WebAssembly.compile(bytes)');
+    const i2 = await timeout(WebAssembly.instantiate(m), 30000, 'WebAssembly.instantiate(module)');
+    Kit.check('WebAssembly.compile(bytes) then instantiate(module): an Instance whose cases = the host', 'Instance, ' + HP.wasm_i64,
+              (i2 instanceof WebAssembly.Instance) + ', ' + C.caseI64(i2.exports), i2 instanceof WebAssembly.Instance && C.caseI64(i2.exports) === HP.wasm_i64);
+  });
+  await step('streaming compile', async () => {
+    // Blink's streaming glue, fed from an in-memory Response (no fetch of any file)
+    const resp = new Response(new Blob([embedded], { type: 'application/wasm' }), { headers: { 'Content-Type': 'application/wasm' } });
+    const r = await timeout(WebAssembly.instantiateStreaming(resp), 30000, 'WebAssembly.instantiateStreaming(Response)');
+    const a32 = C.caseI32(r.instance.exports);
+    Kit.check('WebAssembly.instantiateStreaming(Response of the bytes): wasm_i32 = the host', HP.wasm_i32, a32, a32 === HP.wasm_i32);
+    const resp2 = new Response(embedded, { headers: { 'Content-Type': 'text/plain' } });
+    let rej; try { await timeout(WebAssembly.compileStreaming(resp2), 30000, 'compileStreaming wrong MIME'); rej = 'resolved'; } catch (x) { rej = x.name; }
+    Kit.check('compileStreaming of a Response that is not application/wasm is rejected (TypeError)', 'TypeError', rej, rej === 'TypeError');
+  });
+  await step('invalid modules', async () => {
+    const badMagic = Uint8Array.from(embedded); badMagic[1] = 0x42;
+    const truncated = embedded.slice(0, 40);
+    const empty = new Uint8Array(0);
+    Kit.eq('WebAssembly.validate: bad magic, truncated, empty', 'false,false,false', [WebAssembly.validate(badMagic), WebAssembly.validate(truncated), WebAssembly.validate(empty)].join());
+    Kit.eq('new WebAssembly.Module(bad magic / truncated) throws CompileError', 'CompileError,CompileError', [C.trap(() => new WebAssembly.Module(badMagic)), C.trap(() => new WebAssembly.Module(truncated))].join());
+    let rej; try { await timeout(WebAssembly.compile(badMagic), 30000, 'compile(bad magic)'); rej = 'resolved'; } catch (x) { rej = x.name; }
+    Kit.eq('WebAssembly.compile(bad magic) rejects with CompileError', 'CompileError', rej);
+    // a module that imports something the page does not supply
+    const needsImport = Uint8Array.from([0,97,115,109,1,0,0,0, 1,4,1,96,0,0, 2,7,1,1,109,1,102,0,0]);   // (import "m" "f" (func))
+    Kit.check('the import-only test module is valid wasm (so the LinkError below is about linking)', true, WebAssembly.validate(needsImport), WebAssembly.validate(needsImport) === true);
+    Kit.eq('instantiating a module with an unmet import throws TypeError (no import object)', 'TypeError', C.trap(() => new WebAssembly.Instance(new WebAssembly.Module(needsImport))));
+    Kit.eq('...and with an import object that lacks the function: LinkError', 'LinkError', C.trap(() => new WebAssembly.Instance(new WebAssembly.Module(needsImport), { m: {} })));
+  });
+
+  // ------------------------------------------------------------ the tier, through natives where the configuration has them
+  if (Kit.natives) {
+    await step('natives', async () => {
+      await Kit.loadScript('lib/wasm-tier.js'); N = window.KitWasmNatives;
+      // the natives must answer for a real wasm function: 'other' would mean they do not see the code (a fresh module copy, its export, before any call)
+      const st = N.status(new WebAssembly.Instance(new WebAssembly.Module(KitWasmAsm.withNonce(embedded, 'natives-probe-' + Math.random()))).exports.add32);
+      Kit.check('V8 natives work on a wasm export (this configuration passes --allow-natives-syntax): its status', 'uncompiled, liftoff or turbofan', st, st === 'uncompiled' || st === 'liftoff' || st === 'turbofan');
+      Kit.info('wasm trap handler (true: OOB by signal handler; false: explicit bounds checks)', N.trapHandler());
+    });
+  } else if (WANT) {
+    // lib/configs.js gives every configuration that expects a wasm tier natives; if that ever drifts, the page must not report PASS without a proof
+    Kit.check('configuration "' + Kit.config + '" expects wasm tier ' + WANT + ' (lib/configs.js), so it must be able to read the tier (--allow-natives-syntax)', 'natives available', 'natives off: the tier cannot be proven', false);
+  } else {
+    Kit.na('wasm tier proof through V8 natives', 'configuration "' + Kit.config + '" has no --allow-natives-syntax (it is the as-shipped flag set); default tiering (Liftoff first, TurboFan when a function is hot) cannot be read without natives');
+  }
+  const tierNotes = [];
+  const wantFlag = '--' + (WANT === 'liftoff' ? 'liftoff-only' : 'no-liftoff');
+  if (N) await step('wasm tier (s10 module)', async () => {
+    // a module copy V8 has not seen (custom section), so its code is compiled fresh and is still at its first tier
+    const f = new WebAssembly.Instance(new WebAssembly.Module(KitWasmAsm.withNonce(embedded, 'tier-s10-' + Math.random()))).exports;
+    const st = () => JS_NAMES.map(n => N.status(f[n])).join(',');
+    Kit.info('wasm tier of the 6 exports of a fresh instance, before any call', st());
+    const r1 = [C.caseI32(f), C.caseI64(f)];
+    const s1 = st();
+    if (WANT) Kit.check('wasm tier ASSERTED: ' + Kit.config + ' (' + wantFlag + ') => the 6 s10 exports are ' + WANT + ' after the cases, before any forced tier-up',
+                        same(6, WANT), s1, s1 === same(6, WANT));
+    else Kit.info('wasm tier of the 6 exports after the s10 cases ran once (default tiering: Liftoff unless already promoted)', s1);
+    extra.wasm.tierAssert.s10 = s1;
+    Kit.check('fresh instance, cases as compiled: wasm_i32 | wasm_i64 = the host', HP.wasm_i32 + ' | ' + HP.wasm_i64, r1.join(' | '), r1[0] === HP.wasm_i32 && r1[1] === HP.wasm_i64);
+    JS_NAMES.forEach(n => N.tierUp(f[n]));
+    const s2 = st();
+    Kit.check('%WasmTierUpFunction: all 6 exports are TurboFan code afterwards', same(6, 'turbofan'), s2, s2 === same(6, 'turbofan'));
+    const r2 = C.reps(() => C.caseI32(f)).concat(C.reps(() => C.caseI64(f)));
+    Kit.check('after forced TurboFan, wasm_i32 x4 and wasm_i64 x4 = the host', 'all 8 equal the host',
+              r2.every((v, i) => v === (i < 4 ? HP.wasm_i32 : HP.wasm_i64)) ? 'all 8 equal' : r2.join(' | '), r2.every((v, i) => v === (i < 4 ? HP.wasm_i32 : HP.wasm_i64)));
+    tierNotes.push('s10: ' + s1 + ' as called -> forced ' + (s2 === same(6, 'turbofan') ? 'turbofan' : s2));
+  });
+
+  // ------------------------------------------------------------ ext: operators on a 32-bit target
+  const extBytes = C.bytes(D.ext.b64);
+  const groups = [];
+  for (const o of D.ext.ops) { let g = groups.find(x => x.name === o.group); if (!g) groups.push(g = { name: o.group, ops: [] }); g.ops.push(o); }
+  const callsTraps = ds => { let c = 0, t = 0; for (const k in ds) { const p = ds[k].split('/'); c += Number(p[1]); t += Number(p[2]); } return c + ' calls, ' + t + ' traps'; };
+  const phase = (label, got) => {
+    // the SHAPE of the pass: the groups and operator counts the page digested are exactly the host's record (a group lost from the data would otherwise just have no row)
+    const sh = C.opsShape(got, D);
+    Kit.check('ext operators' + label + ': the digest pass covered exactly the operator groups and counts of the host record (data ext.expect)', sh.want, sh.got, sh.ok);
+    for (const g of groups) {
+      const bad = g.ops.filter(o => got[o.fn] !== D.ext.host_python[o.fn]);
+      const mine = {}; g.ops.forEach(o => { mine[o.fn] = got[o.fn]; });
+      Kit.check('ext ' + g.name + ': ' + g.ops.length + ' operators, every input tuple; result digests = the host' + label,
+                g.ops.length + ' digests as the host (' + callsTraps(mine) + ')',
+                bad.length ? bad.length + ' DIFFER: ' + bad.slice(0, 3).map(o => o.name + ' got ' + got[o.fn] + ' want ' + D.ext.host_python[o.fn]).join('; ') : 'all ' + g.ops.length + ' equal',
+                bad.length === 0);
+    }
+  };
+  await step('ext operators', async () => {
+    Kit.check('WebAssembly.validate(ext module: ' + extBytes.length + ' bytes, ' + D.ext.ops.length + ' operators + memory functions + hot loops)', true, WebAssembly.validate(extBytes), WebAssembly.validate(extBytes) === true);
+    const ei = new WebAssembly.Instance(new WebAssembly.Module(KitWasmAsm.withNonce(extBytes, 'ext-ops-' + Math.random()))).exports;
+    const dg1 = C.digestOps(ei, D);                                          // every operator has been called (many tuples each): its tier is now what the configuration gives
+    let lab1 = '', nOps = D.ext.ops.length, t1 = null;
+    if (N) {
+      t1 = tally(D.ext.ops.map(o => ei[o.fn]));
+      lab1 = ' [as called: ' + tierText(t1) + ']';                            // MEASURED, not assumed
+      if (WANT) Kit.check('wasm tier ASSERTED: all ' + nOps + ' ext operators are ' + WANT + ' as called, before any forced tier-up', WANT + ': ' + nOps, JSON.stringify(t1), t1[WANT] === nOps);
+      else Kit.check('every ext operator is compiled code (liftoff or turbofan; never uncompiled/other) as called', 'liftoff + turbofan = ' + nOps, JSON.stringify(t1), (t1.liftoff || 0) + (t1.turbofan || 0) === nOps);
+      extra.wasm.tierAssert.ext = t1;
+    }
+    phase(lab1, dg1);
+    if (N) {
+      D.ext.ops.forEach(o => N.tierUp(ei[o.fn]));
+      const sts = tally(D.ext.ops.map(o => ei[o.fn]));
+      Kit.check('%WasmTierUpFunction: all ' + nOps + ' ext operators are TurboFan code afterwards', 'turbofan: ' + nOps, JSON.stringify(sts), sts.turbofan === nOps);
+      phase(t1.turbofan === nOps ? ' [second pass: already TurboFan, %WasmTierUpFunction was a no-op]' : ' [after %WasmTierUpFunction: TurboFan]', C.digestOps(ei, D));
+      tierNotes.push('ext: ' + nOps + ' operators ' + tierText(t1) + ' as called -> forced turbofan');
+    }
+  });
+  await step('ext memory', async () => {
+    const mod = new WebAssembly.Module(KitWasmAsm.withNonce(extBytes, 'ext-mem-' + Math.random()));
+    const ei = new WebAssembly.Instance(mod).exports;
+    const MP = ['ld32', 'st32', 'ld64', 'st64', 'grow', 'size'];             // the functions memProbe calls
+    const probeRow = (label, probes) => {
+      const badP = probes.filter(p => p[1] !== p[2]);
+      Kit.check('ext memory: ' + probes.length + ' probes (wasm loads/stores, little-endian layout, bounds-check traps at the edges, growth, the page maximum)' + label, 'all ' + probes.length + ' as expected',
+                badP.length ? badP.length + ' WRONG: ' + badP.slice(0, 4).map(p => p[0] + ' want ' + p[1] + ' got ' + p[2]).join('; ') : 'all ' + probes.length + ' as expected', badP.length === 0);
+    };
+    const probes = C.memProbe(ei);
+    let lab = '', t = null;
+    if (N) {
+      t = tally(MP.map(n => ei[n])); lab = ' [as called: ' + tierText(t) + ']';
+      if (WANT) Kit.check('wasm tier ASSERTED: the ' + MP.length + ' functions of the memory probes are ' + WANT + ' as called, before any forced tier-up', WANT + ': ' + MP.length, JSON.stringify(t), t[WANT] === MP.length);
+      extra.wasm.tierAssert.memProbe = t;
+    }
+    probeRow(lab, probes);
+    if (N) {
+      MP.forEach(n => N.tierUp(ei[n]));
+      const t2 = tally(MP.map(n => ei[n]));
+      Kit.check('%WasmTierUpFunction: the ' + MP.length + ' functions of the memory probes are TurboFan code afterwards', 'turbofan: ' + MP.length, JSON.stringify(t2), t2.turbofan === MP.length);
+      probeRow(t.turbofan === MP.length ? ' [second pass: already TurboFan, fresh instance]' : ' [after %WasmTierUpFunction: TurboFan, fresh instance]', C.memProbe(new WebAssembly.Instance(mod).exports));
+    }
+    const jm = C.jsMemory(), badJ = jm.filter(p => p[1] !== p[2]);
+    Kit.check('WebAssembly.Memory from JS: grow to 64 MiB, first and last word, grow past the maximum (' + jm.length + ' probes)', 'all ' + jm.length + ' as expected',
+              badJ.length ? badJ.length + ' WRONG: ' + badJ.slice(0, 4).map(p => p[0] + ' want ' + p[1] + ' got ' + p[2]).join('; ') : 'all ' + jm.length + ' as expected', badJ.length === 0);
+  });
+  await step('ext memory script', async () => {
+    // narrow / extending / unaligned / float / offset-overflow / constant-address memory accesses; every want is from the host's python MemModel (data/wasm-data.js ext.mem),
+    // which Node (V8 on x64) reproduces step for step (kit-tools/wasm/node_check.js). A float access that kills the tab on a 32-bit ARM (alignment fault) is a finding, not a harness bug.
+    const M = D.ext.mem, fnNames = Object.keys(M.fns);
+    const mod = new WebAssembly.Module(KitWasmAsm.withNonce(extBytes, 'ext-memscript-' + Math.random()));
+    const report = (tag, res) => {
+      // the SHAPE of the pass: the phases, step counts and functions the page executed are exactly the host's record (a phase lost from the data would otherwise just have no row)
+      const sh = C.memShape(res, M);
+      Kit.check('ext mem script' + tag + ': the replay executed exactly the phases, step counts and functions of the host record (data ext.mem.expect)', sh.want, sh.got, sh.ok);
+      const by = new Map();
+      for (const r of res) { if (!by.has(r[0])) by.set(r[0], { n: 0, bad: [] }); const g = by.get(r[0]); g.n++; if (r[2] !== r[3]) g.bad.push(r[1] + ' want ' + r[2] + ' got ' + r[3]); }
+      for (const [ph, g] of by) Kit.check('ext mem script, ' + ph + ': ' + g.n + ' steps = the host model' + tag, 'all ' + g.n + ' as the host (python MemModel)',
+                                          g.bad.length ? g.bad.length + ' WRONG: ' + g.bad.slice(0, 4).join('; ') : 'all ' + g.n + ' equal', g.bad.length === 0);
+    };
+    const i1 = new WebAssembly.Instance(mod).exports;
+    const r1 = C.memScript(i1, M);
+    let tag1 = '', t1 = null;
+    if (N) {
+      t1 = tally(fnNames.map(n => i1[n]));
+      tag1 = ' [as called: ' + tierText(t1) + ']';
+      if (WANT) Kit.check('wasm tier ASSERTED: all ' + fnNames.length + ' memory functions are ' + WANT + ' as called, before any forced tier-up', WANT + ': ' + fnNames.length, JSON.stringify(t1), t1[WANT] === fnNames.length);
+      else Kit.check('every memory function is compiled code (liftoff or turbofan; never uncompiled/other) as called', 'liftoff + turbofan = ' + fnNames.length, JSON.stringify(t1), (t1.liftoff || 0) + (t1.turbofan || 0) === fnNames.length);
+      extra.wasm.tierAssert.mem = t1;
+    }
+    report(tag1, r1);
+    if (N) {
+      fnNames.forEach(n => N.tierUp(i1[n]));
+      const t2 = tally(fnNames.map(n => i1[n]));
+      Kit.check('%WasmTierUpFunction: all ' + fnNames.length + ' memory functions are TurboFan code afterwards', 'turbofan: ' + fnNames.length, JSON.stringify(t2), t2.turbofan === fnNames.length);
+      report(t1.turbofan === fnNames.length ? ' [second pass: already TurboFan, fresh instance]' : ' [after %WasmTierUpFunction: TurboFan, fresh instance]', C.memScript(new WebAssembly.Instance(mod).exports, M));
+      tierNotes.push('memory: ' + fnNames.length + ' functions ' + tierText(t1) + ' as called -> forced turbofan');
+    }
+  });
+  await step('ext hot loops', async () => {
+    const mod = new WebAssembly.Module(KitWasmAsm.withNonce(extBytes, 'ext-loops-' + Math.random()));
+    const ei = new WebAssembly.Instance(mod).exports;
+    const eq = (name, obj, set) => {
+      const ns = set.n, w = ns.map(n => set.host_python[n]).join(), g = ns.map(n => obj[n]).join();
+      Kit.check(name + ' for n = ' + ns.join(', ') + ' = the host', w, g, w === g);
+    };
+    // The timing comes first, on a module nothing has called yet (its functions are still at their first tier).
+    // The same call six times with a pause in between. With default tiering V8 may promote a hot function from Liftoff to TurboFan in
+    // the background, so later calls can get faster; with --liftoff-only / --no-liftoff the time stays flat (slow / fast).
+    // Information, not a pass criterion: the times depend on the machine. The answers are checked, and the tier is asserted separately.
+    const NT = D.ext.memloop.timing_n, want = D.ext.memloop.host_python[NT], ms = [], vals = [];
+    const tmod = new WebAssembly.Module(KitWasmAsm.withNonce(extBytes, 'ext-timing-' + Math.random()));
+    new WebAssembly.Instance(tmod).exports.memloop(1);       // the first call compiles the function (lazily): keep that out of the timed calls
+    for (let i = 0; i < 6; i++) {
+      const f = new WebAssembly.Instance(tmod).exports.memloop;
+      const t0 = performance.now(); vals.push(f(NT)); ms.push(Math.round((performance.now() - t0) * 10) / 10);
+      await Kit.sleep(80);
+    }
+    Kit.check('memloop(' + NT + ') six times, with a pause in between (tiering may happen meanwhile): the same answer every time = the host', want + ' x6', vals.join(' '), vals.every(v => v === want));
+    eq('spin(n): an i32 LCG loop', C.spinProbe(ei, D), D.ext.spin);
+    eq('memloop(n): a loop of bounds-checked word loads and stores (a fresh instance per call)', C.memloopProbe(mod, D), D.ext.memloop);
+    const best = Math.min.apply(null, ms), ratio = Math.round(ms[0] / best * 10) / 10;
+    Kit.info('time of memloop(' + NT + '), six calls, ms', ms.join(', ') + '   first/best = ' + ratio +
+             (N ? ' (timing is information only; the tier is read from the natives in the tier row below)' : ' (no natives: the tier cannot be read here, so this timing proves nothing about it)'));
+    extra.wasm.memloopMs = ms; extra.wasm.memloopFirstOverBest = ratio;
+    if (N && WANT === 'liftoff') {
+      // the NEGATIVE needs time to show: with default tiering a hot function is promoted by a background compile, so keep both loops hot for up to SOAK_MS (stops at the first TurboFan)
+      const f = new WebAssembly.Instance(tmod).exports, t0 = performance.now();
+      while (performance.now() - t0 < SOAK_MS && N.status(f.memloop) !== 'turbofan' && N.status(ei.spin) !== 'turbofan') { f.memloop(NT); ei.spin(2000000); await Kit.sleep(100); }
+      extra.wasm.liftoffSoakMs = Math.round(performance.now() - t0);
+      Kit.info('liftoff-only: the hot loops were kept hot for', extra.wasm.liftoffSoakMs + ' ms (limit ' + SOAK_MS + ' ms; it stops early only if something was promoted)');
+    }
+    if (N) {
+      const s1 = N.status(ei.spin), s2 = N.status(new WebAssembly.Instance(tmod).exports.memloop), got = s1 + ',' + s2;
+      // liftoff-only: V8 never promotes (default tiering would have made these TurboFan by now: the turbofan/maglev configurations show it); no-liftoff: TurboFan from the first call
+      if (WANT) Kit.check('wasm tier ASSERTED: spin and memloop are ' + WANT + (WANT === 'liftoff' ? ' after the hot calls and the soak' : ' after the hot calls'), same(2, WANT), got, got === same(2, WANT));
+      else Kit.info('wasm tier of spin and memloop after those calls (natives; default tiering: promotion is timing-dependent)', got);
+      extra.wasm.tierAssert.loops = got; tierNotes.push('hot loops after the runs: spin ' + s1 + ', memloop ' + s2);
+    }
+  });
+
+  // ------------------------------------------------------------ the tier, summed up
+  if (N) {
+    extra.tier = 'wasm natives' + (WANT ? ' (tier ' + WANT + ' ASSERTED)' : ' (default tiering, tier reported)') + ': ' + tierNotes.join('; ');
+  } else {
+    Kit.info('wasm tier', 'not provable here (no natives; default tiering); see the memloop timings above');
+    extra.tier = 'wasm tier not provable without natives (default tiering; memloop first/best ' + (extra.wasm.memloopFirstOverBest || '?') + ')';
+  }
+  extra.wasm.totalMs = Math.round(performance.now() - t00);
+  Kit.info('time of this page (ms) and of each step', extra.wasm.totalMs + ' total; ' + Object.keys(extra.wasm.stepMs).map(k => k + ' ' + extra.wasm.stepMs[k]).join(', '));
+  await finish();
+})();
+</script>

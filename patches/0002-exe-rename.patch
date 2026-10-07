@@ -1,0 +1,228 @@
+diff --git a/build/win/reorder-imports.py b/build/win/reorder-imports.py
+index 8885160..2b69f77 100644
+--- a/build/win/reorder-imports.py
++++ b/build/win/reorder-imports.py
+@@ -15,7 +15,7 @@ sys.path.insert(
+                  'pefile_py3'))
+ import pefile
+ 
+-def reorder_imports(input_dir, output_dir, architecture):
++def reorder_imports(input_dir, output_dir, architecture, exe_name='chrome.exe'):
+   """Swap chrome_elf.dll to be the first import of chrome.exe.
+   Also copy over any related files that might be needed
+   (pdbs, manifests etc.).
+@@ -24,8 +24,8 @@ def reorder_imports(input_dir, output_dir, architecture):
+   # correct executable in the first place, so that this script
+   # only needs to verify that and not write a whole new exe.
+ 
+-  input_image = os.path.join(input_dir, 'chrome.exe')
+-  output_image = os.path.join(output_dir, 'chrome.exe')
++  input_image = os.path.join(input_dir, exe_name)
++  output_image = os.path.join(output_dir, exe_name)
+ 
+   # pefile mmap()s the whole executable, and then parses parts of
+   # it into python data structures for ease of processing.
+@@ -73,7 +73,7 @@ def reorder_imports(input_dir, output_dir, architecture):
+ 
+   pe.write(filename=output_image)
+ 
+-  for fname in glob.iglob(os.path.join(input_dir, 'chrome.exe.*')):
++  for fname in glob.iglob(os.path.join(input_dir, exe_name + '.*')):
+     shutil.copy(fname, os.path.join(output_dir, os.path.basename(fname)))
+   return 0
+ 
+@@ -87,11 +87,13 @@ def main(argv):
+       metavar='DIR')
+   parser.add_option('-a', '--arch', help='architecture of build (optional)',
+       default='ia32')
++  parser.add_option('-e', '--exe-name', default='chrome.exe',
++      help='file name of the executable to reorder (default chrome.exe)')
+   opts, args = parser.parse_args()
+ 
+   if not opts.input or not opts.output:
+     parser.error('Please provide and input and output directory')
+-  return reorder_imports(opts.input, opts.output, opts.arch)
++  return reorder_imports(opts.input, opts.output, opts.arch, opts.exe_name)
+ 
+ if __name__ == "__main__":
+   sys.exit(main(sys.argv[1:]))
+diff --git a/chrome/BUILD.gn b/chrome/BUILD.gn
+index 1841716..0bd5d23 100644
+--- a/chrome/BUILD.gn
++++ b/chrome/BUILD.gn
+@@ -85,12 +85,12 @@ if (is_win) {
+     # initialexe/ is used so that the we can reorder imports and write back to
+     # the final destination at $root_out_dir/.
+     inputs = [
+-      "$root_out_dir/initialexe/chrome.exe",
+-      "$root_out_dir/initialexe/chrome.exe.pdb",
++      "$root_out_dir/initialexe/venetium.exe",
++      "$root_out_dir/initialexe/venetium.exe.pdb",
+     ]
+     outputs = [
+-      "$root_out_dir/chrome.exe",
+-      "$root_out_dir/chrome.exe.pdb",
++      "$root_out_dir/venetium.exe",
++      "$root_out_dir/venetium.exe.pdb",
+     ]
+     args = [
+       "-i",
+@@ -99,6 +99,8 @@ if (is_win) {
+       rebase_path("$root_out_dir", root_build_dir),
+       "-a",
+       current_cpu,
++      "-e",
++      "venetium.exe",
+     ]
+     deps = [ ":chrome_initial" ]
+   }
+@@ -148,7 +150,7 @@ if (!is_android && !is_mac) {
+   }
+ 
+   if (is_win) {
+-    _chrome_output_name = "initialexe/chrome"
++    _chrome_output_name = "initialexe/venetium"
+   } else {
+     _chrome_output_name = "chrome"
+   }
+@@ -1503,7 +1505,7 @@ copy("visual_elements_resources") {
+   sources = [
+     "//chrome/app/theme/$branding_path_component/win/tiles/Logo.png",
+     "//chrome/app/theme/$branding_path_component/win/tiles/SmallLogo.png",
+-    "app/visual_elements_resources/chrome.VisualElementsManifest.xml",
++    "app/visual_elements_resources/venetium.VisualElementsManifest.xml",
+   ]
+ 
+   if (is_chrome_branded) {
+diff --git a/chrome/app/chrome_exe.ver b/chrome/app/chrome_exe.ver
+index a2d3901..2531209 100644
+--- a/chrome/app/chrome_exe.ver
++++ b/chrome/app/chrome_exe.ver
+@@ -1,2 +1,2 @@
+-INTERNAL_NAME=chrome_exe
+-ORIGINAL_FILENAME=chrome.exe
++INTERNAL_NAME=venetium_exe
++ORIGINAL_FILENAME=venetium.exe
+diff --git a/chrome/app/visual_elements_resources/chrome.VisualElementsManifest.xml b/chrome/app/visual_elements_resources/venetium.VisualElementsManifest.xml
+similarity index 100%
+rename from chrome/app/visual_elements_resources/chrome.VisualElementsManifest.xml
+rename to chrome/app/visual_elements_resources/venetium.VisualElementsManifest.xml
+diff --git a/chrome/browser/performance_manager/metrics/metrics_provider_desktop.cc b/chrome/browser/performance_manager/metrics/metrics_provider_desktop.cc
+index 6e2167a..63928c3 100644
+--- a/chrome/browser/performance_manager/metrics/metrics_provider_desktop.cc
++++ b/chrome/browser/performance_manager/metrics/metrics_provider_desktop.cc
+@@ -219,7 +219,7 @@ void RecordFrontEndHeapDebugOptionsHistogram() {
+   base::win::RegKey key;
+   if (key.Open(HKEY_LOCAL_MACHINE,
+                L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Image File "
+-               L"Execution Options\\chrome.exe",
++               L"Execution Options\\venetium.exe",
+                KEY_QUERY_VALUE | KEY_WOW64_32KEY) == ERROR_SUCCESS) {
+     DWORD value = 0;
+     if (key.ReadValueDW(L"FrontEndHeapDebugOptions", &value) == ERROR_SUCCESS) {
+diff --git a/chrome/browser/profile_resetter/resettable_settings_snapshot.cc b/chrome/browser/profile_resetter/resettable_settings_snapshot.cc
+index e8a6352..e0e61a8 100644
+--- a/chrome/browser/profile_resetter/resettable_settings_snapshot.cc
++++ b/chrome/browser/profile_resetter/resettable_settings_snapshot.cc
+@@ -325,7 +325,7 @@ base::ListValue GetReadableFeedbackForSnapshot(
+     for (auto i = shortcuts.begin(); i != shortcuts.end(); ++i) {
+       if (!shortcut_targets.empty())
+         shortcut_targets += u"\n";
+-      shortcut_targets += u"chrome.exe ";
++      shortcut_targets += u"venetium.exe ";
+       shortcut_targets += base::WideToUTF16(i->second);
+     }
+     if (!shortcut_targets.empty()) {
+diff --git a/chrome/browser/safe_browsing/incident_reporting/binary_integrity_analyzer_win.cc b/chrome/browser/safe_browsing/incident_reporting/binary_integrity_analyzer_win.cc
+index ae97755..b6d6ab9 100644
+--- a/chrome/browser/safe_browsing/incident_reporting/binary_integrity_analyzer_win.cc
++++ b/chrome/browser/safe_browsing/incident_reporting/binary_integrity_analyzer_win.cc
+@@ -24,7 +24,7 @@ namespace safe_browsing {
+ 
+ std::vector<base::FilePath> GetCriticalBinariesPath() {
+   static constexpr auto kUnversionedFiles = std::to_array({
+-      FILE_PATH_LITERAL("chrome.exe"),
++      FILE_PATH_LITERAL("venetium.exe"),
+   });
+   static constexpr auto kVersionedFiles = std::to_array({
+       FILE_PATH_LITERAL("chrome.dll"),
+diff --git a/chrome/chrome_proxy/chrome_proxy_main_win.cc b/chrome/chrome_proxy/chrome_proxy_main_win.cc
+index 776f544..08f1a56 100644
+--- a/chrome/chrome_proxy/chrome_proxy_main_win.cc
++++ b/chrome/chrome_proxy/chrome_proxy_main_win.cc
+@@ -15,7 +15,7 @@
+ namespace {
+ 
+ constexpr base::FilePath::CharType kChromeExecutable[] =
+-    FILE_PATH_LITERAL("chrome.exe");
++    FILE_PATH_LITERAL("venetium.exe");
+ 
+ constexpr base::FilePath::CharType kChromeProxyExecutable[] =
+     FILE_PATH_LITERAL("chrome_proxy.exe");
+diff --git a/chrome/common/chrome_constants.cc b/chrome/common/chrome_constants.cc
+index 6e30ef1..5912691 100644
+--- a/chrome/common/chrome_constants.cc
++++ b/chrome/common/chrome_constants.cc
+@@ -32,9 +32,9 @@ const char kChromeVersion[] = CHROME_VERSION_STRING;
+ 
+ #if BUILDFLAG(IS_WIN)
+ const base::FilePath::CharType kBrowserProcessExecutableName[] =
+-    FPL("chrome.exe");
++    FPL("venetium.exe");
+ const base::FilePath::CharType kHelperProcessExecutableName[] =
+-    FPL("chrome.exe");
++    FPL("venetium.exe");
+ #elif BUILDFLAG(IS_MAC)
+ const base::FilePath::CharType kBrowserProcessExecutableName[] =
+     FPL(PRODUCT_FULLNAME_STRING);
+@@ -54,9 +54,9 @@ const base::FilePath::CharType kHelperProcessExecutableName[] = FPL("exe");
+ 
+ #if BUILDFLAG(IS_WIN)
+ const base::FilePath::CharType kBrowserProcessExecutablePath[] =
+-    FPL("chrome.exe");
++    FPL("venetium.exe");
+ const base::FilePath::CharType kHelperProcessExecutablePath[] =
+-    FPL("chrome.exe");
++    FPL("venetium.exe");
+ #elif BUILDFLAG(IS_MAC)
+ const base::FilePath::CharType kBrowserProcessExecutablePath[] =
+     FPL(PRODUCT_FULLNAME_STRING ".app/Contents/MacOS/" PRODUCT_FULLNAME_STRING);
+diff --git a/chrome/installer/mini_installer/BUILD.gn b/chrome/installer/mini_installer/BUILD.gn
+index 37a9269..b79b82d 100644
+--- a/chrome/installer/mini_installer/BUILD.gn
++++ b/chrome/installer/mini_installer/BUILD.gn
+@@ -147,7 +147,7 @@ action("mini_installer_archive") {
+   inputs = [
+     "$root_out_dir/chrome.dll",
+     "$root_out_dir/chrome_elf.dll",
+-    "$root_out_dir/chrome.exe",
++    "$root_out_dir/venetium.exe",
+     "$root_out_dir/locales/en-US.pak",
+     "$root_out_dir/setup.exe",
+     "//chrome/tools/build/win/makecab.py",
+diff --git a/chrome/installer/util/util_constants.cc b/chrome/installer/util/util_constants.cc
+index fa3e162..4210bf0 100644
+--- a/chrome/installer/util/util_constants.cc
++++ b/chrome/installer/util/util_constants.cc
+@@ -179,7 +179,7 @@ const char kVerboseLogging[] = "verbose-logging";
+ // Active Setup.
+ const wchar_t kActiveSetupExe[] = L"chrmstp.exe";
+ const wchar_t kChromeDll[] = L"chrome.dll";
+-const wchar_t kChromeExe[] = L"chrome.exe";
++const wchar_t kChromeExe[] = L"venetium.exe";
+ const wchar_t kChromeNewExe[] = L"new_chrome.exe";
+ const wchar_t kChromeOldExe[] = L"old_chrome.exe";
+ const wchar_t kChromeProxyExe[] = L"chrome_proxy.exe";
+diff --git a/chrome/notification_helper/notification_activator.cc b/chrome/notification_helper/notification_activator.cc
+index 08c3dc8..9f9d0f3 100644
+--- a/chrome/notification_helper/notification_activator.cc
++++ b/chrome/notification_helper/notification_activator.cc
+@@ -138,7 +138,7 @@ HRESULT NotificationActivator::Activate(
+ 
+   if (!::ShellExecuteEx(&info)) {
+     DWORD error_code = ::GetLastError();
+-    Trace(L"Unable to launch Chrome.exe; error: 0x%08X\n", error_code);
++    Trace(L"Unable to launch venetium.exe; error: 0x%08X\n", error_code);
+     LogNotificationActivatorPrimaryStatus(
+         NotificationActivatorPrimaryStatus::kShellExecuteFailed);
+     return HRESULT_FROM_WIN32(error_code);

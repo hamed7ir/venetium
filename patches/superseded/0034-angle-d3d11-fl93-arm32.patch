@@ -1,0 +1,82 @@
+diff --git a/third_party/angle/gni/angle.gni b/third_party/angle/gni/angle.gni
+index 88dd9c8..07eef0f 100644
+--- a/third_party/angle/gni/angle.gni
++++ b/third_party/angle/gni/angle.gni
+@@ -217,9 +217,10 @@ declare_args() {
+ 
+   angle_enable_d3d9 = is_win && !angle_is_winuwp
+ 
+-  # Venetium 0021: Windows ARM32 (Surface 2 / Tegra 4) renders through ANGLE's
+-  # D3D9 backend (and GL); the D3D11 and Vulkan backends are not built there.
+-  angle_enable_d3d11 = is_win && current_cpu != "arm"
++  # Venetium 0021/0034: Windows ARM32 (Surface 2 / Tegra 4) renders through ANGLE's D3D9 backend (and GL). 0034 brings the
++  # D3D11 backend back on ARM32 as well, so it can run at Direct3D feature level 9_3 (Renderer11 appends 9_3 on _M_ARM); D3D9
++  # stays as the fallback. The Vulkan backend is still not built on ARM32 (below keeps current_cpu != "arm").
++  angle_enable_d3d11 = is_win
+   angle_enable_gl =
+       (ozone_platform_drm || ozone_platform_wayland || !is_linux ||
+        ((angle_use_x11 && !is_chromeos) || angle_use_wayland || is_castos)) &&
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp
+index bc03c09..23c7a8d 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp
+@@ -494,6 +494,22 @@ Renderer11::Renderer11(egl::Display *display)
+             }
+         }
+ 
++        // Venetium 0034: Direct3D feature level 9_3. On Windows ARM32 (the Tegra, which creates no 10_0+ D3D11 device) append
++        // 9_3 after 10_0 so the D3D11 backend can run there; on any target, an explicit maximum of 9.3 requests 9_3 alone
++        // (section 5's WARP test via --venetium-angle-d3d11-max-fl=9_3). 9_1/9_2 are never requested - ANGLE has no
++        // shader-model mapping for them (getMajorShaderModel/getMinorShaderModel/getShaderModelSuffix), so a 9_1-only device
++        // creates no D3D11 device here and keeps the D3D9 path.
++        if (requestedMajorVersion == 9 && requestedMinorVersion == 3)
++        {
++            mAvailableFeatureLevels.push_back(D3D_FEATURE_LEVEL_9_3);
++        }
++#if defined(_M_ARM)
++        else if (requestedMajorVersion == EGL_DONT_CARE)
++        {
++            mAvailableFeatureLevels.push_back(D3D_FEATURE_LEVEL_9_3);
++        }
++#endif
++
+         EGLint requestedDeviceType = static_cast<EGLint>(attributes.get(
+             EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_DEVICE_TYPE_HARDWARE_ANGLE));
+         switch (requestedDeviceType)
+diff --git a/ui/gl/gl_display.cc b/ui/gl/gl_display.cc
+index 06f8b6c..d897855 100644
+--- a/ui/gl/gl_display.cc
++++ b/ui/gl/gl_display.cc
+@@ -92,6 +92,15 @@ EGLDisplay GetPlatformANGLEDisplay(
+         display_attribs.push_back(low);
+       }
+     }
++    // Venetium 0034: --venetium-angle-d3d11-max-fl=9_3 caps this D3D11 (or D3D11-WARP) display at Direct3D feature level 9_3,
++    // so the 9_3 path can be exercised on hardware that is actually higher (the WARP simulation of the Surface 2). Inert
++    // without the switch; any architecture.
++    if (command_line->GetSwitchValueASCII("venetium-angle-d3d11-max-fl") == "9_3") {
++      display_attribs.push_back(EGL_PLATFORM_ANGLE_MAX_VERSION_MAJOR_ANGLE);
++      display_attribs.push_back(9);
++      display_attribs.push_back(EGL_PLATFORM_ANGLE_MAX_VERSION_MINOR_ANGLE);
++      display_attribs.push_back(3);
++    }
+   }
+ 
+   GLDisplayEglUtil::GetInstance()->GetPlatformExtraDisplayAttribs(
+diff --git a/ui/gl/gl_switches.cc b/ui/gl/gl_switches.cc
+index 3600c21..56ecfc8 100644
+--- a/ui/gl/gl_switches.cc
++++ b/ui/gl/gl_switches.cc
+@@ -190,6 +190,12 @@ const auto kGLSwitchesCopiedFromGpuProcessHostArray = std::to_array({
+     kDisableGLDrawingForTests,
+     kOverrideUseSoftwareGLForTests,
+     kUseANGLE,
++    // Venetium 0034: forward --venetium-angle-d3d11-max-fl to the GPU process.
++    // gl_display.cc reads it there (GetDisplayFromType) to cap the ANGLE D3D11
++    // display at feature level 9_3; without forwarding, the GPU process never
++    // sees it (gpu_process_host.cc copies only listed switches) and the cap is
++    // silently ignored - including section 5's WARP 9_3 run.
++    "venetium-angle-d3d11-max-fl",
+ #if BUILDFLAG(USE_STATIC_ANGLE)
+     kUseDynamicAngle,
+ #endif

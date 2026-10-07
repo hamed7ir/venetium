@@ -1,0 +1,68 @@
+Venetium 0023 - ffmpeg for Windows ARM32: the GN wiring for the win/arm-neon config (codecs on, D13).
+
+BATCH-ARM-1 section 3G, his decision 8 (ARM-1-DECISIONS.md). The config itself is a generated input, not part of this patch:
+third_party/ffmpeg/chromium/config/Chrome/win/arm-neon/ (10 files, venetium/deps/arm-inputs.tsv), made by FFmpeg's own configure through
+venetium/deps/ffmpeg-win-arm.sh (Chromium's build_ffmpeg.py cannot run on this tree as-is). 2 files:
+- third_party/ffmpeg/ffmpeg_generated.gni: the ARM C and .S sources were gated on use_linux_config only; the gates now also take
+  is_win && current_cpu == "arm" (hand-widened, as generate_gn.py would for this config: FFmpeg's own make -n on the generated config
+  lists exactly the same 285 sources - 270 C + 15 .S; generate_gn.py itself needs every platform's build dir and is not run).
+- third_party/ffmpeg/BUILD.gn: HAVE_VFP_ARGS=1 for is_win && current_cpu == "arm". Windows ARM32 is hard-float (FFmpeg's configure
+  detected it from __ARM_PCS_VFP; Chromium's config post-processing comments the define out and leaves it to the build, which sets it
+  only for posix). Without it the float NEON/VFP assembly is built for the soft-float convention and corrupts float math SILENTLY
+  (float_dsp_neon assembles either way) - the conscious check his decisions ask for; runtime proof is device-only (HE-AAC/SBR decode).
+Checked (RUNTIME, real arm-rt21 graph after gn gen): ffmpeg_internal builds: 285 objects, all ARMNT, the 15 .S with their functions.
+A later FFmpeg roll's generate_gn.py run would drop the win/arm stanzas: re-apply this patch after a roll.
+
+diff --git a/third_party/ffmpeg/BUILD.gn b/third_party/ffmpeg/BUILD.gn
+index bdf0208..b1f9a06 100644
+--- a/third_party/ffmpeg/BUILD.gn
++++ b/third_party/ffmpeg/BUILD.gn
+@@ -328,6 +328,18 @@ target(link_target_type, "ffmpeg_internal") {
+     }
+   }
+ 
++  if (is_win && current_cpu == "arm") {
++    # Windows ARM32 is hard-float: float/double arguments are passed in VFP
++    # registers. The arm assembly (libavutil/arm/asm.S, sbrdsp_neon.S, ...)
++    # must be assembled for that convention, i.e. with HAVE_VFP_ARGS=1.
++    # config.h leaves HAVE_VFP_ARGS undefined on purpose (build_ffmpeg.py
++    # comments it out: "selection is done by the chrome build"), and the posix
++    # block above does not run on Windows. Left undefined, sbrdsp_neon.S does
++    # not assemble and float_dsp_neon.S silently assembles for the soft-float
++    # register convention (wrong float arguments at run time).
++    asmflags = [ "-DHAVE_VFP_ARGS=1" ]
++  }
++
+   if (is_fuchsia || (is_posix && !is_mac)) {
+     defines += [
+       "_ISOC99_SOURCE",
+diff --git a/third_party/ffmpeg/ffmpeg_generated.gni b/third_party/ffmpeg/ffmpeg_generated.gni
+index 145ceba..c553745 100644
+--- a/third_party/ffmpeg/ffmpeg_generated.gni
++++ b/third_party/ffmpeg/ffmpeg_generated.gni
+@@ -474,7 +474,8 @@ if ((current_cpu == "arm64" || current_cpu == "arm64e") &&
+   ]
+ }
+ 
+-if (use_linux_config && current_cpu == "arm" && ffmpeg_branding == "Chrome") {
++if ((is_win && current_cpu == "arm" && ffmpeg_branding == "Chrome") ||
++    (use_linux_config && current_cpu == "arm" && ffmpeg_branding == "Chrome")) {
+   ffmpeg_c_sources += [
+     "libavcodec/arm/h264chroma_init_arm.c",
+     "libavcodec/arm/h264dsp_init_arm.c",
+@@ -496,6 +497,7 @@ if (use_linux_config && current_cpu == "arm" && ffmpeg_branding == "Chrome") {
+ }
+ 
+ if ((is_android && current_cpu == "arm") ||
++    (is_win && current_cpu == "arm") ||
+     (use_linux_config && current_cpu == "arm")) {
+   ffmpeg_c_sources += [
+     "libavcodec/arm/flacdsp_init_arm.c",
+@@ -554,6 +556,7 @@ if (current_cpu == "arm64" || current_cpu == "arm64e") {
+ }
+ 
+ if ((is_android && current_cpu == "arm" && ffmpeg_branding == "Chrome") ||
++    (is_win && current_cpu == "arm" && ffmpeg_branding == "Chrome") ||
+     (use_linux_config && current_cpu == "arm" && ffmpeg_branding == "Chrome")) {
+   ffmpeg_c_sources += [
+     "libavcodec/arm/aacpsdsp_init_arm.c",

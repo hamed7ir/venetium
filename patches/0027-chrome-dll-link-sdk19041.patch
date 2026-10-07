@@ -1,0 +1,90 @@
+Venetium 0027 - chrome.dll links against the SDK 19041 ARM32 import libs: two newer GUIDs and IsWindowArranged.
+
+BATCH-ARM-1 section 5, his decision (2026-10-04, "0027, also fix x86"). After 0026 the ARM32 chrome.dll link failed on 3 symbols the
+Windows SDK 19041 ARM32 import libs do not have (D9: 26100 headers + 19041 ARM32 libs). 3 files:
+- media/capture/video/win/video_capture_device_mf_win.cc: __uuidof(IMFCameraControlNotify) instead of IID_IMFCameraControlNotify
+  (not in the 19041 ARM32 mfuuid.lib).
+- ui/accessibility/platform/uia_client_info_source_win.cc: __uuidof(CUIAutomationClientInfoSource) instead of
+  CLSID_CUIAutomationClientInfoSource (not in the 19041 ARM32 Uuid.Lib).
+  Both uuids are the ones the 26100 headers declare (mfidl.h MIDL_INTERFACE("E8F2540D-..."), UIAutomationCore.h
+  DECLSPEC_UUID("A8D4F123-...")) and are byte-identical to the symbols in the 26100 x86/x64 libs, so every arch gets the same GUID.
+- chrome/browser/ui/views/frame/browser_frame_view_win.cc: IsWindowArranged() is resolved at run time on every arch
+  (IsWindowArrangedIfAvailable, via base::win::GetUser32FunctionPointer as win_util.cc does); where it is missing no window counts
+  as arranged. The 19041 user32.lib (ARM32 and x86) has no stub for it, and user32.dll before Windows 10 does not export it -
+  user32 is delay-loaded in chrome.dll, so on Windows 7/8.x the first GetWindowRoundedCorners() call would have hit the
+  delay-load failure hook. (Windows 10 user32 exports it since RTM, chrome/test/delayload/supported_imports_10.0.10240.txt.)
+Reviewed before capture by a read-only workflow (it corrected the first draft's comment, which claimed a static import).
+Checked (RUNTIME, real arm-rt21 graph): the three ARM objects compile with no reference to the three symbols; chrome.dll and
+venetium.exe then link as ARMNT. x86 (STRUCTURAL): browser_frame_view_win.cc compiled with out/x86-rt21's own command no longer
+references __imp__IsWindowArranged@4.
+
+diff --git a/chrome/browser/ui/views/frame/browser_frame_view_win.cc b/chrome/browser/ui/views/frame/browser_frame_view_win.cc
+index f829637..7db850c 100644
+--- a/chrome/browser/ui/views/frame/browser_frame_view_win.cc
++++ b/chrome/browser/ui/views/frame/browser_frame_view_win.cc
+@@ -14,6 +14,7 @@
+ #include "base/scoped_observation.h"
+ #include "base/trace_event/common/trace_event_common.h"
+ #include "base/trace_event/trace_event.h"
++#include "base/win/win_util.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/app/chrome_dll_resource.h"
+ #include "chrome/browser/themes/theme_properties.h"
+@@ -82,6 +83,18 @@ constexpr int kMaximizedLeftMargin = 2;
+ 
+ constexpr int kIconTitleSpacing = 5;
+ 
++// Venetium 0027: IsWindowArranged() is resolved at run time. The Windows SDK
++// 19041 user32.lib that the Windows ARM32 build links against has no stub for
++// it, and user32.dll before Windows 10 does not export it (user32 is
++// delay-loaded, so the first call there would fail). Where it is missing, no
++// window counts as arranged.
++bool IsWindowArrangedIfAvailable(HWND hwnd) {
++  static const auto is_window_arranged =
++      reinterpret_cast<decltype(&::IsWindowArranged)>(
++          base::win::GetUser32FunctionPointer("IsWindowArranged"));
++  return is_window_arranged && is_window_arranged(hwnd);
++}
++
+ }  // namespace
+ 
+ // Wrapper around MinimizeButtonMetrics so that calls don't need to be routed
+@@ -483,7 +496,7 @@ void BrowserFrameViewWin::OnThemeChanged() {
+ gfx::RoundedCornersF BrowserFrameViewWin::GetWindowRoundedCorners() const {
+   const auto* const widget = GetWidget();
+   if (widget && !widget->IsMaximized() && !widget->IsFullscreen() &&
+-      !IsWindowArranged(views::HWNDForWidget(widget))) {
++      !IsWindowArrangedIfAvailable(views::HWNDForWidget(widget))) {
+     return gfx::RoundedCornersF(
+         GetLayoutConstant(LayoutConstant::kToolbarCornerRadius));
+   }
+diff --git a/media/capture/video/win/video_capture_device_mf_win.cc b/media/capture/video/win/video_capture_device_mf_win.cc
+index 4ae7ade..0b82a43 100644
+--- a/media/capture/video/win/video_capture_device_mf_win.cc
++++ b/media/capture/video/win/video_capture_device_mf_win.cc
+@@ -777,7 +777,9 @@ class VideoCaptureDeviceMFWin::MFVideoCallback final
+     if (riid == IID_IUnknown) {
+       *object = this;
+       hr = S_OK;
+-    } else if (riid == IID_IMFCameraControlNotify) {
++    } else if (riid == __uuidof(IMFCameraControlNotify)) {
++      // Venetium 0027: __uuidof, not IID_IMFCameraControlNotify - the GUID is
++      // newer than the Windows SDK 19041 ARM32 import libs (mfuuid.lib).
+       *object = static_cast<IMFCameraControlNotify*>(this);
+       hr = S_OK;
+     } else if (riid == IID_IMFCaptureEngineOnSampleCallback) {
+diff --git a/ui/accessibility/platform/uia_client_info_source_win.cc b/ui/accessibility/platform/uia_client_info_source_win.cc
+index 93dbcb3..4f88518 100644
+--- a/ui/accessibility/platform/uia_client_info_source_win.cc
++++ b/ui/accessibility/platform/uia_client_info_source_win.cc
+@@ -141,7 +141,9 @@ std::optional<UiaClientInfoSource> UiaClientInfoSource::Create(
+     // Doing it at background priority can cause a priority inversion with the
+     // main thread, perceived as a hang by the user.
+     SCOPED_MAY_LOAD_LIBRARY_AT_BACKGROUND_PRIORITY();
+-    hr = ::CoCreateInstance(CLSID_CUIAutomationClientInfoSource, nullptr,
++    // Venetium 0027: __uuidof, not CLSID_CUIAutomationClientInfoSource - the
++    // GUID is newer than the Windows SDK 19041 ARM32 import libs.
++    hr = ::CoCreateInstance(__uuidof(CUIAutomationClientInfoSource), nullptr,
+                             CLSCTX_INPROC_SERVER,
+                             IID_PPV_ARGS(&client_info_source));
+   }

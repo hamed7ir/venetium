@@ -1,0 +1,201 @@
+Venetium 0026 - Windows ARM32 link fixes: x86-decorated TLS-callback /INCLUDE: names and the ARM64-only TSC guards.
+
+BATCH-ARM-1 section 5, his decision (2026-10-03, "Yes, new patch 0026"). The re-run after 0025 compiled the whole chrome graph; 7 ARM32
+links (chrome_elf.dll and six helper exes; chrome.dll and venetium.exe wait behind chrome_elf.dll) failed on the same undefined
+symbols. 8 files:
+- base/threading/thread_local_storage_win.cc, base/allocator/partition_allocator/src/partition_alloc/partition_tls_win.cc,
+  third_party/perfetto/src/tracing/platform_windows.cc, third_party/boringssl/src/crypto/thread_win.cc: each picks its TLS-callback
+  /INCLUDE: names (and the .CRT$XL? placement) by "#ifdef _WIN64 ... #else"; the else branch is x86's (decorated __tls_used,
+  _p_thread_callback_base, ...), and ARM32 C symbols are undecorated (MSVC's ARM libcmt tlssup.obj defines _tls_used). Windows ARM32
+  (_M_ARM) now takes the x64/ARM64 branch in both blocks: undecorated names, const callback data (lld folds .CRT into .rdata, as on
+  x64). x86 keeps the decorated branch; x64/ARM64 are unchanged; MinGW does not define _M_ARM.
+- base/process/process_metrics_win.cc, base/threading/platform_thread_metrics_win.cc, chrome/browser/metrics/power/
+  process_metrics_recorder_util.cc, chrome/browser/metrics/power/process_monitor.cc: their Arm path (no constant-rate TSC) was
+  ARCH_CPU_ARM64 only, so ARM32 called base::time_internal::HasConstantRateTSC()/TSCTicksPerSecond(), which Venetium 0017 removed
+  for the whole ARM family in base/time/time_win.cc. They now use ARCH_CPU_ARM_FAMILY, as 0017 did. base/time/time.h (which still
+  declares the two functions for ARM32, unused) is deliberately left alone: nearly all of Chromium includes it.
+Reviewed before capture by two read-only lenses (ARM32 mechanism, other-configuration regression); the review found the two
+chrome/browser callers that the first draft missed (chrome.dll links both objects directly).
+Checked (RUNTIME, real arm-rt21 graph): the 8 ARM objects compile; ARM32 objects define R p_thread_callback_base etc. and carry
+/INCLUDE:_tls_used; no ARM32 object references HasConstantRateTSC/TSCTicksPerSecond or __tls_used any more.
+
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/partition_tls_win.cc b/base/allocator/partition_allocator/src/partition_alloc/partition_tls_win.cc
+index e28ffe8..7455908 100644
+--- a/base/allocator/partition_allocator/src/partition_alloc/partition_tls_win.cc
++++ b/base/allocator/partition_allocator/src/partition_alloc/partition_tls_win.cc
+@@ -68,7 +68,10 @@ void PartitionTlsSetOnDllProcessDetach(void (*callback)()) {
+ // it's not already there.  (e.g. if __declspec(thread) is not used).  Force a
+ // reference to partition_tls_thread_exit_callback to prevent whole program
+ // optimization from discarding the variable.
+-#ifdef _WIN64
++// Venetium 0026: Windows ARM32 (_M_ARM) takes the x64/ARM64 branches here: its
++// C symbols are undecorated (no leading underscore, unlike x86) and the linker
++// merges .CRT into .rdata, as on x64.
++#if defined(_WIN64) || defined(_M_ARM)
+ 
+ #pragma comment(linker, "/INCLUDE:_tls_used")
+ #pragma comment(linker, "/INCLUDE:partition_tls_thread_exit_callback")
+@@ -87,7 +90,7 @@ extern "C" {
+ // reference to this variable with a linker /INCLUDE:symbol pragma to ensure
+ // that.) If this variable is discarded, PartitionTlsOnThreadExit will never be
+ // called.
+-#ifdef _WIN64
++#if defined(_WIN64) || defined(_M_ARM)
+ 
+ // .CRT section is merged with .rdata on x64 so it must be constant data.
+ #pragma const_seg(".CRT$XLY")
+diff --git a/base/process/process_metrics_win.cc b/base/process/process_metrics_win.cc
+index e402bb1..6583ed8 100644
+--- a/base/process/process_metrics_win.cc
++++ b/base/process/process_metrics_win.cc
+@@ -183,11 +183,11 @@ ProcessMetrics::GetMemoryInfo() const {
+ base::expected<TimeDelta, ProcessCPUUsageError>
+ ProcessMetrics::GetCumulativeCPUUsage() {
+   TRACE_EVENT("base", "GetCumulativeCPUUsage");
+-#if defined(ARCH_CPU_ARM64)
++#if defined(ARCH_CPU_ARM_FAMILY)
+   // Precise CPU usage is not available on Arm CPUs because they don't support
+   // constant rate TSC.
+   return GetImpreciseCumulativeCPUUsage(process_);
+-#else   // !defined(ARCH_CPU_ARM64)
++#else   // !defined(ARCH_CPU_ARM_FAMILY)
+   if (!time_internal::HasConstantRateTSC()) {
+     return GetImpreciseCumulativeCPUUsage(process_);
+   }
+@@ -213,7 +213,7 @@ ProcessMetrics::GetCumulativeCPUUsage() {
+ 
+   const double process_time_seconds = process_cycle_time / tsc_ticks_per_second;
+   return base::ok(Seconds(process_time_seconds));
+-#endif  // !defined(ARCH_CPU_ARM64)
++#endif  // !defined(ARCH_CPU_ARM_FAMILY)
+ }
+ 
+ ProcessMetrics::ProcessMetrics(ProcessHandle process) {
+diff --git a/base/threading/platform_thread_metrics_win.cc b/base/threading/platform_thread_metrics_win.cc
+index e3ba14c..992da81 100644
+--- a/base/threading/platform_thread_metrics_win.cc
++++ b/base/threading/platform_thread_metrics_win.cc
+@@ -74,11 +74,11 @@ PlatformThreadMetrics::PlatformThreadMetrics(win::ScopedHandle&& handle)
+ 
+ std::optional<TimeDelta> PlatformThreadMetrics::GetCumulativeCPUUsage() {
+   TRACE_EVENT("base", "Thread::GetCumulativeCPUUsage");
+-#if defined(ARCH_CPU_ARM64)
++#if defined(ARCH_CPU_ARM_FAMILY)
+   // Precise CPU usage is not available on Arm CPUs because they don't support
+   // constant rate TSC.
+   return GetImpreciseCumulativeCPUUsage(handle_);
+-#else   // !defined(ARCH_CPU_ARM64)
++#else   // !defined(ARCH_CPU_ARM_FAMILY)
+   if (!time_internal::HasConstantRateTSC()) {
+     return GetImpreciseCumulativeCPUUsage(handle_);
+   }
+@@ -98,7 +98,7 @@ std::optional<TimeDelta> PlatformThreadMetrics::GetCumulativeCPUUsage() {
+   }
+ 
+   return Seconds(cycle_time / tsc_ticks_per_second);
+-#endif  // !defined(ARCH_CPU_ARM64)
++#endif  // !defined(ARCH_CPU_ARM_FAMILY)
+ }
+ 
+ }  // namespace base
+diff --git a/base/threading/thread_local_storage_win.cc b/base/threading/thread_local_storage_win.cc
+index 54583fd..0c2fbd3 100644
+--- a/base/threading/thread_local_storage_win.cc
++++ b/base/threading/thread_local_storage_win.cc
+@@ -46,7 +46,10 @@ void PlatformThreadLocalStorage::SetTLSValue(TLSKey key, void* value) {
+ // if it's not already there.  (e.g. if __declspec(thread) is not used).
+ // Force a reference to p_thread_callback_base to prevent whole program
+ // optimization from discarding the variable.
+-#ifdef _WIN64
++// Venetium 0026: Windows ARM32 (_M_ARM) takes the x64/ARM64 branches here: its
++// C symbols are undecorated (no leading underscore, unlike x86) and the linker
++// merges .CRT into .rdata, as on x64.
++#if defined(_WIN64) || defined(_M_ARM)
+ 
+ #pragma comment(linker, "/INCLUDE:_tls_used")
+ #pragma comment(linker, "/INCLUDE:p_thread_callback_base")
+@@ -84,7 +87,7 @@ extern "C" {
+ // The linker must not discard p_thread_callback_base.  (We force a reference
+ // to this variable with a linker /INCLUDE:symbol pragma to ensure that.) If
+ // this variable is discarded, the OnThreadExit function will never be called.
+-#ifdef _WIN64
++#if defined(_WIN64) || defined(_M_ARM)
+ 
+ // .CRT section is merged with .rdata on x64 so it must be constant data.
+ #pragma const_seg(".CRT$XLB")
+diff --git a/chrome/browser/metrics/power/process_metrics_recorder_util.cc b/chrome/browser/metrics/power/process_metrics_recorder_util.cc
+index b1aeab2..76a60b3 100644
+--- a/chrome/browser/metrics/power/process_metrics_recorder_util.cc
++++ b/chrome/browser/metrics/power/process_metrics_recorder_util.cc
+@@ -29,7 +29,7 @@ constexpr int kCPUUsageHistogramBucketCount = 100;
+ 
+ #if BUILDFLAG(IS_WIN)
+ bool HasConstantRateTSC() {
+-#if defined(ARCH_CPU_ARM64)
++#if defined(ARCH_CPU_ARM_FAMILY)
+   // Constant rate TSC is never support on Arm CPUs.
+   return false;
+ #else
+diff --git a/chrome/browser/metrics/power/process_monitor.cc b/chrome/browser/metrics/power/process_monitor.cc
+index bf03990..5c35ca3 100644
+--- a/chrome/browser/metrics/power/process_monitor.cc
++++ b/chrome/browser/metrics/power/process_monitor.cc
+@@ -235,7 +235,7 @@ ProcessInfo::ProcessInfo(
+   // meaningful data.
+   SampleMetrics(*this->process_metrics);
+ 
+-#if BUILDFLAG(IS_WIN) && !defined(ARCH_CPU_ARM64)
++#if BUILDFLAG(IS_WIN) && !defined(ARCH_CPU_ARM_FAMILY)
+   // Record the value of HasConstantRateTSC to get a feel of the proportion of
+   // users that don't record the average CPU usage histogram.
+   base::UmaHistogramBoolean("PerformanceMonitor.HasPreciseCPUUsage",
+diff --git a/third_party/boringssl/src/crypto/thread_win.cc b/third_party/boringssl/src/crypto/thread_win.cc
+index 5fce1bc..b08b3e1 100644
+--- a/third_party/boringssl/src/crypto/thread_win.cc
++++ b/third_party/boringssl/src/crypto/thread_win.cc
+@@ -106,7 +106,10 @@ static void NTAPI thread_local_destructor(PVOID module, DWORD reason,
+ // Note, in the prefixed build, |p_thread_callback_boringssl| may be a macro.
+ #define STRINGIFY(x) #x
+ #define EXPAND_AND_STRINGIFY(x) STRINGIFY(x)
+-#ifdef _WIN64
++// Venetium 0026: Windows ARM32 (_M_ARM) takes the x64/ARM64 branches here: its
++// C symbols are undecorated (no leading underscore, unlike x86) and the linker
++// merges .CRT into .rdata, as on x64.
++#if defined(_WIN64) || defined(_M_ARM)
+ __pragma(comment(linker, "/INCLUDE:_tls_used")) __pragma(comment(
+     linker, "/INCLUDE:" EXPAND_AND_STRINGIFY(p_thread_callback_boringssl)))
+ #else
+@@ -130,7 +133,7 @@ __pragma(comment(linker, "/INCLUDE:__tls_used")) __pragma(comment(
+ // reference to this variable with a linker /INCLUDE:symbol pragma to ensure
+ // that.) If this variable is discarded, the OnThreadExit function will never
+ // be called.
+-#ifdef _WIN64
++#if defined(_WIN64) || defined(_M_ARM)
+ 
+ // .CRT section is merged with .rdata on x64 so it must be constant data.
+ #pragma const_seg(".CRT$XLC")
+diff --git a/third_party/perfetto/src/tracing/platform_windows.cc b/third_party/perfetto/src/tracing/platform_windows.cc
+index 27b1e62..9aa1b09 100644
+--- a/third_party/perfetto/src/tracing/platform_windows.cc
++++ b/third_party/perfetto/src/tracing/platform_windows.cc
+@@ -31,7 +31,10 @@
+ // This magic is from chromium's base/threading/thread_local_storage_win.cc
+ // which in turn is from http://www.codeproject.com/threads/tls.asp.
+ 
+-#ifdef _WIN64
++// Venetium 0026: Windows ARM32 (_M_ARM) takes the x64/ARM64 branches here: its
++// C symbols are undecorated (no leading underscore, unlike x86) and the linker
++// merges .CRT into .rdata, as on x64.
++#if defined(_WIN64) || defined(_M_ARM)
+ #pragma comment(linker, "/INCLUDE:_tls_used")
+ #pragma comment(linker, "/INCLUDE:perfetto_thread_callback_base")
+ #else
+@@ -148,7 +151,7 @@ void NTAPI PerfettoOnThreadExit(PVOID, DWORD reason, PVOID) {
+   }
+ }
+ 
+-#ifdef _WIN64
++#if defined(_WIN64) || defined(_M_ARM)
+ 
+ // .CRT section is merged with .rdata on x64 so it must be constant data.
+ #pragma const_seg(".CRT$XLP")

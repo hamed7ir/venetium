@@ -1,0 +1,24 @@
+Venetium 0014 - ProcessBoundString: decrypt with CryptUnprotectMemory, not CryptProtectMemory.
+
+crypto/process_bound_string.cc as Supermium's 150 core patch (09-22 set, the one in this tree) leaves it: MaybeDecryptBuffer() calls
+::CryptProtectMemory - the ENCRYPT call - so every ProcessBound value (cookie values in net/cookies/canonical_cookie.h, the network
+service's enterprise cache encryption keys, the OAuth token delegate) is encrypted a second time when it is read, on every Windows
+newer than XP. Found by BATCH-X86-1b section 4 (read-only look at Supermium's 09-30 patches): Supermium fixed it on 09-30 ("an issue
+with double encryption"), but its published hunk calls ::CryptUnrotectMemory, which is not in the Windows SDK, so it cannot be used.
+
+Fix: the one call name, as upstream Chromium has it. His decision (2026-10-02): "Fix it, no matter it is broken or not." Drop this
+patch when Supermium's set is moved to a version with a correct fix.
+
+diff --git a/crypto/process_bound_string.cc b/crypto/process_bound_string.cc
+index eba4278..1c836d8 100644
+--- a/crypto/process_bound_string.cc
++++ b/crypto/process_bound_string.cc
+@@ -56,7 +56,7 @@ bool MaybeDecryptBuffer(base::span<uint8_t> buffer) {
+ #if BUILDFLAG(IS_WIN)
+   TRACE_EVENT0(kTraceCategory, "ProcessBoundString::DecryptBuffer");
+   if (base::win::GetVersion() > base::win::Version::XP &&
+-      ::CryptProtectMemory(buffer.data(), buffer.size(),
++      ::CryptUnprotectMemory(buffer.data(), buffer.size(),
+                              CRYPTPROTECTMEMORY_SAME_PROCESS)) {
+     return true;
+   }

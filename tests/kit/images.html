@@ -1,0 +1,254 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Venetium kit - images</title>
+<script src="lib/configs.js"></script>
+<script src="lib/kit.js"></script>
+<script src="lib/images-lib.js"></script>
+<script src="data/images-valid.js"></script>
+<script src="data/images-broken.js"></script>
+<style>
+  body { display: flex; flex-direction: column; }
+  #kit-head { order: -3; } #kit-verdict { order: -2; } #gallery { order: -1; } #kit-table { order: 1; }
+  #gallery { margin: 4px 0 10px; font: 11px Consolas, monospace; }
+  #gallery h3 { font: bold 13px "Segoe UI", Arial, sans-serif; margin: 6px 0 2px; }
+  .row { display: flex; flex-wrap: wrap; gap: 4px; }
+  .th { width: 92px; text-align: center; background: #fafafa; border: 1px solid #bbb; padding: 2px; overflow: hidden; }
+  .th img { display: block; margin: 0 auto; width: 64px; height: 64px; object-fit: contain; background: repeating-conic-gradient(#ccc 0 25%, #fff 0 50%) 0 0 / 8px 8px; }
+  .th span { display: block; word-break: break-all; line-height: 1.15; }
+  .th.bad { background: #f8d0d0; } .th.ok { background: #e4f6e4; }
+</style>
+<script>
+// images.html - valid JPEG, PNG, GIF, WebP, AVIF, BMP and ICO files must decode with the right size and pixel checksum (RUNTIME, expected
+// values from the generators, not from the browser); deliberately broken ones must not crash or hang the renderer and must end in an
+// outcome class the host data allows. The broken JPEGs are BUILT to drive libjpeg-turbo's error exit, which Blink's JPEG decoder
+// implements as a longjmp (the D42 class on ARM32); whether it ran is STRUCTURAL (argued from the source), not shown at run time:
+// the run-time evidence on a device is that the renderer survives and the page reports (a crashed or silent page is the failure
+// signal; index.html gives up after its time limit, the runner sees the crash). Everything goes through blob: URLs of base64 data
+// (data\images-*.js).
+// Routes into the decoders: (1) <img> + canvas read-back (header and decode on the main thread), (2) createImageBitmap (decode on a
+// worker thread), (3) the same files shown as <img> elements in the gallery below, plus img.decode() on each of them, which queues
+// the decode on the compositor's image-decode worker threads (STRUCTURAL: argued from the source; the page reads only whether the
+// request completed, not what the worker decoded).
+(async () => {
+  const L = ImgLib;
+  const T_LOAD = 10000, REPS = 5;
+  const T_DECODE = 20000;      // img.decode() on all gallery images at once: one budget for the whole batch (x86: 0.1 s), a device may be 50x slower
+  if (!document.body) await new Promise(r => document.addEventListener('DOMContentLoaded', r));
+  let ticks = 0; const hb = setInterval(() => ticks++, 50);      // heartbeat (an info row at the end: setInterval and setTimeout both need the event loop; a renderer crash is never seen by an in-page check, the runner or index.html sees it)
+  const t0 = performance.now();
+  // the CPU the browser reports (informational: it makes a device result self-describing when only the x86-regression rows differ)
+  const arch = await Kit.arch();
+  Kit.info('browser CPU as reported (informational)', 'architecture ' + JSON.stringify(arch.architecture) + ', bitness ' + JSON.stringify(arch.bitness) + ', wow64 ' + JSON.stringify(arch.wow64) + ', ia32 ' + arch.ia32 + (arch.note ? ' (' + arch.note + ')' : ''));
+
+  // --- which decoder handles which format in this build (STRUCTURAL: Blink sources, skia/BUILD.gn, the chrome.dll link line, args.gn) -----
+  Kit.info('decoder JPEG (STRUCTURAL)', 'Blink JPEGImageDecoder + libjpeg-turbo 3.1.0 (8-bit API, SIMD; arithmetic coding not compiled in); the only decoder here with setjmp/longjmp: error_exit() longjmps to the setjmp in JPEGImageReader::Decode (jpeg_image_decoder.cc)');
+  Kit.info('decoder PNG (STRUCTURAL)', 'Blink PngImageDecoder -> Skia SkPngRustCodec -> Rust png crate 0.18.1 (libpng is not linked into chrome.dll); no setjmp');
+  Kit.info('decoder GIF (STRUCTURAL)', 'Blink GIFImageDecoder -> Skia SkWuffsCodec -> Wuffs 0.3.4 (generated C, no setjmp)');
+  Kit.info('decoder WebP (STRUCTURAL)', 'Blink WEBPImageDecoder + libwebp 1.6.0 (WebPDemux + incremental WebPIDecoder); no setjmp in the library');
+  Kit.info('decoder AVIF (STRUCTURAL)', 'Blink AVIFImageDecoder -> crabbyavif (Rust) + dav1d + libyuv; libavif is not used; no setjmp');
+  Kit.info('decoder BMP (STRUCTURAL)', 'Blink BMPImageDecoder / BMPImageReader (C++); the Rust BMP decoder is behind kRustyBmpFeature (off by default); no setjmp');
+  Kit.info('decoder ICO (STRUCTURAL)', 'Blink ICOImageDecoder: BMP entries through BMPImageReader, PNG entries through the Rust PNG decoder; no setjmp');
+  Kit.info('JXL (STRUCTURAL)', 'enable_jxl_decoder = false (venetium.gn #15): no JPEG XL decoder in this build');
+  Kit.info('encoders (STRUCTURAL)', 'canvas.toBlob: PNG = Skia SkPngRustEncoder (Rust png), JPEG = Skia SkJpegEncoder over libjpeg-turbo (setjmp on the encode path, in a worker), WebP = SkWebpEncoder over libwebp (quality 1 = lossless); there is no AVIF encoder (toBlob falls back to PNG)');
+
+  // --- 1. valid files ------------------------------------------------------------------------------------------------------------------
+  const base = {};            // id -> {px, sum, grid}: the valid decode, the control for the broken siblings
+  const sums = {};            // id -> checksum (extra data for the result file)
+  const validOk = {};         // id -> all its checks passed
+  let nValid = 0, nValidOk = 0;
+  for (const v of IMG_VALID) {
+    nValid++;
+    const blob = new Blob([Kit.bytes(v.b64)], { type: v.type });
+    const url = URL.createObjectURL(blob);
+    const r = await L.decodeImg(url, T_LOAD);
+    URL.revokeObjectURL(url);
+    const px = r.px;
+    const sum = px ? L.hex8(L.fnv(px.data)) : null;
+    sums[v.id] = sum;
+    if (px) base[v.id] = { px, sum, grid: L.grid(px, 8, 8) };
+    let ok = true;
+    ok = Kit.check('valid ' + v.id + ' (' + v.fmt + '): size', v.w + 'x' + v.h, r.ev === 'load' ? r.w + 'x' + r.h : r.ev, r.ev === 'load' && r.w === v.w && r.h === v.h) && ok;
+    if (v.exact) {
+      // the one planted check of an armed run: the first exact checksum's expectation goes through Kit.want
+      const want = v.id === 'png-rgb8' ? Kit.want(v.exact, '00000000') : v.exact;
+      ok = Kit.check('valid ' + v.id + ': pixel checksum (independent: from the generator\'s own pixels)', want, sum || 'no pixels', sum === want) && ok;
+    } else {
+      if (v.exactOp) {
+        const so = px ? L.hex8(L.fnvOpaque(px.data)) : null;
+        ok = Kit.check('valid ' + v.id + ': opaque pixels + alpha channel (independent: from the source PNG; semi-transparent edge colours are not compared)', v.exactOp, so || 'no pixels', so === v.exactOp) && ok;
+      }
+      const d = px ? L.gridDiff(base[v.id].grid, v.ref.grid) : 999;
+      ok = Kit.check('valid ' + v.id + ': colours match the source image (8x8 mean grid, max channel difference)', '<= ' + v.ref.tol, px ? String(d) : 'no pixels', px && d <= v.ref.tol) && ok;
+      // NOT independent: v.x86 is what the x86 build of this record produced. On x86 it detects only a change of the build; on ARM32 it shows a
+      // numeric difference (SIMD rounding in libjpeg-turbo / libwebp / libyuv / skcms). If only this row fails and the 8x8 grid row above passes, triage the
+      // difference; the picture is right.
+      // A picture with semi-transparent pixels (v.semi > 0, data\images-valid.js: 0 < alpha < 255 pixels, counted on the host by gen_valid.py and checked by
+      // kit-tools\images\alpha_survey.py: wheel-png, wheel-webp, wheel-avif) is NOT judged by it, only shown. The canvas read-back un-premultiplies those pixels
+      // and Skia rounds ties up on ARMv7 NEON but to even on x86 (SkSwizzler_opts.inc, pixel_round_as_RP), so a correct ARM32 decode gives another full-RGBA
+      // checksum. Those pictures stay judged by the rows around this one (opaque pixels + alpha channel, 8x8 grid, createImageBitmap). Opaque files keep the check.
+      if (v.x86 && v.semi > 0) Kit.info('valid ' + v.id + ': checksum vs the x86 build (INFO, not judged: the picture has semi-transparent pixels, 0 < alpha < 255 (' + v.semi + ' in its source image); the canvas un-premultiply rounds ties up on ARMv7 NEON but to even on x86, so a correct ARM32 decode gives another checksum; the picture is judged by the opaque-pixels, 8x8 grid and createImageBitmap rows)',
+        (sum || 'no pixels') + ' (x86 build: ' + v.x86 + ', ' + (sum === v.x86 ? 'same' : 'different') + ')');
+      else if (v.x86) ok = Kit.check('valid ' + v.id + ': REGRESSION vs the x86 build (checksum equals the one the x86 build produced; not independent: on x86 it only detects a build change)', v.x86, sum || 'no pixels', sum === v.x86) && ok;
+      else Kit.info('valid ' + v.id + ': checksum (no x86 reference recorded yet)', sum);
+    }
+    // second route into the decoders: createImageBitmap decodes off the main thread; the pixels must be the same
+    const rb = await L.decodeBitmap(blob, T_LOAD);
+    const sb = rb.px ? L.hex8(L.fnv(rb.px.data)) : null;
+    ok = Kit.check('valid ' + v.id + ': createImageBitmap gives the same pixels', sum || 'no pixels', sb || (rb.ev + (rb.err ? ' ' + rb.err : '')), !!sum && sum === sb) && ok;
+    validOk[v.id] = ok;
+    if (ok) nValidOk++;
+  }
+
+  // --- 1b. the encoders: put a decoded valid picture through canvas.toBlob, decode the result, compare ---------------------------------------
+  // (the encode runs off the main thread; the expected values are the same independent ones as for the decoders above)
+  async function roundTrip(id, type, quality) {
+    const src = base[id]; if (!src) return { err: 'the source ' + id + ' did not decode' };
+    const c = document.createElement('canvas'); c.width = src.px.w; c.height = src.px.h;
+    c.getContext('2d', { willReadFrequently: true }).putImageData(new ImageData(new Uint8ClampedArray(src.px.data), c.width, c.height), 0, 0);
+    const blob = await Promise.race([new Promise(res => c.toBlob(res, type, quality)), Kit.sleep(T_LOAD).then(() => null)]);
+    if (!blob) return { err: 'toBlob gave no blob' };
+    const url = URL.createObjectURL(blob); const d = await L.decodeImg(url, T_LOAD); URL.revokeObjectURL(url);
+    return { type: blob.type, size: blob.size, d };
+  }
+  for (const e of [
+    { id: 'png-rgb8', type: 'image/png', name: 'PNG, opaque', exact: true },
+    { id: 'png-rgba8', type: 'image/png', name: 'PNG, alpha 0/255', exact: true },
+    { id: 'png-rgb8', type: 'image/webp', q: 1, name: 'WebP lossless (quality 1), opaque', exact: true },
+    { id: 'png-rgba8', type: 'image/webp', q: 1, name: 'WebP lossless (quality 1), alpha 0/255', exact: true },
+    { id: 'jpeg-baseline-420', type: 'image/jpeg', q: 0.92, name: 'JPEG quality 0.92', tol: 6 },
+    { id: 'webp-lossy', type: 'image/webp', q: 0.9, name: 'WebP lossy quality 0.9', tol: 8 },
+  ]) {
+    const v = IMG_VALID.find(x => x.id === e.id);
+    const rt = await roundTrip(e.id, e.type, e.q);
+    const label = 'encoder ' + e.name + ' (round trip of ' + e.id + ')';
+    Kit.check(label + ': toBlob returns ' + e.type, e.type, rt.type || rt.err, rt.type === e.type);
+    const px = rt.d && rt.d.px;
+    if (e.exact) {
+      const sum = px ? L.hex8(L.fnv(px.data)) : null;
+      Kit.check(label + ': decoded result has the original pixels (independent checksum)', v.exact, sum || (rt.err || (rt.d && rt.d.ev) || 'no pixels'), sum === v.exact);
+    } else {
+      const dd = px && px.w === v.w && px.h === v.h ? L.gridDiff(L.grid(px, 8, 8), v.ref.grid) : 999;
+      Kit.check(label + ': decoded result is the same picture (8x8 mean grid vs the source image, max channel difference)', '<= ' + e.tol, px ? (px.w === v.w && px.h === v.h ? String(dd) : 'size ' + px.w + 'x' + px.h) : (rt.err || 'no pixels'), dd <= e.tol);
+    }
+  }
+
+  // --- 2. broken files: each one REPS times through <img> and through createImageBitmap ---------------------------------------------------
+  const outcomes = {}, brokenOk = {}, lastNote = {};
+  let nBroken = 0, nClean = 0;
+  const sig = r => r.ev + ':' + r.w + 'x' + r.h + ':' + (r.px ? L.fnv(r.px.data) : 0);
+  for (const b of IMG_BROKEN) {
+    nBroken++;
+    const ref = b.base ? base[b.base] : null;
+    const blob = new Blob([Kit.bytes(b.b64)], { type: b.type });
+    let ci = null, first = null, unstable = false;
+    for (let i = 0; i < REPS; i++) {
+      const url = URL.createObjectURL(blob);
+      const r = await L.decodeImg(url, T_LOAD);
+      URL.revokeObjectURL(url);
+      if (i === 0) { ci = L.classify(r, ref && ref.px, ref && ref.grid); first = sig(r); }
+      else if (sig(r) !== first) unstable = true;     // same event, size and pixels as the first attempt?
+    }
+    let cb = null, bfirst = null, bUnstable = false;
+    for (let i = 0; i < REPS; i++) {
+      const r = await L.decodeBitmap(blob, T_LOAD);
+      if (i === 0) { cb = L.classify(r, ref && ref.px, ref && ref.grid); bfirst = sig(r); }
+      else if (sig(r) !== bfirst) bUnstable = true;
+    }
+    outcomes[b.id] = { img: ci.cls, bitmap: cb.cls }; lastNote[b.id] = ci.note || '';
+    // createImageBitmap needs the whole image: it may say "error" for anything the <img> route shows as partial or empty
+    const okI = !unstable && b.allowed.includes(ci.cls), okB = !bUnstable && (b.allowed.includes(cb.cls) || cb.cls === 'error');
+    // A file without a valid sibling (no pixels to compare with) whose allowed list holds every class it can come out as is a no-crash /
+    // no-hang probe: its two checks can fail only on a hang or an unstable result (5 attempts must agree), so they are named that way.
+    // The class it gave is shown in 'got' but is not pinned: it would come from the browser under test.
+    const survives = !b.base && ['error', 'empty', 'content'].every(c => b.allowed.includes(c));
+    const gotI = ci.cls + (ci.note ? ' [' + ci.note + ']' : '') + (unstable ? ' - UNSTABLE across ' + REPS + ' attempts' : '');
+    const gotB = cb.cls + (cb.note ? ' [' + cb.note + ']' : '') + (bUnstable ? ' - UNSTABLE across ' + REPS + ' attempts' : '');
+    if (survives) {
+      Kit.check('broken ' + b.id + ': SURVIVES through <img> (no hang or crash, identical outcome on all ' + REPS + ' attempts; any class accepted)', 'any class, stable', gotI, okI);
+      Kit.check('broken ' + b.id + ': SURVIVES through createImageBitmap (no hang or crash, identical outcome on all ' + REPS + ' attempts; any class accepted)', 'any class, stable', gotB, okB);
+    } else {
+      Kit.check('broken ' + b.id + ': fails cleanly through <img> (built to reach: ' + b.phase + ')', 'one of: ' + b.allowed.join(', '), gotI, okI);
+      Kit.check('broken ' + b.id + ': fails cleanly through createImageBitmap', 'one of: ' + [...new Set(['error', ...b.allowed])].join(', '), gotB, okB);
+    }
+    brokenOk[b.id] = okI && okB;
+    if (okI && okB) nClean++;
+  }
+  // STRUCTURAL, not a runtime proof: which broken JPEGs are BUILT to reach libjpeg-turbo's error_exit -> longjmp (argued from jdmarker.c / jdhuff.c /
+  // jdapistd.c and jpeg_image_decoder.cc:378/778), with the class each gave here. 'empty' (size known, nothing drawn) is also what an end-of-data
+  // suspension (JPEGImageDecoder::Decode -> SetFailed, :1344) and decoders with no setjmp (libwebp, Wuffs, crabbyavif) produce, so the class is an
+  // observation only. The run-time evidence for the longjmp on a device is differential and lives outside this page: the renderer survives the
+  // first error-exit file (jpeg-badhuff-count) and the page reaches Kit.done, where a build without the D42 fix dies.
+  const jpgEE = IMG_BROKEN.filter(b => b.fmt === 'jpg' && /error_exit/.test(b.phase));
+  Kit.info('JPEG error-exit files (STRUCTURAL: built to reach error_exit -> longjmp; argued from source, not shown at run time; the outcome class is an observation, NOT proof that it ran)', jpgEE.length + ' files: ' + jpgEE.map(b => b.id + '=' + outcomes[b.id].img).join(', '));
+
+  // --- 3. route 3: the same files as <img> elements on screen, plus img.decode() on each ------------------------------------------------
+  // What this route is: the files are put on the page as <img> elements (so a visible one is decoded when it is painted) and img.decode() is
+  // called on every one of them (valid and broken, visible or not). STRUCTURAL (argued from image_loader.cc, web_frame_widget_impl.cc and
+  // cc/tiles/image_controller.cc, not observed here): img.decode() -> ChromeClient::RequestDecode -> LayerTreeHost::QueueImageDecode -> a decode
+  // task on the compositor's image-decode worker threads. What the page can read is only whether that request completed: resolved = the worker
+  // task ran to completion (cc also reports it for a broken file whose size was known, so it does not tell a failed decode), rejected = the
+  // <img> was broken or there is no compositor. It never reads the pixels a worker produced, so none of the rows below is a raster-decode
+  // correctness check; the pixel checks are routes 1 and 2.
+  const gallery = document.createElement('div'); gallery.id = 'gallery';
+  // the broken files come first: the top of the page is what a small window (the iframe in index.html) paints
+  gallery.innerHTML = '<h3>broken files as painted (red = not a clean failure; an empty box is a failed decode: size known, nothing drawn; a broken-image icon = onerror)</h3><div class="row" id="gb"></div>' +
+                      '<h3>valid files as painted (green = all checks passed; "~" = lossy or alpha: coarse reference)</h3><div class="row" id="gv"></div>';
+  document.body.appendChild(gallery);
+  const tile = (src, label, ok) => {
+    const d = document.createElement('div'); d.className = 'th ' + (ok ? 'ok' : 'bad');
+    const im = document.createElement('img'); im.src = src; im.alt = 'x'; d.appendChild(im);
+    const s = document.createElement('span'); s.textContent = label; d.appendChild(s);
+    return { d, im };
+  };
+  const shown = [];
+  for (const v of IMG_VALID) { const t = tile(Kit.blobUrl(v.b64, v.type), v.id + (v.exact ? '' : ' ~'), validOk[v.id]); document.getElementById('gv').appendChild(t.d); shown.push({ id: v.id, im: t.im, valid: true }); }
+  for (const b of IMG_BROKEN) { const t = tile(Kit.blobUrl(b.b64, b.type), b.id + ' ' + outcomes[b.id].img, brokenOk[b.id]); document.getElementById('gb').appendChild(t.d); shown.push({ id: b.id, im: t.im, valid: false }); }
+  // wait until every <img> has settled and two animation frames have been painted (a hidden page may never get frames: time-box it)
+  const settle = Date.now();
+  while (Date.now() - settle < T_LOAD && !shown.every(s => s.im.complete)) await Kit.sleep(50);
+  await Promise.race([new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))), Kit.sleep(1500)]);
+  await Kit.sleep(400);
+  const unsettled = shown.filter(s => !s.im.complete).map(s => s.id);
+  Kit.check('LIVENESS: all ' + shown.length + ' files shown as <img> elements settled (load or error; img.complete is true for both)', 'none pending', unsettled.length ? unsettled.join(', ') : 'none pending', unsettled.length === 0);
+  // the painted element agrees with the canvas read-back path on size: a valid file has its size, a broken one that had no image still has none
+  const odd = shown.filter(s => {
+    if (s.valid) return !(sums[s.id] && s.im.naturalWidth > 0);
+    const o = outcomes[s.id].img; return (o === 'error') !== (s.im.naturalWidth === 0);
+  }).map(s => s.id + ' (naturalWidth ' + s.im.naturalWidth + ')');
+  Kit.check('LIVENESS (not a raster-decode check): <img> elements agree with the canvas path on size (valid: naturalWidth > 0; broken: naturalWidth 0 exactly when the decode said error)', 'all agree', odd.length ? odd.join(', ') : 'all agree', odd.length === 0);
+  // img.decode() on every gallery element, all requests at once, each time-boxed
+  const decRes = {};
+  await Promise.all(shown.map(async s => {
+    let tm;
+    const answer = (async () => { try { await s.im.decode(); return 'resolved'; } catch (e) { return 'rejected (' + (e && e.name) + ')'; } })();
+    decRes[s.id] = await Promise.race([answer, new Promise(r => { tm = setTimeout(() => r('no answer within ' + T_DECODE / 1000 + ' s'), T_DECODE); })]);
+    clearTimeout(tm);
+  }));
+  const nValidShown = shown.filter(s => s.valid).length, nBrokenShown = shown.length - nValidShown;
+  const decBadValid = shown.filter(s => s.valid && decRes[s.id] !== 'resolved').map(s => s.id + ' (' + decRes[s.id] + ')');
+  Kit.check('route 3: img.decode() on the <img> of every valid file resolves (the decode request to the compositor\'s worker threads completed; says nothing about the pixels)', 'all ' + nValidShown + ' resolve',
+    decBadValid.length ? decBadValid.join(', ') : 'all ' + nValidShown + ' resolve', decBadValid.length === 0);
+  const decHung = shown.filter(s => !s.valid && /^no answer/.test(decRes[s.id])).map(s => s.id);
+  Kit.check('route 3 NO HANG: img.decode() on the <img> of every broken file settles (resolved and rejected are both accepted; can fail only on a hang)', 'all ' + nBrokenShown + ' settle',
+    decHung.length ? 'no answer: ' + decHung.join(', ') : 'all ' + nBrokenShown + ' settle', decHung.length === 0);
+  const decTally = {}; for (const s of shown) if (!s.valid) decTally[decRes[s.id]] = (decTally[decRes[s.id]] || 0) + 1;
+  Kit.info('route 3 observation: img.decode() of the broken files (a tally, not a verdict)', Object.keys(decTally).map(k => decTally[k] + ' ' + k).join(', '));
+  Kit.info('route 3 (UNVERIFIED): which thread decoded, and what', 'not observed by this page: the worker-thread decode is argued from the source and the pixels a worker produced are never read');
+
+  // --- 4. the page and the decoders are still alive after all those error exits --------------------------------------------------------
+  const t1 = ticks; await Kit.sleep(300);
+  // Info, not a check: this cannot fail. The 50 ms interval is always due before the 300 ms timer that resumed us, so at least one tick is counted, and a
+  // blocked event loop never reaches this line. A crashed or silent page is seen by the runner / index.html, not by an in-page row.
+  Kit.info('LIVENESS (informational, cannot fail: a blocked event loop never reaches this row): page event loop still running after ' + nBroken + ' broken files x ' + REPS + ' attempts x 2 routes + painting (heartbeat ticks)', (ticks - t1) + ' new ticks');
+  clearInterval(hb);
+  for (const id of ['jpeg-baseline-420', 'jpeg-420-islow-prog', 'png-rgb8', 'gif-static', 'webp-lossy', 'wheel-webp', 'avif-8bit', 'bmp-24', 'ico-bmp32']) {
+    const v = IMG_VALID.find(x => x.id === id); if (!v || !base[id]) continue;
+    const url = Kit.blobUrl(v.b64, v.type);
+    const r = await L.decodeImg(url, T_LOAD); URL.revokeObjectURL(url);
+    const sum = r.px ? L.hex8(L.fnv(r.px.data)) : null;
+    Kit.check('decoder healthy after the errors: ' + id + ' decodes to the same pixels again', base[id].sum, sum || r.ev, sum === base[id].sum);
+  }
+  Kit.info('totals', nValid + ' valid files (' + nValidOk + ' fully ok), ' + nBroken + ' broken files (' + nClean + ' clean), ' + REPS + ' attempts each through <img> and createImageBitmap, ' + Math.round(performance.now() - t0) + ' ms');
+  await Kit.done({ sums, outcomes, notes: lastNote, reps: REPS, decode: decRes, arch });
+})();
+</script>

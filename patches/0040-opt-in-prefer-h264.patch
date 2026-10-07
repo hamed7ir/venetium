@@ -1,0 +1,48 @@
+Venetium 0040 - opt-in codec preference, default OFF (BATCH MEDIA-1; his correction 2026-10-06: forcing H.264 breaks or
+degrades VP9/AV1-only videos). Features VenetiumPreferH264 (IsDecoderVp9ProfileSupported + IsDecoderAV1Supported -> false, so
+sites such as YouTube serve H.264) and VenetiumNoAV1 (AV1 only, keeps VP9), defined in media/base/supported_types.cc, their only
+user, to avoid recompiling the ~600 includers of media_switches.h. Enable: --enable-features=VenetiumNoAV1 (or VenetiumPreferH264).
+VP9/AV1 hardware decode is impossible on Tegra 3/4 (no VP9/AV1 block); the VP9/AV1 lever is 0042.
+
+--- a/media/base/supported_types.cc
++++ b/media/base/supported_types.cc
+@@ -41,6 +41,16 @@
+ 
+ namespace {
+ 
++// Venetium 0040: opt-in codec preference for devices whose GPU cannot decode
++// VP9/AV1 in hardware (e.g. Windows ARM32 / Tegra 3/4: software decode only).
++// VenetiumPreferH264 reports VP9 and AV1 as unsupported, so sites such as
++// YouTube serve H.264 (h264ify-style); videos without an H.264 rendition may
++// then fall back to a lower resolution or not play, hence off by default.
++// VenetiumNoAV1 hides only AV1 (the heaviest software codec) and keeps VP9.
++// Defined here, not in media_switches.h, because only this file uses them.
++BASE_FEATURE(kVenetiumPreferH264, base::FEATURE_DISABLED_BY_DEFAULT);
++BASE_FEATURE(kVenetiumNoAV1, base::FEATURE_DISABLED_BY_DEFAULT);
++
+ template <typename T>
+ class SupplementalProfileCache {
+  public:
+@@ -251,6 +261,10 @@
+ }
+ 
+ bool IsDecoderVp9ProfileSupported(const VideoType& type) {
++  // Venetium 0040: opt-in "prefer H.264" (off by default).
++  if (base::FeatureList::IsEnabled(kVenetiumPreferH264)) {
++    return false;
++  }
+ #if BUILDFLAG(IS_ANDROID)
+   // After Q, all VP9 profiles are required by Android
+   return IsColorSpaceSupported(type.color_space);
+@@ -281,6 +295,11 @@
+ }
+ 
+ bool IsDecoderAV1Supported(const VideoType& type) {
++  // Venetium 0040: opt-in "prefer H.264" / "no AV1" (both off by default).
++  if (base::FeatureList::IsEnabled(kVenetiumPreferH264) ||
++      base::FeatureList::IsEnabled(kVenetiumNoAV1)) {
++    return false;
++  }
+   // If the AV1 decoder is enabled, or if we're on Q or later, yes.
+ #if BUILDFLAG(ENABLE_AV1_DECODER)
+   return IsColorSpaceSupported(type.color_space);

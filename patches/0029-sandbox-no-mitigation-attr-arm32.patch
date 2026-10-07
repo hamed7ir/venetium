@@ -1,0 +1,71 @@
+Venetium 0029 - on Windows ARM32, sandboxed child processes are created without PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY.
+
+BATCH-ARM-FIX-2, his decision (2026-10-04, Q1 "both in one trip": ship this now, and carry probe v3, which measures the older
+4-byte form of the attribute and the in-child mitigation calls, for a possible later restoration).
+
+On the Surface 2 (Windows 10 build 15035 ARM32, the post-0028 zip) sandboxed child launches fail:
+- trip 3's metrics recorded Process.Sandbox.Launch.Error = 87 (ERROR_INVALID_PARAMETER) x14, and SBOX_ERROR_CREATE_PROCESS for the
+  GPU, renderers and the storage service;
+- the DEVICE-3 runs log "GPU process launch failed: error_code=18" (SBOX_ERROR_CREATE_PROCESS) until the browser's intentional
+  "GPU process isn't usable" crash.
+
+The sandbox probe (sbxprobe 2, run on the device) measured the cause:
+- build 15035 ARM32 refuses PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY for every value, 0 included, in both the 8-byte and the
+  16-byte form, through CreateProcessW and CreateProcessAsUserW alike;
+- every other part of Chromium's call is accepted: flags 0x0008040C, STARTF 0x180, JOB_LIST, CHILD_PROCESS_POLICY, HANDLE_LIST
+  with Chromium-like handles, every token level, the alternate window station and the filtered environment (COMPONENT_FILTER
+  fails at Update with NOT_SUPPORTED, which Chromium already tolerates);
+- with only that attribute removed, all 11 replays of Chromium's call were accepted, including the one with the real
+  venetium.exe.
+
+1 file:
+- sandbox/win/src/startup_information_helper.cc: under #if defined(_M_ARM), SetMitigations() clears the mitigation word (both
+  DWORD64s) and its size after ConvertProcessMitigationsToPolicy(). CountAttributes() and BuildStartupInformation() therefore leave
+  the attribute out. Every other architecture is unchanged.
+
+What this changes on ARM32, per creation-time mitigation Chromium requests on this OS (GPU / renderer / storage service; the
+renderer with code integrity adds one):
+- Never applied now (nothing re-applies them):
+  - EXTENSION_POINT_DISABLE, FONT_DISABLE (non-system fonts), IMAGE_LOAD_NO_REMOTE, IMAGE_LOAD_NO_LOW_LABEL - all types;
+  - WIN32K_SYSTEM_CALL_DISABLE - renderer and storage service. Their sandbox config still requests win32k lockdown, including its
+    fake-GDI interceptions, while win32k now stays usable in those processes (see ARM-FIX-2-RESULTS.md).
+- Still applied another way:
+  - HEAP_TERMINATE: base::EnableTerminationOnHeapCorruption() at process start in every content process;
+  - BOTTOM_UP_ASLR: the broker's weak 32-bit emulation (ApplyProcessMitigationsToSuspendedProcess);
+  - BLOCK_NON_MICROSOFT_BINARIES for the code-integrity renderer: after startup, through the delayed set; only the startup window
+    is lost.
+- Unchanged: tokens, integrity levels, jobs, desktops, the handle list, the child-process policy, and the delayed mitigations each
+  child applies to itself (DLL search order, Microsoft-signed binaries only, strict handle checks, dynamic-code disable where
+  Chromium asks for it). Those in-child calls are PCHECKed and have not run on 15035 ARM32; probe v3 measures them.
+
+Checked (STRUCTURAL):
+- The ARM startup_information_helper.obj's SetMitigations zeroes the 16-byte word and the size right after the conversion.
+- The preprocessed source is identical with and without this patch for i686, x86_64, aarch64 and arm64ec (review).
+- Relinked chrome.dll and venetium.exe are ARMNT with ASLR/DEP/CFG, with the same sections, exports, version strings and import
+  sets, 0 imports missing in the device's 15035 kernel32/ntdll, and the __rt_* division shim present. chrome_elf.dll is unchanged.
+
+NOT MEASURED: whether this clears the launch failure on the device (his re-run).
+
+diff --git a/sandbox/win/src/startup_information_helper.cc b/sandbox/win/src/startup_information_helper.cc
+index fce8b01..e885141 100644
+--- a/sandbox/win/src/startup_information_helper.cc
++++ b/sandbox/win/src/startup_information_helper.cc
+@@ -43,6 +43,18 @@ void StartupInformationHelper::SetDesktop(std::wstring desktop) {
+ void StartupInformationHelper::SetMitigations(MitigationFlags flags) {
+   ConvertProcessMitigationsToPolicy(flags, &mitigations_[0],
+                                     &mitigations_size_);
++#if defined(_M_ARM)
++  // Venetium 0029: Windows 10 build 15035 on ARM32 refuses CreateProcess with
++  // ERROR_INVALID_PARAMETER whenever PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY is
++  // in the attribute list - for every value, 0 included, in both the 8- and the
++  // 16-byte form (measured on the device). So on ARM32 sandboxed children are
++  // created without it: the creation-time mitigations are not applied at
++  // launch there. The mitigations a child applies to itself after startup
++  // (delayed mitigations) are unchanged.
++  mitigations_[0] = 0;
++  mitigations_[1] = 0;
++  mitigations_size_ = 0;
++#endif
+   ConvertProcessMitigationsToComponentFilter(flags, &component_filter_);
+ }
+ 

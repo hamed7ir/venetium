@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Venetium kit - js-f1</title>
+<script src="lib/configs.js"></script>
+<script src="lib/build.js"></script>
+<script src="lib/kit.js"></script>
+<script src="lib/js-f1-probe.js"></script>
+<script src="lib/js-f1-host.js"></script>
+<script>
+// The F1 probe (venetium/tests/f1probe.js, BATCH-REDO-1 section 5 step 22) inside the real browser: 24 calls (0 of 2, 1 of 3, 2 of 3, 2 of 5,
+// 4 of 2, 6 of 3; sloppy and strict callee; plain and method call) x 3 checks = 72 checks per configuration, the logic unchanged:
+// lib/js-f1-probe.js is f1probe.js mechanically derived (kit-tools/js-f1/js-f1-derive.js, server only); only `print` became the kit's reporter.
+// F1: on Windows ARM32 a call passing FEWER arguments than declared never copied them, so f3(1, 2) saw [global], 1, 2.
+// When the configuration enables --allow-natives-syntax (jitless, ignition, sparkplug, maglev, turbofan, maglev-caller, turbofan-caller,
+// and the two wasm configurations), lib/js-f1-natives.js (the only file with %-syntax) is loaded, the warm-up forces the tier, and
+// %GetOptimizationStatus proves it, decoded as in f1probe.js. The configurations that select no JS tier (default, liftoff-only,
+// no-liftoff) still run the 72 checks; their tier proof is n/a. lib/build.js (the build record, written by the packaging step; null in the
+// record's copy) must load before lib/kit.js: Kit.build and Kit.arch() decide whether a missing Maglev may be n/a (only on a build without Maglev).
+(async () => {
+  try {
+    await F1Host.run(Kit);
+  } catch (e) {
+    Kit.check('js-f1 page ran', 'no exception', String((e && e.stack) || e).split('\n').slice(0, 3).join(' | '), false);
+  }
+  await Kit.done(F1Host.extra);
+})();
+</script>

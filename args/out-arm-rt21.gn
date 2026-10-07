@@ -1,0 +1,64 @@
+# BATCH-ARM-1 §2 step 10 — out\arm-rt21: the Windows ARM32 Venetium browser (Surface 2 / Tegra 4, Windows 10 build 15035).
+# The x86 control's settings (out\x86-rt21\args.gn as generated, 2026-10-02) with target_cpu = "arm"; the server recreates the
+# directory from this file alone: `gn gen out\arm-rt21` with it as args.gn, after `source venetium/env/build-env.sh`.
+# (venetium\args\venetium.gn is appended below it, as the build batches merge it.)
+# Needs Venetium 0016 (the Windows ARM32 toolchain) and clang_rt.builtins-arm.lib in rt21-cr (s9\crt-arm).
+
+# --- the build (his decisions 2026-09-28/29; ARM-1) ---
+target_cpu = "arm"
+is_debug = false
+dcheck_always_on = false
+is_component_build = false
+symbol_level = 1                 # line tables in the PDBs for crash stacks; the PDBs are not shipped
+generate_about_credits = true    # chrome://credits carries Supermium's credit
+# is_official_build stays at its default (false): an official build is a later decision.
+
+# --- toolchain: rt2.1 and rustc-rt2.1 (the sysroot has the thumbv7a-pc-windows-msvc std since RUSTC-2, 21 rlibs) ---
+clang_base_path = "F:/cr/rt21-cr"   # fixed rt2.1 (BATCH-RT21-FIX-1: clang-cl d572c493… lld-link 6e203038… llvm-lib 9e197c48…); clean clang_rt.builtins-arm.lib 6be30eaa… (no __rt_* shim — B5/LLVM 0015)
+clang_version = "23"
+rust_sysroot_absolute = "F:/cr/rustc-rt21"
+rustc_version = "rustc-1.100.0-nightly-bba531001-2026-09-20-rt2.1-31b4bac5e615"
+added_rust_stdlib_libs = [ "windows_link", "rustc_literal_escaper" ]
+removed_rust_stdlib_libs = []
+rust_bindgen_root = "F:/cr/bindgen-rt"   # host tool (x64)
+
+# --- carried from the x86 control because they concern the toolchain, not the product ---
+use_thin_lto = false
+chrome_pgo_phase = 0
+clang_use_chrome_plugins = false   # rt2.x has no Chromium clang plugins
+use_siso = false                   # we drive ninja
+enable_precompiled_headers = false # V8SIM-2 §4 / TOOLCHAIN-ISSUES P1
+
+# --- ARM-1 decision 9 (ARM-1-DECISIONS.md, GPU): ARM32 renders through ANGLE's D3D9 backend (Venetium 0021); SwiftShader and
+# ANGLE's WebGPU/Dawn backend have no use there and are left out of the ARM build.
+enable_swiftshader = false
+angle_enable_wgpu = false
+# ARM-1 §5 fix round (his decision 1, "completes 0021"): Dawn pulls SwiftShader on its own arg (third_party/dawn/src/dawn/
+# native/BUILD.gn data_deps); with ui/gl's Windows data_deps gated by Venetium 0025, this takes SwiftShader out of the graph.
+dawn_use_swiftshader = false
+# --- TOOLCHAIN-ISSUES B4: FIXED in the fixed rt2.1 (LLVM 0017, Windows ARM32 WinEH). Venetium 0024 (libc++ no-exceptions) is
+# dropped — libc++ carries its EH tables again. But DXC stays OFF on ARM32: this is a PLATFORM gap, not the B4 workaround.
+# DEVICE-7-FIX-1 (his decision 2026-10-06): VENETIUM-DROP §4 said to drop dawn_use_built_dxc=false now that B4 is fixed, but
+# doing so turns Dawn's DXC/D3D12 path back on, and its graph copies a prebuilt arm/dxil.dll signer the Windows SDK never ships
+# for 32-bit ARM (SDK 26100 has x64/arm64/x86 only; dxil.dll is Microsoft's closed DXIL validator, unbuildable from source).
+# The Tegra is ANGLE D3D9 / FL 9_1 only (decision 9: enable_swiftshader / angle_enable_wgpu / dawn_use_swiftshader all false),
+# so WebGPU/D3D12/DXC is dead code here regardless of exceptions — like 0022's GetStackStartImpl it stays as a platform fact.
+# x86 is unaffected (real dxil.dll, Dawn's default). "ninja: error: '.../arm/dxil.dll' ... missing and no known rule to make it".
+dawn_use_built_dxc = false
+
+# ---- venetium\args\venetium.gn (appended, as the build batches merge it) ----
+# Venetium GN args (BATCH-VENETIUM-4 §2). Not a patch: the build batch merges this file into each output directory's args.gn.
+# #1 Field-trial TESTING config off: non-Chrome-branded builds otherwise apply testing/variations/fieldtrial_testing_config.json at every start.
+disable_fieldtrial_testing_config = true
+# #9 Reporting API and Network Error Logging off (no background report uploads).
+enable_reporting = false
+# #10 On-device model service off (the ML model runtime process and its code).
+use_on_device_model_service = false
+# #15 JPEG XL decoder off.
+enable_jxl_decoder = false
+# D13 (his decision, 2026-10-02: "video and audio should be on"): proprietary codecs (H.264, AAC, ...) in every Venetium build.
+proprietary_codecs = true
+ffmpeg_branding = "Chrome"
+# D15 (his decision, 2026-10-02: "official build, I agree with you"): stay non-official (no ThinLTO/PGO), but use the real
+# build/util/LASTCHANGE (Chromium's revision and year, venetium\deps\release-inputs.tsv) instead of LASTCHANGE.dummy.
+use_dummy_lastchange = false

@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Venetium kit — stall</title>
+<!-- BATCH-GPU-1 §7.20 (and the §5 compositor torture page): 60 s of compositor work - rounded corners, backdrop blur,
+     drop-shadow filters, gradients, opacity/transform animations, a looping <video>, a 2-D canvas and a minimal WebGL 1 scene,
+     all redrawn every frame - with a requestAnimationFrame meter that records every inter-frame gap over 100 ms (the hang meter).
+     ?seconds=N sets the duration (default 60). -->
+<script src="../lib/configs.js"></script>
+<script src="../lib/kit.js"></script>
+<script src="../lib/gpu-scene.js"></script>
+<script src="../data/media-index.js"></script>
+<body>
+<script>
+(async () => {
+  const q = new URLSearchParams(location.search);
+  const seconds = Math.max(5, Number(q.get('seconds') || 60));
+
+  // which ANGLE backend is live, and does WebGL 1 render at all
+  const gl = GPUScene.webglReport();
+  Kit.info('WebGL renderer (unmasked)', gl.renderer || gl.error || '(none)');
+  Kit.info('WebGL MAX_VARYING_VECTORS', gl.maxVaryingVectors);
+  Kit.check('WebGL 1 renders (drew a non-background pixel)', true, gl.ok + (gl.error ? ' (' + gl.error + ')' : ''), gl.ok);
+
+  const stage = document.createElement('div');
+  document.body.appendChild(stage);
+  const handle = GPUScene.build(stage, { video: true });
+
+  // feed the composited <video> layer the 720p H.264 clip (looping), so the stall scene includes a real decode
+  let videoOk = false;
+  try {
+    const IDX = {}; for (const c of (window.KIT_MEDIA_INDEX || [])) IDX[c.id] = c;
+    await Kit.loadScript('../data/media-avc1.js');
+    const b64 = (window.KIT_MEDIA || {})['avc1'];
+    if (b64 && handle.video) {
+      handle.video.src = Kit.blobUrl(b64, IDX.avc1.mime);
+      const p = handle.video.play(); if (p && p.catch) p.catch(() => {});
+      videoOk = true;
+      delete window.KIT_MEDIA['avc1'];
+    }
+  } catch (e) { /* the scene still runs without the video layer */ }
+  Kit.info('composited <video> layer (720p H.264)', videoOk ? 'playing' : 'not available');
+
+  const stats = await GPUScene.meter({ seconds, handle });
+
+  // the hang meter: a healthy compositor keeps frames flowing; long rAF gaps are the freezes he feels
+  Kit.info('duration', stats.seconds + ' s');
+  Kit.info('frames', stats.frames + ' (' + stats.fps + ' fps)');
+  Kit.info('frame time p50 / p95', stats.p50Ms + ' / ' + stats.p95Ms + ' ms');
+  Kit.info('rAF gaps > 100 ms', stats.gapsOver100 + ' (longest ' + stats.longestGapMs + ' ms)');
+  // a gate the runner can read: a smooth run keeps the longest single gap modest. This is a soft threshold for the server/WARP
+  // (headless WARP is not a GPU); on the device it is the number that matters, reported either way.
+  Kit.check('no rAF gap longer than 2000 ms', '<= 2000 ms', stats.longestGapMs + ' ms', stats.longestGapMs <= 2000);
+  Kit.check('kept at least 10 fps on average', '>= 10 fps', stats.fps + ' fps', stats.fps >= 10);
+
+  await Kit.done({ kind: 'stall', seconds, webgl: gl, videoLayer: videoOk, stats });
+})();
+</script>
+</body>

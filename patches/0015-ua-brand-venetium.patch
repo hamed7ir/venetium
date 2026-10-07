@@ -1,0 +1,29 @@
+Venetium 0015 - client hints: brand the browser "Venetium", not "Google Chrome".
+
+components/embedder_support/user_agent_utils.cc as Supermium's 150 set leaves it: GetUserAgentBrandList() on a Chromium-branded
+build (Venetium is one) puts the brand "Google Chrome" into Sec-CH-UA, Sec-CH-UA-Full-Version-List and navigator.userAgentData
+unless a 'uao' file in the user data directory names another. Genuine Google Chrome sends that brand together with its
+X-Browser-Validation / -Channel / -Year / -Copyright headers on Google requests; this build cannot send them (they exist only in
+Chrome-branded builds). Google's sign-in therefore sees a "Google Chrome" without them and refuses it: "Couldn't sign you in -
+This browser or app may not be secure" (accounts.google.com/v3/signin/rejected).
+
+Found in BATCH-X86-2 (his windowed session, 2026-10-02). Shown on this machine (F:\cr\x86-2\signin\probe.json): Venetium sent
+the brand without the headers; Google Chrome 154 sent both. His test A: the same build with a 'uao' file that changes only the
+brand to "Venetium" signed in, and YouTube played signed in.
+
+Fix: when no 'uao' brand is given, use version_info::GetProductName() ("Venetium", from chrome/app/theme/chromium/BRANDING),
+the call upstream uses for branded builds. A 'uao' brand still wins. His decision (2026-10-02): patch now, brand Venetium.
+
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index f933ade..59961df 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -228,7 +228,7 @@ const blink::UserAgentBrandList GetUserAgentBrandList(
+   if (!custom_brand.empty())
+ 	brand = custom_brand;
+   else
+-    brand = std::string("Google Chrome");
++    brand = version_info::GetProductName();
+ #endif
+ 
+   std::string custom_brand_version = parseFile(UACHCustomVersion);

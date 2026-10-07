@@ -1,0 +1,23 @@
+Venetium 0039 - GPU rasterization on NVIDIA Tegra 4 / ANGLE D3D9 (BATCH MEDIA-1, his decision 2026-10-06).
+gpu/config/software_rendering_list.json entry 122 (crbug 1047002, 1462800) blocklists gpu_tile_rasterization on every Windows GPU
+except ps>=5.0 + Direct3D11 renderers; ANGLE-D3D9 Tegra (ps 2.0, Direct3D9Ex) fell out. Skia Ganesh already composites and
+rasters canvas here (GrGLANGLEBackend::kD3D9), and Chromium 77 had GPU raster on by default. One exception: DXGI vendor 0x4144564e
+('NVDA' fourcc, not PCI 0x10de) + device 0x35303230 (Tegra 4, trip-6 d3dprobe) + gl_renderer Direct3D9. Tegra 3 (Surface RT,
+0x35303130, Windows RT 8.1 d3dprobe: identical SM2 caps, max texture 2048) is left on software raster on purpose: its GPU is far
+weaker relative to its CPU. --disable-gpu-rasterization still wins; Tegra 3 opts in with --enable-gpu-rasterization.
+
+--- a/gpu/config/software_rendering_list.json
++++ b/gpu/config/software_rendering_list.json
+@@ -876,6 +876,12 @@
+         },
+         {
+           "gl_renderer": ".*OpenGL.*"
++        },
++        {
++          "comment": "Venetium 0039: NVIDIA Tegra 4 (Surface 2) on Windows ARM32 renders through ANGLE's D3D9 backend, which Skia Ganesh supports (GrGLANGLEBackend::kD3D9); Chromium 77 rasterized on the GPU here by default. DXGI ids are fourccs ('NVDA' vendor, Tegra 4 device 0x35303230 from trip-6 d3dprobe), not PCI ids. Scoped to the Tegra 4 device id on purpose. Tegra 3 (Surface RT, device 0x35303130, d3dprobe on Windows RT 8.1, 2026-10-06) has identical D3D9 shader caps (PS20Caps 0x19, 512 slots, ps_2_a accepted), so correctness is the same, but its GPU is several times weaker relative to its CPU than Tegra 4's, and that GPU also composites everything; it stays on software raster (opt in with --enable-gpu-rasterization) until a Windows 10 Surface RT A/B run justifies adding 0x35303130 here.",
++          "vendor_id": "0x4144564e",
++          "device_id": [ "0x35303230" ],
++          "gl_renderer": ".*Direct3D9.*"
+         }
+       ]
+     },

@@ -1,0 +1,32 @@
+Venetium 0024 - libc++ without C++ exceptions on Windows ARM32 (Chromium-side workaround for TOOLCHAIN-ISSUES B4).
+
+His decision (2026-10-02, on B4): "workaround now". rt2.1 (23.1.1-rt2.1) crashes on any C++ catch handler for arm-windows
+("fatal error: error in backend: WinEH not implemented for this target", ARM Assembly Printer); MSVC's ARM cl 19.44 compiles the same
+code (.pdata/.xdata, __CxxFrameHandler3). libc++ is the only Chromium library in the ARM chrome graph built with exceptions besides
+Dawn's DirectX Shader Compiler, which venetium/args/out-arm-rt21.gn leaves out for ARM (dawn_use_built_dxc = false; WebGPU's D3D12
+backend only - the Tegra has no D3D12). 1 file:
+- buildtools/third_party/libc++/BUILD.gn: for is_win && current_cpu == "arm" the libc++ target swaps
+  //build/config/compiler:exceptions for :no_exceptions (on Windows that only drops /EHsc). libc++ supports a no-exceptions build
+  (_LIBCPP_HAS_EXCEPTIONS follows the compiler); its throw sites then abort. Chromium's own code builds without exceptions already.
+x86, x64 and arm64 keep libc++ with exceptions. Drop this patch (and the args line) when rt2 implements Windows ARM32 C++ EH.
+Checked (RUNTIME, real arm-rt21 graph after gn gen): 0 of 43,873 ARM compiles in chrome have exceptions on; libc++'s 51 objects
+compile; ANGLE's libGLESv2.dll (4,277,248 B) and libEGL.dll link as ARMNT DLLs.
+
+diff --git a/buildtools/third_party/libc++/BUILD.gn b/buildtools/third_party/libc++/BUILD.gn
+index a544966..0484019 100644
+--- a/buildtools/third_party/libc++/BUILD.gn
++++ b/buildtools/third_party/libc++/BUILD.gn
+@@ -527,6 +527,13 @@ target(libcxx_target_type, "libc++") {
+     "//build/config/compiler:exceptions",
+     "//build/config/compiler:rtti",
+   ]
++  if (is_win && current_cpu == "arm") {
++    # Venetium 0024 (TOOLCHAIN-ISSUES B4): rt2.1 cannot emit Windows ARM32 C++ exception handling (a catch handler
++    # crashes its ARM backend), so libc++ is built without exceptions there; its throw sites abort. Drop this
++    # when rt2 implements Windows ARM32 C++ EH.
++    configs -= [ "//build/config/compiler:exceptions" ]
++    configs += [ "//build/config/compiler:no_exceptions" ]
++  }
+ 
+   deps = [ "//third_party/llvm-libc:llvm-libc-shared" ]
+ 

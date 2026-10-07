@@ -1,0 +1,2 @@
+path	sha256	source
+webrtc.html	7bf28c68908f5f4b33dfce5e949fe1019862ba733886b88859c7019659504087	original code (this kit): the webrtc test page (getUserMedia + a two-peer-connection loopback read through getStats); no data files and no libs: the camera picture and the microphone signal come from the browser itself (runner: --use-fake-device-for-media-stream; device: the real camera and microphone), see venetium/tests/kit-tools/webrtc/README.md; mutation checks in venetium/tests/kit-tools/webrtc/mutants.js

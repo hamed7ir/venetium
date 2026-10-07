@@ -1,0 +1,78 @@
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d9/Renderer9.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d9/Renderer9.cpp
+index ea23d79..6b35805 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d9/Renderer9.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d9/Renderer9.cpp
+@@ -164,6 +164,8 @@ Renderer9::Renderer9(egl::Display *display) : RendererD3D(display), mStateManage
+     mAppliedPixelShader   = nullptr;
+     mAppliedProgramSerial = 0;
+ 
++    mSelectedProfileLogged = false;  // Venetium 0033
++
+     gl::InitializeDebugAnnotations(&mAnnotator);
+ }
+ 
+@@ -2757,10 +2759,46 @@ angle::Result Renderer9::compileToExecutable(d3d::Context *context,
+             ANGLE_HR_UNREACHABLE(context);
+     }
+ 
+-    profileStream << "_" << ((getMajorShaderModel() >= 3) ? 3 : 2);
+-    profileStream << "_" << "0";
+-
+-    std::string profile = profileStream.str();
++    // Venetium 0033: on a shader-model-2 device (the Tegra at D3D9) choose the strongest 2.x profile the caps allow, so a
++    // program that needs more than ps_2_0's 64 arithmetic slots compiles (ps_2_a / ps_2_b allow 512; section 2.4) instead of
++    // failing. Microsoft's profile requirements, checked against D3DCAPS9.PS20Caps / VS20Caps. Only reached when the device is
++    // SM2 (an SM3 device, like the x86 WARP control, keeps ps_3_0 / vs_3_0, as before). profileStream is unused now.
++    (void)profileStream;
++    std::string profile;
++    if (getMajorShaderModel() >= 3)
++    {
++        profile = (type == gl::ShaderType::Vertex) ? "vs_3_0" : "ps_3_0";
++    }
++    else if (type == gl::ShaderType::Vertex)
++    {
++        const D3DVSHADERCAPS2_0 &v = mDeviceCaps.VS20Caps;
++        if ((v.Caps & D3DVS20CAPS_PREDICATION) && v.DynamicFlowControlDepth >= 24 && v.NumTemps >= 13 &&
++            v.StaticFlowControlDepth >= 4)
++            profile = "vs_2_a";
++        else
++            profile = "vs_2_0";
++    }
++    else
++    {
++        const D3DPSHADERCAPS2_0 &p    = mDeviceCaps.PS20Caps;
++        const DWORD kPs2aRequiredCaps = D3DPS20CAPS_ARBITRARYSWIZZLE | D3DPS20CAPS_GRADIENTINSTRUCTIONS |
++                                        D3DPS20CAPS_PREDICATION | D3DPS20CAPS_NODEPENDENTREADLIMIT |
++                                        D3DPS20CAPS_NOTEXINSTRUCTIONLIMIT;
++        if (p.NumInstructionSlots >= 512 && p.NumTemps >= 22 && (p.Caps & kPs2aRequiredCaps) == kPs2aRequiredCaps)
++            profile = "ps_2_a";
++        else if (p.NumInstructionSlots >= 512 && p.NumTemps >= 32)
++            profile = "ps_2_b";
++        else
++            profile = "ps_2_0";
++    }
++    if (getMajorShaderModel() < 3 && !mSelectedProfileLogged)
++    {
++        mSelectedProfileLogged = true;
++        INFO() << "Venetium 0033: D3D9 SM2 device; this stage uses profile '" << profile << "' (PS20 slots "
++               << mDeviceCaps.PS20Caps.NumInstructionSlots << " temps " << mDeviceCaps.PS20Caps.NumTemps << " caps "
++               << mDeviceCaps.PS20Caps.Caps << "; VS20 temps " << mDeviceCaps.VS20Caps.NumTemps << " caps "
++               << mDeviceCaps.VS20Caps.Caps << ").";
++    }
+ 
+     UINT flags = ANGLE_COMPILE_OPTIMIZATION_LEVEL;
+ 
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d9/Renderer9.h b/third_party/angle/src/libANGLE/renderer/d3d/d3d9/Renderer9.h
+index 2ce068d..b4ca26b 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d9/Renderer9.h
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d9/Renderer9.h
+@@ -515,6 +515,9 @@ class Renderer9 : public RendererD3D
+     int mPrimitiveCount;
+     GLsizei mRepeatDraw;
+ 
++    // Venetium 0033: log the chosen SM2 shader profile and the device caps once.
++    bool mSelectedProfileLogged;
++
+     bool mSceneStarted;
+ 
+     bool mVertexTextureSupport;

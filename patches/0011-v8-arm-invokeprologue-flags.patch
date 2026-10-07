@@ -1,0 +1,32 @@
+Venetium 0011 - F1: V8 on Windows ARM32 loses the arguments of a call that passes fewer than the function declares.
+
+MacroAssembler::InvokePrologue (v8/src/codegen/arm/macro-assembler-arm.cc) enters its argument-copy loop through
+b(&check) -> b(gt, &copy), a branch that reads the condition flags left by the compare before it. On Windows,
+AllocateStackSpace() touches each new stack page in a loop that ends in `cmp bytes, #4096`, which overwrites those
+flags, so for an under-applied call the copy loop never runs: f3(1, 2) receives [global], 1, 2 instead of
+1, 2, undefined - in every tier, --jitless included. Not simulator-only: a native Windows ARM32 build generates the
+same code; upstream V8 main has it too, and V8 has no Windows ARM32 bot. Found by V8SIM-3 (the simulator's
+instruction trace). Audit (V8SIM-4): of V8's 24 ARM stack-allocation sites only InvokePrologue branches on flags the
+Windows version overwrites; ARM64's Windows version clobbers them too, but its code branches on registers.
+
+Fix: set the flags from the argument count just before that branch. num includes the receiver, so num >= 1 and the
+loop is entered exactly as on non-Windows builds. Windows only (#ifdef V8_OS_WIN). Re-created by BATCH-REDO-1 section 4
+(2026-10-01); the probe is venetium/tests/f1probe.py.
+
+diff --git a/v8/src/codegen/arm/macro-assembler-arm.cc b/v8/src/codegen/arm/macro-assembler-arm.cc
+index a753eb6..eac08b5 100644
+--- a/v8/src/codegen/arm/macro-assembler-arm.cc
++++ b/v8/src/codegen/arm/macro-assembler-arm.cc
+@@ -1711,6 +1711,12 @@ void MacroAssembler::InvokePrologue(Register expected_parameter_count,
+     AllocateStackSpace(scratch);
+     mov(dest, sp);
+     mov(num, actual_parameter_count);
++#ifdef V8_OS_WIN
++    // AllocateStackSpace() on Windows touches the new stack pages in a
++    // compare-and-branch loop, which clobbers the condition flags that the
++    // copy loop below relies on. Set them from the argument count.
++    cmp(num, Operand(0));
++#endif  // V8_OS_WIN
+     b(&check);
+     bind(&copy);
+     ldr(scratch, MemOperand(src, kSystemPointerSize, PostIndex));

@@ -1,0 +1,49 @@
+# BATCH-MOVE-1b §1 — out\x86-rt21: the x86 Venetium browser (the control build; a release beside ARM32 if it proves OK).
+# Its settings are the ARM32 build's, CPU settings aside. The server recreates the directory from this file alone:
+# `gn gen out\x86-rt21` with it as args.gn, after `source venetium/env/build-env.sh`.
+# (venetium\args\venetium.gn is appended below it, as the build batches merge it.)
+# enable_nacl is NOT set: Chromium 150 no longer declares it (`gn args --list=enable_nacl` → "Unknown build argument").
+# Note on the PCH comment below (copied unchanged from out-x86-arm-sim.gn): its "remote builds" reason is superseded — the
+# real reason upstream never meets P1 is that its unsafe-buffers plugin keeps PCH off (pch.gni:18-20), and we turn plugins
+# off (G2); and "//base, the only PCH user" holds for d8/v8_unittests only — the x64 Chrome graph has 81 PCH-building
+# compiles. See TOOLCHAIN-ISSUES.md P1 and V8SIM-2-RESULTS.md §4.1a.
+
+# --- the build (his decisions 2026-09-28/29) ---
+target_cpu = "x86"
+is_debug = false
+dcheck_always_on = false
+is_component_build = false
+symbol_level = 1                 # line tables in the PDBs for crash stacks; the PDBs are not shipped
+generate_about_credits = true    # chrome://credits carries Supermium's credit
+# is_official_build stays at its default (false): an official build is a later decision.
+
+# --- toolchain (V8SIM-1 §0.3): rt2.1 and rustc-rt2.1, whose sysroot has the i686 std since RUSTC-3 ---
+clang_base_path = "F:/cr/rt21-cr"   # fixed rt2.1 (BATCH-RT21-FIX-1): clang-cl d572c493…, lld-link 6e203038…, llvm-lib 9e197c48…
+clang_version = "23"                 # rt2.1's lib/clang/23
+rust_sysroot_absolute = "F:/cr/rustc-rt21"   # 158/158 = RUSTC-3-SYSROOT-MANIFEST.txt; on F: (find_std_rlibs.py relpath)
+rustc_version = "rustc-1.100.0-nightly-bba531001-2026-09-20-rt2.1-31b4bac5e615"   # RUSTC-3 §3.1; new rustc_driver (Part R); no spaces
+added_rust_stdlib_libs = [ "windows_link", "rustc_literal_escaper" ]   # same library lists as the x64 control
+removed_rust_stdlib_libs = []
+rust_bindgen_root = "F:/cr/bindgen-rt"   # the x64 control's Windows bindgen
+
+# --- carried from the x64 control (out\x64-rt2) because they concern the toolchain, not the product ---
+use_thin_lto = false
+chrome_pgo_phase = 0
+clang_use_chrome_plugins = false   # rt2.x has no Chromium clang plugins
+use_siso = false                   # we drive ninja
+# V8SIM-2 §4 (his decision 2026-09-29): no precompiled headers. Chromium 150 adds "-fmodule-name=..._Private" to every
+# Windows clang compile (build/toolchain/win/toolchain.gni:221-224), and clang (18.1.8, 22.1.8, 23.1.1 alike) then builds the
+# /Yc PCH as a C++20 module interface → "missing 'export module' declaration" (//base, the only PCH user). Chromium's bots
+# never meet it: remote builds turn PCH off (build/config/pch.gni:18-20). The x64 and ARM server builds need the same line.
+enable_precompiled_headers = false
+
+# ---- venetium\args\venetium.gn (appended, as the build batches merge it) ----
+# Venetium GN args (BATCH-VENETIUM-4 §2). Not a patch: the build batch merges this file into each output directory's args.gn.
+# #1 Field-trial TESTING config off: non-Chrome-branded builds otherwise apply testing/variations/fieldtrial_testing_config.json at every start.
+disable_fieldtrial_testing_config = true
+# #9 Reporting API and Network Error Logging off (no background report uploads).
+enable_reporting = false
+# #10 On-device model service off (the ML model runtime process and its code).
+use_on_device_model_service = false
+# #15 JPEG XL decoder off.
+enable_jxl_decoder = false

@@ -1,0 +1,242 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Venetium kit - js-jit</title>
+<script src="lib/configs.js"></script>
+<script src="lib/build.js"></script>
+<script src="lib/kit.js"></script>
+<script src="data/js-jit-expected.js"></script>
+<body>
+<pre id="raw" style="font:12px Consolas,monospace;margin:14px 0 0;white-space:pre-wrap"></pre>
+<script>
+// js-jit: s10\jit's JavaScript cases (core.js: 13 functions, each run 4 times) compared value by value with the host's answers, the way
+// s10\jit\run_jit.py does it, but inside the real browser.
+//   lib/js-jit-core.js    s10\jit\core.js, byte for byte. It calls print(); here print() is replaced by a collector (the browser's print()
+//                         opens the print dialog), and the collected 'name=value' lines are parsed exactly like run_jit.py parses d8's stdout.
+//   data/js-jit-expected.js  the host's answers: expected.txt (= `python expected.py`, exact integers) for the 12 recomputable cases, and
+//                         host Node.js (V8 x64, node-x64.txt) for sin_crosstier (libm-dependent, not recomputable) - run_jit.py's rule.
+//   lib/build.js          the build this kit copy is for (null in the record; the packaging step writes {v8_current_cpu, has_maglev, ...}
+//                         from the build's own v8_build_config.json). Loaded BEFORE lib/kit.js, which reads it into Kit.build.
+//   Natives configurations (Kit.natives; V8 %-syntax, so these live in their own files, loaded only then):
+//     lib/js-jit-status.js  s10\jit\status.js, byte for byte: core.js prints tier.<case>=<tier> after each case
+//     lib/js-jit-force.js   s10\jit\force.js, byte for byte: forces each measured function into TurboFan before it is measured
+//     lib/js-jit-force-maglev.js  the Maglev variant (the kit's maglev configurations do not pass --optimize-on-next-call-optimizes-to-maglev)
+//     lib/js-jit-probe.js   %IsMaglevEnabled() etc.: is the tier switched on in this build
+//   The tier proof (the configuration's tier, from lib/configs.js): every one of the 13 functions must END in that tier.
+//   Without natives (default): core.js runs plainly, all answers are still compared, the tier proof is n/a.
+//   Natives on but the configuration selects no JS tier (liftoff-only, no-liftoff carry natives for wasm.html only): the same, the JS tier
+//   proof is n/a ("this configuration selects no JS tier") - never a failure and never "proven".
+//   Natives expected (the configuration has a tier) but rejected by V8: the 'natives syntax accepted' check FAILS and the tier label says
+//   "NOT PROVEN: natives expected but rejected" (not "n/a").
+//   Maglev configurations: if %IsMaglevEnabled() is true the tier is PROVEN (13/13 functions in Maglev), whatever the architecture says.
+//   If it is false, "n/a" is allowed ONLY for ia32 (V8 builds no Maglev there; ARM32 has it), decided like this:
+//     - lib/build.js present (has_maglev is a boolean): n/a only when has_maglev is false AND v8_current_cpu is "x86" (V8 builds no Maglev
+//       for x86 and builds it for every other CPU). has_maglev false with any other v8_current_cpu (arm, arm64, x64, none named) is a FAILURE
+//       ("the build record says <cpu> has no Maglev, but V8 builds Maglev for <cpu>": a wrong record, or a Maglev-less build of a CPU that
+//       must have it), and so is has_maglev true with Maglev off (Maglev switched off by a flag or the build is not the one the kit was
+//       packaged for). The browser's own report is not asked.
+//     - no build record (the record's copy): Kit.arch(), the CPU the browser reports through navigator.userAgentData. ia32 = architecture
+//       'x86' (Chromium reports 'x86' for ia32 AND x64) and (bitness '32' or wow64 true). Windows ARM32 reports architecture '' / bitness '64'
+//       / wow64 false (Chromium has no ARM32 case), x64 reports x86 / 64 / false, so neither is ia32. No API, a rejection or no answer within
+//       3 s is not ia32 either: every doubtful case is a FAILURE.
+//   The architecture and the build record are recorded in every run (info rows + result.arch / result.build), natives or not.
+//   Mismatch: lib/build.js says has_maglev false but V8 has Maglev -> a failed check (the kit and the build disagree); the proof still runs.
+//   --jitless (cfg.nowasm): V8 does not expose WebAssembly, so typeof WebAssembly must be 'undefined'; in every other configuration it
+//   must be 'object'. Jitless is also told from ignition by the lite-mode bit (kLiteMode, 1 << 12, in %GetOptimizationStatus): set in every
+//   tier status if and only if the configuration's flags contain --jitless. And the tiers the configuration's flags switch off or on
+//   (--jitless, --no-sparkplug, --no-maglev, --no-turbofan, --always-sparkplug) are compared with %IsSparkplugEnabled / %IsMaglevEnabled /
+//   %IsTurbofanEnabled ("flags reached V8"); the expectation comes from lib/configs.js, never from the probe.
+//   The -caller configurations (maglev-caller, turbofan-caller) measure the same functions as the callee ones here: core.js has no user
+//   callees, so their inlining flags change nothing this page can observe (an info row says so). A PASS is not caller-inlining evidence.
+// The host's answers (data/js-jit-expected.js): the 12 core answers come from JIT_EXPECTED (host python) ONLY, sin_crosstier from
+// JIT_NODE_X64 ONLY (run_jit.py's rule); the checked keys are the union of both objects, so a key deleted from either one is still
+// checked and fails ("no reference value") instead of silently dropping out. A missing reference never passes. That the 12 python answers
+// also equal the 12 host-Node answers is a BUILD-TIME property of the shipped data file (the same on every device; pinned by the manifest's
+// sha256 and checked by kit-tools\js-jit\gen-expected.js --check), so the page only shows it as an info row - it is not a check of the browser.
+// Likewise the print() collector assignment cannot be refused by a browser, so it is an info row too (core.js's own 'done=core' and answer
+// checks would fail if print() still opened the print dialog).
+// Armed (?armed=1): the first answer check (overflow) gets a wrong expectation (+1, like run_jit.py's planted error) via Kit.want.
+(async () => {
+  try {
+    const cfg = Kit.cfg, E = JIT_EXPECTED, NODE = JIT_NODE_X64, FLAGS = cfg.flags || [];
+    const SIN = 'sin_crosstier';                      // the one answer compared with Node (libm-dependent, not recomputable on the host)
+    const KEYS = [...new Set(Object.keys(E).concat(Object.keys(NODE), [SIN]))];   // run_jit.py: list(exp) + ['sin_crosstier']
+    const lines = [];
+    const collector = function print(s) { lines.push(String(s)); };
+    window.print = collector;
+    Kit.info('print() is the page collector (the real print() would open a print dialog; information only: the assignment cannot be refused)', window.print === collector ? 'collector' : 'window.print');
+
+    // every wait has a timeout; the timer is cleared when the promise settles first
+    function withTimeout(p, ms, what) {
+      let t;
+      return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error('timeout after ' + ms / 1000 + ' s: ' + what)), ms); })])
+        .then(v => { clearTimeout(t); return v; }, e => { clearTimeout(t); throw e; });
+    }
+    const load = (src, ms) => withTimeout(Kit.loadScript(src), ms, 'no load event for ' + src);
+    const loadFailed = [];
+    async function need(src, ms) {
+      try { await load(src, ms || 60000); return true; }
+      catch (e) { loadFailed.push(src); Kit.check('load ' + src, 'loaded', String(e.message), false); return false; }
+    }
+
+    // ---- recorded facts (information only): the configuration, the CPU the browser reports, the build record ----
+    const archInfo = await Kit.arch();                // never rejects, 3 s timeout (lib/kit.js)
+    const build = Kit.build;                          // window.KIT_BUILD from lib/build.js, or null
+    const buildHas = (build && typeof build.has_maglev === 'boolean') ? build.has_maglev : null;     // null: no usable build record
+    Kit.info('configuration', Kit.config + ': natives ' + (Kit.natives ? 'on' : 'off') + '; tier ' + (cfg.tier || '(none)') + '; js-flags ' + (FLAGS.join(' ') || '(none)'));
+    if (cfg.who === 'caller') Kit.info('caller configuration (nominal for this page)', 'core.js has no user callees: this run measures the same functions as the callee configuration; --no-turbo-inlining / --no-maglev-inlining change nothing this page can observe');
+    Kit.info('CPU architecture (Kit.arch: navigator.userAgentData; Windows ARM32 reports architecture "" / bitness 64 / wow64 false)', JSON.stringify(archInfo));
+    Kit.info('build record (lib/build.js)', build ? JSON.stringify(build) : 'none (the record copy of the kit): the Maglev n/a decision uses the CPU the browser reports');
+
+    // ---- the data file: do the 12 python answers and the 12 host-Node answers agree? INFORMATION ONLY: a build-time property of the shipped
+    // data/js-jit-expected.js (identical on every device, pinned by the manifest sha256, checked by kit-tools\js-jit\gen-expected.js --check) ----
+    const recomputable = KEYS.filter(k => k !== SIN);
+    const disagree = recomputable.filter(k => E[k] === undefined || E[k] !== NODE[k]);
+    Kit.info('data file, not a browser check: host python and host Node x64 agree on the ' + recomputable.length + ' recomputable answers (data/js-jit-expected.js)',
+      disagree.length === 0 ? 'agree' : 'DISAGREE on ' + JSON.stringify(disagree));
+
+    // ---- WebAssembly: absent under --jitless, present everywhere else (tells jitless from ignition) ----
+    const wasmType = typeof WebAssembly;
+    if (cfg.nowasm) Kit.check('typeof WebAssembly under --jitless (V8 does not expose it)', 'undefined', wasmType, wasmType === 'undefined');
+    else Kit.check('typeof WebAssembly (present without --jitless)', 'object', wasmType, wasmType === 'object');
+
+    // ---- preambles (natives configurations only), in run_jit.py's order: status, then force ----
+    const plan = { want: null, mode: 'plain' };       // want: the tier every function must end in
+    let probe = null, naWhy = null, maglevWhy = null, flagsExpected = null;
+    if (!Kit.natives) {
+      naWhy = 'natives syntax is off in configuration "' + Kit.config + '": core.js runs plainly, only the answers are compared';
+      Kit.na('tier proof', naWhy);
+    } else if (!cfg.tier) {
+      plan.mode = 'no-tier';       // natives are on (wasm.html needs them), but the configuration picks no JS tier: nothing to prove here
+      naWhy = 'this configuration selects no JS tier (configuration "' + Kit.config + '"): core.js runs plainly, only the answers are compared';
+      Kit.na('tier proof', naWhy);
+    } else {
+      await need('lib/js-jit-status.js');
+      const haveStatus = typeof globalThis.__status === 'function';
+      Kit.check('natives syntax accepted (status.js defined __status)', 'function', typeof globalThis.__status, haveStatus);
+      if (!haveStatus) plan.mode = loadFailed.length ? 'status-not-loaded' : 'natives-rejected';
+      if (haveStatus && await need('lib/js-jit-probe.js')) {
+        probe = globalThis.__jitProbe;
+        Kit.info('V8 tiers switched on (%IsSparkplugEnabled / %IsMaglevEnabled / %IsTurbofanEnabled)', JSON.stringify(probe));
+        // the flags reached V8: what the configuration's own flag list switches on or off (lib/configs.js, in order, last wins) against the probe
+        flagsExpected = { sparkplug: null, maglev: null, turbofan: null };
+        for (const f of FLAGS) {
+          if (f === '--jitless') flagsExpected.sparkplug = flagsExpected.maglev = flagsExpected.turbofan = false;
+          else if (f === '--no-sparkplug') flagsExpected.sparkplug = false;
+          else if (f === '--no-maglev') flagsExpected.maglev = false;
+          else if (f === '--no-turbofan') flagsExpected.turbofan = false;
+          else if (f === '--always-sparkplug') flagsExpected.sparkplug = true;
+        }
+        for (const t of Object.keys(flagsExpected)) {
+          if (flagsExpected[t] === null) continue;
+          Kit.check('flags reached V8: ' + t + ' enabled (the js-flags of "' + Kit.config + '" in lib/configs.js)', flagsExpected[t], probe[t], probe[t] === flagsExpected[t]);
+        }
+      }
+      if (haveStatus) {
+        if (cfg.tier === 'interpreter' || cfg.tier === 'sparkplug') { plan.want = cfg.tier; plan.mode = 'flags'; }   // the flags pick the tier
+        else if (cfg.tier === 'turbofan') { plan.want = 'turbofan'; plan.mode = 'force'; await need('lib/js-jit-force.js'); }
+        else if (cfg.tier === 'maglev') {
+          if (probe && probe.maglev === true) {
+            // Maglev is in this V8: PROVE it, whatever the architecture or the build record say
+            plan.want = 'maglev'; plan.mode = 'force-maglev'; await need('lib/js-jit-force-maglev.js');
+            if (buildHas === false) {
+              Kit.check('lib/build.js and this V8 agree about Maglev', 'has_maglev false (lib/build.js)', '%IsMaglevEnabled() is true: the kit copy and the build are not the same (the proof below still runs)', false);
+            }
+          } else {
+            // Maglev is not enabled (or the probe is missing): n/a only for ia32, otherwise a missing Maglev is a failure
+            const cpu = JSON.stringify({ architecture: archInfo.architecture, bitness: archInfo.bitness, wow64: archInfo.wow64, note: archInfo.note || undefined });
+            let ok = false, why;
+            if (!probe) why = 'the probe lib/js-jit-probe.js did not load, so %IsMaglevEnabled() is unknown';
+            else if (cfg.ia32 !== 'n/a') why = '%IsMaglevEnabled() is false and configuration "' + Kit.config + '" has no ia32 n/a (lib/configs.js)';
+            else if (buildHas === true) why = '%IsMaglevEnabled() is false but lib/build.js says this build has Maglev (v8_current_cpu ' + build.v8_current_cpu + ', has_maglev true): --no-maglev reached V8, or the kit is not the one packaged for this build';
+            else if (buildHas === false) {
+              // has_maglev false is believable only for x86: V8 builds Maglev for every other CPU, so an arm / arm64 / x64 record (or one naming no CPU)
+              // that says "no Maglev" is a wrong record, or a Maglev-less build of a CPU that must have it: a failure, not an n/a
+              const rcpu = build.v8_current_cpu;
+              if (rcpu === 'x86') { ok = true; maglevWhy = 'lib/build.js says has_maglev false for v8_current_cpu x86, the one CPU V8 builds no Maglev for'; }
+              else if (typeof rcpu === 'string' && rcpu !== '') why = 'the build record says ' + rcpu + ' has no Maglev, but V8 builds Maglev for ' + rcpu + ' (lib/build.js: ' + JSON.stringify(build) + ')';
+              else why = 'the build record says has_maglev false but names no v8_current_cpu, and only "x86" may lack Maglev (lib/build.js: ' + JSON.stringify(build) + ')';
+            }
+            else if (archInfo.ia32) { ok = true; maglevWhy = 'the browser reports an ia32 process ' + cpu; }
+            else why = '%IsMaglevEnabled() is false, there is no build record, and the browser does not report an ia32 process: CPU ' + cpu + ' (only ia32 has no Maglev; ARM32 has it)';
+            if (ok) {
+              plan.mode = 'na-ia32';
+              naWhy = 'V8 builds no Maglev on ia32 (%IsMaglevEnabled() is false; ' + maglevWhy + '): this configuration applies on ARM32; core.js runs with default tiering, answers compared, tier reported only';
+              Kit.na('tier proof (Maglev)', naWhy);
+            } else {
+              plan.want = 'maglev'; plan.mode = 'no-maglev';    // Maglev missing where it must exist: the tier checks below fail as well
+              Kit.check('Maglev is available in this V8 (only ia32 may lack it)', '%IsMaglevEnabled() true', why, false);
+            }
+          }
+        } else { plan.mode = 'bad-tier'; Kit.check('configuration has a tier to prove', 'interpreter|sparkplug|maglev|turbofan', String(cfg.tier), false); }
+      }
+    }
+
+    // ---- run core.js (13 functions x 4 repetitions); it runs synchronously inside the script's load ----
+    const t0 = performance.now();
+    await need('lib/js-jit-core.js', 120000);
+    const ms = Math.round(performance.now() - t0);
+    document.getElementById('raw').textContent = 'core.js output (print), ' + ms + ' ms, configuration ' + Kit.config + ', tier mode ' + plan.mode + ':\n' + lines.join('\n');
+
+    // run_jit.py: kv = [l.strip().split('=', 1) for l in lines if '=' in l]; values = the keys not starting with 'tier.'
+    const vals = {}, reached = {};
+    for (const l of lines) {
+      const t = l.trim(), i = t.indexOf('=');
+      if (i < 0) continue;
+      const k = t.slice(0, i), v = t.slice(i + 1);
+      if (k.startsWith('tier.')) reached[k.slice(5)] = v; else vals[k] = v;
+    }
+    Kit.check('core.js ran to completion (its last line)', 'done=core', 'done=' + vals.done, vals.done === 'core');
+    for (const k of KEYS) {
+      let ref = k === SIN ? NODE[k] : E[k];          // sin: V8's own fdlibm result on the host (node x64); the rest: host python only
+      if (k === 'overflow') ref = Kit.want(ref, ref === undefined ? undefined : String(parseInt(ref, 10) + 1));   // armed: planted wrong expectation (+1)
+      const got = vals[k];
+      // a missing reference (a key absent from the data) must fail: undefined === undefined would otherwise pass vacuously
+      Kit.check('answer ' + k + (k === SIN ? ' (host Node x64)' : ' (host python)'),
+        ref === undefined ? '(no reference value in data/js-jit-expected.js)' : ref, got === undefined ? '(missing)' : got, ref !== undefined && got === ref);
+    }
+    const extra = Object.keys(vals).filter(k => k !== 'done' && !KEYS.includes(k));
+    Kit.check('core.js printed no unexpected keys', '[]', JSON.stringify(extra), extra.length === 0);
+
+    // ---- the tier proof ----
+    let tier, tierProof;
+    if (plan.want) {
+      let n = 0;
+      for (const k of KEYS) {
+        const s = reached[k];
+        const name = s === undefined ? '(missing)' : s.replace(/\(.*$/, '');      // 'turbofan(41)' -> 'turbofan'; '+maybe-deopted' stays and fails
+        if (Kit.check('tier.' + k, plan.want, s === undefined ? '(missing)' : s, name === plan.want)) n++;
+      }
+      let allOk = n === KEYS.length, liteNote = '', liteBad = false;
+      if (plan.want === 'interpreter') {
+        // jitless vs ignition: kLiteMode (1 << 12, v8/src/runtime/runtime.h OptimizationStatus) is set in the status by --jitless only
+        const wantLite = FLAGS.includes('--jitless');
+        const wrong = [];
+        for (const k of KEYS) {
+          const m = /\((\d+)\)$/.exec(reached[k] === undefined ? '' : reached[k]);
+          const lite = m ? (Number(m[1]) & 4096) !== 0 : null;
+          if (lite !== wantLite) wrong.push(k + ':' + (reached[k] === undefined ? '(missing)' : reached[k]));
+        }
+        const liteOk = Kit.check('lite-mode bit (4096) in every tier status: set only by --jitless', (wantLite ? 'set' : 'clear') + ' in ' + KEYS.length + '/' + KEYS.length,
+          wrong.length ? 'wrong in ' + wrong.length + ': ' + wrong.join(' ') : (wantLite ? 'set' : 'clear') + ' in ' + KEYS.length + '/' + KEYS.length, wrong.length === 0);
+        allOk = allOk && liteOk; liteBad = !liteOk; liteNote = ' (lite-mode ' + (wantLite ? 'set' : 'clear') + ')';
+      }
+      tierProof = allOk ? 'proven' : 'NOT PROVEN';
+      tier = allOk ? plan.want + ' ' + n + '/' + KEYS.length + liteNote : 'NOT PROVEN: ' + plan.want + ' ' + n + '/' + KEYS.length + (liteBad ? ' (lite-mode bit wrong)' : '');
+    } else if (plan.mode === 'na-ia32') {
+      tierProof = 'n/a';
+      tier = 'n/a (no Maglev on ia32); reached ' + [...new Set(Object.values(reached).map(s => s.replace(/\(.*$/, '')))].sort().join(',');
+      Kit.info('tiers reached (default tiering, not asserted)', JSON.stringify(reached));
+    } else if (plan.mode === 'natives-rejected') { tierProof = 'NOT PROVEN'; tier = 'NOT PROVEN: natives expected but rejected (--allow-natives-syntax did not take effect)'; }
+    else if (plan.mode === 'status-not-loaded') { tierProof = 'NOT PROVEN'; tier = 'NOT PROVEN: lib/js-jit-status.js could not be loaded'; }
+    else if (plan.mode === 'no-tier') { tierProof = 'n/a'; tier = 'n/a (this configuration selects no JS tier)'; }
+    else if (plan.mode === 'bad-tier') { tierProof = 'NOT PROVEN'; tier = 'NOT PROVEN: unknown tier "' + cfg.tier + '" in lib/configs.js'; }
+    else { tierProof = 'n/a'; tier = 'n/a (natives off)'; }
+
+    await Kit.done({ tier, tierProof, tierMode: plan.mode, tierWanted: plan.want, tierNa: naWhy, maglevNaBy: maglevWhy, switches: probe, flagsExpected,
+      arch: archInfo, build, wasmType, coreMs: ms, reached, values: vals, output: lines });
+  } catch (e) {
+    Kit.check('page error', 'none', String(e && (e.stack || e)), false);
+    await Kit.done({ tier: 'page error', arch: null });
+  }
+})();
+</script>

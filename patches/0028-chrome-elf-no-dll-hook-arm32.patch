@@ -1,0 +1,48 @@
+Venetium 0028 - chrome_elf does not install its third-party-DLL blocking hook on Windows ARM32.
+
+BATCH-ARM-FIX-1, his decision (2026-10-04, Q1 "skip the hook on ARM32"). The first device trip of the -rtdiv build (Surface 2,
+Windows 10 build 15035 ARM32): 11 of 11 launches crashed ~2 s after start, 22 Crashpad dumps, all ACCESS_VIOLATION reading 0x4 in
+chrome_elf.dll third_party_dlls::LogLoadAttempt (third_party_dlls/logs.cc:240), called from the hook (NewNtMapViewOfSection64) while
+the OS loader maps chrome.dll's imports. The faulting thread is a Windows 10 parallel-loader worker (TEB SameTebFlags 0x2000
+LoaderWorker) whose TEB ThreadLocalStoragePointer is NULL; the thread-safe-static guard of GetAllowedLog() reads implicit TLS there.
+Microsoft's own ARM cl emits the same TLS sequence, so this is the platform's early-load context, not a toolchain defect
+(TOOLCHAIN-ISSUES.md N10). The hook was only active once HKCU\Software\Venetium\BLBeacon\state became 1, which happens the first time
+a run reaches PostBrowserStart - the earlier build never got that far - and venetium.exe's SignalChromeElf() re-arms the beacon before
+chrome.dll loads, so its two-failure safety never tripped.
+1 file:
+- chrome/chrome_elf/chrome_elf_main.cc: DllMain's "if (third_party_dlls::LeaveSetupBeacon()) third_party_dlls::Init();" is under
+  #if !defined(_M_ARM) (clang-cl and cl define _M_ARM for 32-bit ARM only). On ARM32 the DllMain half of the beacon (LeaveSetupBeacon)
+  and the hook are skipped - ResetBeacon and the browser's BrowserBlocklistBeaconSetup still write the BLBeacon key, harmlessly;
+  the rest of chrome_elf is unchanged. chrome.dll already copes with an uninitialised hook (the beacon-off state): DrainLog,
+  RegisterLogNotification and IsThirdPartyInitialized see no log mutex and return empty / false.
+Checked (STRUCTURAL): chrome_elf_main.obj (ARM) no longer references LeaveSetupBeacon or third_party_dlls::Init; relinked
+chrome_elf.dll is ARMNT with ASLR/DEP/CFG, the same 27 exports and version strings, and 6 fewer kernel32 imports (CreateMutexW,
+K32GetMappedFileNameW, ReadProcessMemory, UnmapViewOfFile, VirtualProtectEx, WriteProcessMemory - the hook's own); chrome.dll and
+venetium.exe relink byte-identical. Device (his run, equivalent state): with BLBeacon state set to 0 the same build passed the old
+crash point and showed its window - the next failure there is a different one.
+
+diff --git a/chrome/chrome_elf/chrome_elf_main.cc b/chrome/chrome_elf/chrome_elf_main.cc
+index 531723b..df1e4de 100644
+--- a/chrome/chrome_elf/chrome_elf_main.cc
++++ b/chrome/chrome_elf/chrome_elf_main.cc
+@@ -78,10 +78,20 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
+         // Disable third party extension points.
+         elf_security::EarlyBrowserSecurity();
+ 
++#if !defined(_M_ARM)
+         // Initialize the blocking of third-party DLLs if the initialization of
+         // the safety beacon succeeds.
+         if (third_party_dlls::LeaveSetupBeacon())
+           third_party_dlls::Init();
++#else
++        // Venetium 0028: no third-party DLL blocking hook on Windows ARM32.
++        // The hook (NtMapViewOfSection) also runs on the OS loader's parallel
++        // worker threads, which on Windows 10 ARM32 (build 15035) have no
++        // implicit TLS (TEB ThreadLocalStoragePointer is null), and its
++        // thread-safe statics read TLS there and fault. Without the hook the
++        // browser runs as it does when the setup beacon is off: the log
++        // exports see no mutex and return empty.
++#endif
+       } __except (elf_crash::GenerateCrashDump(GetExceptionInformation())) {
+       }
+     } else if (!install_static::IsCrashpadHandlerProcess()) {

@@ -1,0 +1,4 @@
+# X86-1b §2 (D15): Chromium 150.0.7871.226's real revision and commit time for a non-official release build; selected by
+# use_dummy_lastchange = false (venetium.gn). Both files REPLACE the .222 tarball's. path<TAB>sha256<TAB>source<TAB>pin
+build/util/LASTCHANGE	3b6ef04b630094eca8aadd8ba6b843affee774d03d9b8f60d5b9996a481776df	chromium.googlesource.com refs/tags/150.0.7871.226 (confirmed: GitHub chromium/chromium); format of build/util/lastchange.py; replaces the .222 tarball's file (a5ed5208443d8df5…, moved to F:\cr\x86-1b\tree-moved)	a432ac4385eeea1fffb88bb8785f778918a1a322 refs/branch-heads/7871@{#4266}
+build/util/LASTCHANGE.committime	699d2cd1aaaedb4af50a826e8b945633df9581f58636cf45e3f3579f1588f82c	commit time of a432ac4385eeea1fffb88bb8785f778918a1a322 (2026-08-06T15:01:59Z, UTC epoch seconds); replaces the .222 tarball's (1785879766)	1786028519

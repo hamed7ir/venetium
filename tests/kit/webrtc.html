@@ -1,0 +1,402 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Venetium kit — webrtc</title>
+<script src="lib/configs.js"></script>
+<script src="lib/kit.js"></script>
+<body>
+<div id="media" style="display:flex;gap:12px;margin:12px">
+  <div>local camera (getUserMedia)<br><video id="local" muted playsinline autoplay width="320" height="240" style="background:#222"></video></div>
+  <div>remote side of the loopback<br><video id="remote" playsinline width="320" height="240" style="background:#222"></video></div>
+  <div>canvas copy of the local frame<br><canvas id="cl" width="320" height="240" style="background:#222"></canvas></div>
+  <div>canvas copy of the remote frame<br><canvas id="cr" width="320" height="240" style="background:#222"></canvas></div>
+</div>
+<pre id="timeline" style="font:12px Consolas,monospace;margin:12px"></pre>
+<script>
+// getUserMedia (audio + video) and an RTCPeerConnection loopback inside this page (two peer connections, no network server, no
+// STUN) for 10 s, read through getStats(). Audio and video packets must flow the whole time; audio is requested with echo
+// cancellation, noise suppression and automatic gain control, which on Windows builds WebRTC's audio processing module with
+// AGC2 adaptive-digital gain (media/webrtc/helpers.cc ConfigAutomaticGainControl) — the voice-activity detector there is the RNN
+// whose fully-connected layer is third_party/webrtc/modules/audio_processing/agc2/rnn_vad/rnn_fc.cc (Venetium 0013).
+// This page EXERCISES rnn_fc (AGC2's RNN VAD runs), it does NOT VERIFY it: no getStats field exposes the VAD's output and no check
+// here depends on it, so a wrong activation function would still pass every check; and the RNN layers are skipped for digital silence.
+// The runner launches this page's browser with --use-fake-device-for-media-stream --use-fake-ui-for-media-stream (a synthetic
+// camera pattern and a periodic beep, no permission prompt). On the device the real camera and microphone are used and the
+// browser shows a permission prompt: allow it within 45 s. Nothing here needs a network: ICE gathers host candidates only.
+// The remote element plays at volume 0.1 (not 1): WebRTC applies the playout volume before it measures the inbound level, so a muted
+// element reads level 0, and a full-volume one would play the microphone into the speakers on the device. If the autoplay policy
+// refuses unmuted playback (neither the device launchers nor the runner pass --autoplay-policy: the browser's default policy applies on
+// both, and nobody clicks before the page runs), the element is muted instead (a muted <video> may always autoplay) and the one check
+// that needs an audible element is reported n/a; every other check, the audio flow included (it is read from getStats()), still runs.
+// Without any element playing the remote audio, WebRTC never pulls samples, so totalSamplesReceived stays 0 (observed): that check is real.
+(async () => {
+  const T0 = performance.now();
+  const BUDGET_MS = 75000;            // index.html gives this page 90 s in all; the runner alone gives it 180 s
+  const SECONDS = 10, WINDOW_S = 2;   // the flow window and the stall-detection window inside it
+  const el = id => document.getElementById(id);
+  const sleep = Kit.sleep;
+  const left = () => BUDGET_MS - (performance.now() - T0);
+  const errs = e => (e && e.name ? e.name + ': ' : '') + ((e && e.message) || e);
+  const timeout = (p, ms, what) => {
+    let t; const to = new Promise((_, rej) => { t = setTimeout(() => rej(new Error(what + ': no answer within ' + Math.round(ms / 1000) + ' s')), ms); });
+    return Promise.race([p, to]).finally(() => clearTimeout(t));
+  };
+  async function waitFor(fn, ms, step) {
+    const t = performance.now();
+    for (;;) {
+      let v = false; try { v = await fn(); } catch (e) { v = false; }
+      if (v) return true;
+      if (performance.now() - t >= ms || left() < 1500) return false;
+      await sleep(step || 100);
+    }
+  }
+  // video frame callbacks (requestVideoFrameCallback) stop in a hidden or fully covered window: a frame-count failure then is the window, not the
+  // browser. The rows that count frames say what the page's visibility was, so the person reading a FAIL can tell.
+  const vis = () => { try { return 'page ' + document.visibilityState + (document.hasFocus() ? ', focused' : ', not focused') + (window.parent !== window ? ', in a frame' : ''); } catch (e) { return 'page visibility unknown'; } };
+  const round = (v, d) => (typeof v === 'number' && isFinite(v)) ? Math.round(v * Math.pow(10, d || 0)) / Math.pow(10, d || 0) : v;
+  // energies and levels are tiny for a quiet microphone: print them in exponent form so a small positive value never shows as 0
+  const ex = v => (typeof v === 'number' && isFinite(v)) ? v.toExponential(3) : String(v);
+  const get = (o, path) => path.split('.').reduce((x, k) => (x == null ? undefined : x[k]), o);
+  const pickKeys = (o, keys) => { const r = {}; if (o) for (const k of keys) if (k in o) r[k] = o[k]; return r; };
+
+  let stream = null, pcA = null, pcB = null, at = null, vt = null;
+  const extra = { webrtc: {} };
+  // getUserMedia with a time limit. An answer that arrives AFTER the limit (or after the page has finished) is not wanted, but the
+  // browser still opens the camera and the microphone for it: its tracks are stopped at once, and that is recorded (a check while the
+  // page is still running), otherwise those tracks stay live until the page unloads.
+  let pageEnded = false;
+  const lateGum = [];                  // answers that came after their limit: { what, afterMs, tracks, ended }
+  const waitingLate = new Set();       // timed-out calls that have not answered yet
+  function gum(constraints, ms, what) {
+    const t0 = performance.now();
+    return new Promise((resolve, reject) => {
+      let timedOut = false;
+      const call = navigator.mediaDevices.getUserMedia(constraints);
+      const timer = setTimeout(() => {
+        timedOut = true; waitingLate.add(call);
+        reject(new Error(what + ': no answer within ' + Math.round(ms / 1000) + ' s'));
+      }, ms);
+      call.then(s => {
+        clearTimeout(timer); waitingLate.delete(call);
+        if (!timedOut && !pageEnded) { resolve(s); return; }
+        const tracks = s.getTracks();
+        for (const t of tracks) { try { t.stop(); } catch (e) {} }
+        const rec = { what, afterMs: Math.round(performance.now() - t0), tracks: tracks.length, ended: tracks.every(t => t.readyState === 'ended') };
+        lateGum.push(rec);
+        if (!pageEnded) Kit.check('getUserMedia that answered after its time limit has its tracks stopped (' + what + ')', 'every track of the late stream ended',
+          rec.tracks + ' track(s), ' + (rec.ended ? 'all ended' : 'still ' + tracks.filter(t => t.readyState !== 'ended').map(t => t.kind + ' ' + t.readyState).join(', ')) + ', answered ' + rec.afterMs + ' ms after the call', rec.tracks > 0 && rec.ended);
+        if (!timedOut) reject(new Error(what + ': answered after the page had finished'));
+      }, e => { clearTimeout(timer); waitingLate.delete(call); if (!timedOut) reject(e); });
+    });
+  }
+  function cleanup() {
+    for (const pc of [pcA, pcB]) { try { if (pc) pc.close(); } catch (e) {} }
+    if (stream) for (const t of stream.getTracks()) { try { t.stop(); } catch (e) {} }
+    try { el('local').srcObject = null; el('remote').srcObject = null; } catch (e) {}
+  }
+  // a hard stop: whatever hangs (a prompt nobody answers, a getStats that never returns) still ends in a verdict
+  const hard = setTimeout(() => {
+    Kit.check('page finished within its time budget', Math.round(BUDGET_MS / 1000) + ' s', 'still running after ' + Math.round((performance.now() - T0) / 1000) + ' s', false);
+    pageEnded = true; cleanup(); Kit.done(extra);
+  }, BUDGET_MS + 5000);
+
+  async function snap(pc) {
+    const rep = await timeout(pc.getStats(), 8000, 'getStats');
+    const o = { codec: {}, pairs: [], cand: {} };
+    rep.forEach(s => {
+      const k = s.kind || s.mediaType;
+      if (s.type === 'inbound-rtp') o['in_' + k] = s;
+      else if (s.type === 'outbound-rtp') o['out_' + k] = s;
+      else if (s.type === 'media-source') o['src_' + k] = s;
+      else if (s.type === 'remote-inbound-rtp') o['rin_' + k] = s;
+      else if (s.type === 'codec') o.codec[s.id] = s;
+      else if (s.type === 'candidate-pair') o.pairs.push(s);
+      else if (s.type === 'local-candidate' || s.type === 'remote-candidate') o.cand[s.id] = s;
+      else if (s.type === 'transport') o.transport = s;
+    });
+    return o;
+  }
+
+  try {
+    // ---- the APIs
+    const haveApi = typeof RTCPeerConnection === 'function' && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+    Kit.check('WebRTC and getUserMedia exist', 'RTCPeerConnection + mediaDevices.getUserMedia', 'RTCPeerConnection ' + typeof RTCPeerConnection +
+      ', mediaDevices ' + typeof navigator.mediaDevices + ', secure context ' + window.isSecureContext, haveApi);
+    if (!haveApi) throw new Error('stop: no WebRTC API');
+
+    // ---- getUserMedia with the audio-processing constraints
+    const REQ_AUDIO = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+    const REQ_VIDEO = { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } };
+    Kit.info('constraints requested', { audio: REQ_AUDIO, video: REQ_VIDEO });
+    Kit.info('supported constraints (audio processing)', pickKeys(navigator.mediaDevices.getSupportedConstraints(),
+      ['echoCancellation', 'noiseSuppression', 'autoGainControl', 'voiceIsolation', 'channelCount', 'sampleRate', 'sampleSize', 'latency', 'suppressLocalAudioPlayback']));
+    // inside index.html's iframe the page may use the camera and microphone only if the iframe's allow="..." lists them for every origin
+    // (a file:// frame has an opaque origin, so a plain allow="camera; microphone" never matches it): say what this document is allowed
+    try {
+      const pp = document.permissionsPolicy || document.featurePolicy;
+      Kit.info('permissions policy allows in this document', pp ? { camera: pp.allowsFeature('camera'), microphone: pp.allowsFeature('microphone'), inFrame: window.parent !== window } : '(permissionsPolicy not available)');
+    } catch (e) { Kit.info('permissions policy', 'cannot read: ' + errs(e)); }
+    let gumErr = null, gumMs = 0;
+    const g0 = performance.now();
+    try { stream = await gum({ audio: REQ_AUDIO, video: REQ_VIDEO }, 45000, 'getUserMedia (on the device: allow the permission prompt)'); }
+    catch (e) { gumErr = e; }
+    gumMs = Math.round(performance.now() - g0);
+    // the planted check of an armed run
+    const wantTracks = Kit.want('1 audio + 1 video', '2 audio + 0 video');
+    const gotTracks = stream ? stream.getAudioTracks().length + ' audio + ' + stream.getVideoTracks().length + ' video' : 'getUserMedia failed: ' + errs(gumErr);
+    Kit.check('getUserMedia({audio, video}) returns the tracks', wantTracks, gotTracks, gotTracks === wantTracks);
+    if (!stream) {
+      // which half fails, for the report
+      for (const [n, c] of [['audio only', { audio: REQ_AUDIO }], ['video only', { video: REQ_VIDEO }]]) {
+        try { const s = await gum(c, 15000, 'getUserMedia ' + n); Kit.info('getUserMedia ' + n, 'works'); s.getTracks().forEach(t => t.stop()); }
+        catch (e) { Kit.info('getUserMedia ' + n, 'fails: ' + errs(e)); }
+      }
+      throw new Error('stop: no stream');
+    }
+    Kit.info('getUserMedia took', gumMs + ' ms (includes a permission prompt on the device)');
+    at = stream.getAudioTracks()[0]; vt = stream.getVideoTracks()[0];
+
+    // devices, now with labels
+    try {
+      const devs = await timeout(navigator.mediaDevices.enumerateDevices(), 8000, 'enumerateDevices');
+      const n = k => devs.filter(d => d.kind === k).length;
+      Kit.info('devices', devs.map(d => d.kind + ': ' + (d.label || '(no label)')));
+      Kit.check('at least one microphone and one camera enumerated', '>=1 audioinput and >=1 videoinput', n('audioinput') + ' audioinput, ' + n('videoinput') + ' videoinput', n('audioinput') >= 1 && n('videoinput') >= 1);
+    } catch (e) { Kit.check('enumerateDevices', 'works', errs(e), false); }
+
+    // ---- what was actually applied
+    const as = at.getSettings(), vs = vt.getSettings();
+    Kit.info('audio track', { label: at.label, readyState: at.readyState, enabled: at.enabled, muted: at.muted, contentHint: at.contentHint });
+    Kit.info('audio settings applied (getSettings)', as);
+    Kit.info('audio constraints held by the track (getConstraints)', at.getConstraints());
+    try { Kit.info('audio capabilities', at.getCapabilities()); } catch (e) { Kit.info('audio capabilities', 'not available: ' + errs(e)); }
+    Kit.info('video settings applied (getSettings)', vs);
+    Kit.check('audio and video tracks are live', 'audio live, video live', 'audio ' + at.readyState + ', video ' + vt.readyState, at.readyState === 'live' && vt.readyState === 'live');
+    for (const k of ['echoCancellation', 'noiseSuppression', 'autoGainControl'])
+      Kit.check('audio setting applied: ' + k, true, as[k], as[k] === true);
+    extra.webrtc.requested = { audio: REQ_AUDIO, video: REQ_VIDEO };
+    extra.webrtc.audioSettings = as; extra.webrtc.videoSettings = vs;
+    Kit.info('rnn_fc.cc (Venetium 0013): exercised, not verified',
+      "exercises rnn_fc (AGC2's RNN VAD runs), does not verify it. autoGainControl:true makes WebRTC build AGC2 adaptive-digital gain, whose RNN voice-activity detector " +
+      "runs rnn_fc on every 10 ms frame that is not digital silence. No getStats field exposes the VAD output and no check on this page depends on it: " +
+      "a wrong activation function in rnn_fc would still pass every check here. What the checks do prove: the setting is applied, the capture path keeps producing, the signal arrives.");
+    extra.webrtc.rnnFc = 'exercised, not verified';
+
+    // ---- local preview: the camera really produces frames
+    let localFrames = 0, remoteFrames = 0;
+    const L = el('local'), R = el('remote');
+    const countFrames = (v, inc) => { if (!v.requestVideoFrameCallback) return false; const tick = () => { inc(); try { v.requestVideoFrameCallback(tick); } catch (e) {} }; v.requestVideoFrameCallback(tick); return true; };
+    const haveRvfc = countFrames(L, () => { localFrames++; }) && countFrames(R, () => { remoteFrames++; });
+    L.srcObject = new MediaStream([vt]); L.play().catch(() => {});
+    const sized = await waitFor(() => L.videoWidth > 0, 10000, 100);
+    const lf0 = localFrames; await sleep(2000);
+    if (haveRvfc) Kit.check('local camera preview shows frames', '>=3 frames in 2 s', (localFrames - lf0) + ' frames, ' + L.videoWidth + 'x' + L.videoHeight + ', ' + vis(), sized && localFrames - lf0 >= 3);
+    else Kit.check('local camera preview has a size', '>0', L.videoWidth + 'x' + L.videoHeight, sized);
+
+    // ---- loopback: two peer connections in this page, candidates handed over directly
+    const rtcCfg = { iceServers: [] };
+    pcA = new RTCPeerConnection(rtcCfg); pcB = new RTCPeerConnection(rtcCfg);
+    const states = [];
+    for (const [n, pc] of [['A', pcA], ['B', pcB]]) {
+      for (const [ev, prop] of [['iceconnectionstatechange', 'iceConnectionState'], ['connectionstatechange', 'connectionState'],
+                                ['signalingstatechange', 'signalingState'], ['icegatheringstatechange', 'iceGatheringState']])
+        pc.addEventListener(ev, () => states.push(Math.round(performance.now() - T0) + ' ms ' + n + ' ' + prop + ' = ' + pc[prop]));
+    }
+    const link = (src, dst) => {
+      const o = { ready: false, q: [], n: 0, err: [] };
+      const add = c => dst.addIceCandidate(c).catch(e => o.err.push(errs(e)));
+      src.addEventListener('icecandidate', e => { if (!e.candidate) return; o.n++; if (o.ready) add(e.candidate); else o.q.push(e.candidate); });
+      o.flush = () => { o.ready = true; for (const c of o.q.splice(0)) add(c); };
+      return o;
+    };
+    const linkAB = link(pcA, pcB), linkBA = link(pcB, pcA);
+    const remote = new MediaStream(), remoteKinds = [];
+    let remoteMode = 'unmuted, volume 0.1';
+    R.volume = 0.1;
+    pcB.addEventListener('track', e => {
+      if (!remoteKinds.includes(e.track.kind)) remoteKinds.push(e.track.kind);
+      remote.addTrack(e.track);
+      if (R.srcObject !== remote) R.srcObject = remote;     // (assigning it again would restart the element and abort a pending play())
+      // only the autoplay policy's refusal (NotAllowedError) turns this into a muted element
+      R.play().catch(err => { if (err.name === 'NotAllowedError' && remoteMode.startsWith('unmuted')) { remoteMode = 'muted (unmuted playback refused: ' + err.name + ')'; R.muted = true; R.play().catch(() => {}); } });
+    });
+    pcA.addTrack(at, stream); pcA.addTrack(vt, stream);
+    const n0 = performance.now();
+    await timeout((async () => {
+      const offer = await pcA.createOffer(); await pcA.setLocalDescription(offer);
+      await pcB.setRemoteDescription(pcA.localDescription); linkAB.flush();
+      const answer = await pcB.createAnswer(); await pcB.setLocalDescription(answer);
+      await pcA.setRemoteDescription(pcB.localDescription); linkBA.flush();
+    })(), 15000, 'offer/answer');
+    Kit.info('offer/answer took', Math.round(performance.now() - n0) + ' ms');
+    const connected = await waitFor(() => pcA.connectionState === 'connected' && pcB.connectionState === 'connected', Math.min(20000, left() - 3000), 100);
+    Kit.info('peer connection state timeline', states);
+    Kit.info('ICE candidates handed over (A->B, B->A) and errors', { ab: linkAB.n, ba: linkBA.n, errors: linkAB.err.concat(linkBA.err) });
+    Kit.check('loopback peer connections reach "connected"', 'A connected, B connected, signaling stable',
+      'A ' + pcA.connectionState + '/' + pcA.iceConnectionState + ', B ' + pcB.connectionState + '/' + pcB.iceConnectionState + ', ' + pcA.signalingState + '/' + pcB.signalingState,
+      connected && pcA.signalingState === 'stable' && pcB.signalingState === 'stable');
+    Kit.check('peer B received the audio and the video track', 'audio,video', remoteKinds.slice().sort().join(','), remoteKinds.slice().sort().join(',') === 'audio,video');
+    if (!connected) {
+      try {
+        const s = await snap(pcA);
+        Kit.info('why not connected: A candidate pairs and candidates', { pairs: s.pairs.map(p => pickKeys(p, ['state', 'nominated', 'bytesSent', 'bytesReceived', 'requestsSent', 'responsesReceived'])),
+          cands: Object.values(s.cand).map(c => pickKeys(c, ['type', 'candidateType', 'protocol', 'address', 'port'])) });
+      } catch (e) { Kit.info('why not connected', 'getStats failed: ' + errs(e)); }
+      throw new Error('stop: not connected');
+    }
+
+    // ---- first media, then 10 s of flow
+    const flowing = async () => { const [a, b] = await Promise.all([snap(pcA), snap(pcB)]); return (get(b, 'in_audio.packetsReceived') || 0) > 0 && (get(b, 'in_video.framesDecoded') || 0) > 0; };
+    const f0 = performance.now();
+    const first = await waitFor(flowing, Math.min(15000, left() - SECONDS * 1000 - 4000), 250);
+    Kit.check('first audio packet and first decoded video frame arrive', 'within 15 s of "connected"', first ? Math.round(performance.now() - f0) + ' ms after "connected"' : 'nothing within 15 s', first);
+    if (!first) throw new Error('stop: no media');
+
+    const samples = [];
+    const s0 = performance.now(), rf0 = remoteFrames;
+    for (let i = 0; i <= SECONDS; i++) {
+      const wait = s0 + i * 1000 - performance.now(); if (wait > 0) await sleep(wait);
+      const [A, B] = await Promise.all([snap(pcA), snap(pcB)]);
+      samples.push({ t: Math.round(performance.now() - s0), A, B, remoteFrames, localFrames });
+      if (left() < 3000) throw new Error('time budget used up during the flow window');
+    }
+    const vals = path => samples.map(s => get(s, path));
+    function grows(path, label) {
+      const v = vals(path), ws = [];
+      for (let i = 0; i + WINDOW_S < v.length; i += WINDOW_S) ws.push(v[i + WINDOW_S] - v[i]);
+      const ok = ws.length === SECONDS / WINDOW_S && ws.every(d => Number.isFinite(d) && d > 0);
+      return Kit.check(label, 'increases in every ' + WINDOW_S + ' s window of the ' + SECONDS + ' s', round(v[0], 3) + ' -> ' + round(v[v.length - 1], 3) + '; per window ' +
+        ws.map(d => (Number.isFinite(d) ? (d >= 0 ? '+' : '') + round(d, 3) : String(d))).join(' '), ok);
+    }
+    // playout (the remote element pulling decoded audio) can start later than the first packet: windows before the first
+    // growing one are start-up (at most MAX_START_W windows, reported); from there on every window must grow, at least 2 of them
+    const MAX_START_W = 3;
+    function growsAfterStart(path, label) {
+      const v = vals(path), ws = [];
+      for (let i = 0; i + WINDOW_S < v.length; i += WINDOW_S) ws.push(v[i + WINDOW_S] - v[i]);
+      const start = ws.findIndex(d => Number.isFinite(d) && d > 0);
+      const after = start < 0 ? [] : ws.slice(start);
+      const ok = ws.length === SECONDS / WINDOW_S && start >= 0 && start <= MAX_START_W && after.length >= 2 && after.every(d => Number.isFinite(d) && d > 0);
+      return Kit.check(label, 'starts within ' + (MAX_START_W * WINDOW_S) + ' s, then increases in every ' + WINDOW_S + ' s window (at least 2)',
+        round(v[0], 3) + ' -> ' + round(v[v.length - 1], 3) + '; start-up ' + (start < 0 ? 'never' : (start * WINDOW_S) + ' s') + '; per window ' +
+        ws.map(d => (Number.isFinite(d) ? (d >= 0 ? '+' : '') + round(d, 3) : String(d))).join(' '), ok);
+    }
+    // the receiving side (peer B): audio and video packets flow, audio is played out, video is decoded
+    grows('B.in_audio.packetsReceived', 'inbound audio: packetsReceived');
+    growsAfterStart('B.in_audio.totalSamplesReceived', 'inbound audio: totalSamplesReceived (playout pulls decoded audio)');
+    grows('B.in_video.packetsReceived', 'inbound video: packetsReceived');
+    grows('B.in_video.framesDecoded', 'inbound video: framesDecoded');
+    // the sending side (peer A): the capture + audio processing pipeline keeps producing
+    grows('A.src_audio.totalSamplesDuration', 'audio source (capture through audio processing): totalSamplesDuration');
+    grows('A.out_audio.packetsSent', 'outbound audio: packetsSent');
+    grows('A.out_video.framesEncoded', 'outbound video: framesEncoded');
+    const last = samples[samples.length - 1];
+    const fw = get(last, 'B.in_video.frameWidth'), fh = get(last, 'B.in_video.frameHeight');
+    Kit.check('inbound video frame size', '> 0 x > 0', fw + 'x' + fh, fw > 0 && fh > 0);
+    if (haveRvfc) Kit.check('remote <video> element presented frames', '>= 10 frames in ' + SECONDS + ' s', (remoteFrames - rf0) + ' frames, ' + R.videoWidth + 'x' + R.videoHeight + ', ' + vis(), remoteFrames - rf0 >= 10 && R.videoWidth > 0);
+    else Kit.check('remote <video> element has a size', '> 0', R.videoWidth + 'x' + R.videoHeight, R.videoWidth > 0);
+    // the decoded picture is the camera's picture: mean colour of a 32x24 copy of the local and the remote frame (and visible copies)
+    const grab = (v, cv) => {
+      try {
+        const c = document.createElement('canvas'); c.width = 32; c.height = 24; const g = c.getContext('2d', { willReadFrequently: true }); g.drawImage(v, 0, 0, 32, 24);
+        const d = g.getImageData(0, 0, 32, 24).data; let r = 0, gr = 0, b = 0, lo = 255, hi = 0;
+        for (let i = 0; i < d.length; i += 4) { r += d[i]; gr += d[i + 1]; b += d[i + 2]; const y = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]; lo = Math.min(lo, y); hi = Math.max(hi, y); }
+        const n = d.length / 4;
+        try { cv.getContext('2d').drawImage(v, 0, 0, cv.width, cv.height); } catch (e) {}
+        return { rgb: [r / n, gr / n, b / n].map(Math.round), lumaRange: Math.round(hi - lo) };
+      } catch (e) { return { error: errs(e) }; }
+    };
+    // both elements must hold a frame (readyState >= HAVE_CURRENT_DATA): a video element with no frame draws nothing, reads as black, and two
+    // such elements would "match" without any picture having been compared. (A real frame that is black, a covered lens, is a real picture:
+    // the remote one must then be as black as the local one.)
+    const COLOUR = 'remote video frame has the colours of the local camera frame';
+    const WANT_COLOUR = 'both <video> elements have a frame (readyState >= 2) and the mean R,G,B of the two frames are within 40 of each other';
+    if (!(L.readyState >= 2 && R.readyState >= 2)) {
+      Kit.check(COLOUR, WANT_COLOUR, 'no frame to compare: local readyState ' + L.readyState + ', remote readyState ' + R.readyState, false);
+    } else {
+      const lf = grab(L, el('cl')), rf = grab(R, el('cr'));
+      const dd = lf.rgb && rf.rgb ? lf.rgb.map((x, i) => Math.abs(x - rf.rgb[i])) : null;
+      Kit.check(COLOUR, WANT_COLOUR, lf.error || rf.error ? (lf.error || rf.error) : 'local ' + lf.rgb + ' remote ' + rf.rgb + ' diff ' + dd + ' (readyState local ' + L.readyState + ', remote ' + R.readyState + ')', !!dd && dd.every(x => x <= 40));
+      Kit.info('luma range inside the frame (local / remote)', lf.lumaRange + ' / ' + rf.lumaRange);
+    }
+    const lossA = get(last, 'B.in_audio.packetsLost'), recvA = get(last, 'B.in_audio.packetsReceived');
+    Kit.info('audio packets lost / received', lossA + ' / ' + recvA);
+    Kit.info('video packets lost / received, frames dropped', get(last, 'B.in_video.packetsLost') + ' / ' + get(last, 'B.in_video.packetsReceived') + ', ' + get(last, 'B.in_video.framesDropped'));
+
+    // audio levels: what came out of the audio processing, what arrived
+    const lvl = (path) => Math.max.apply(null, vals(path).filter(x => typeof x === 'number'));
+    const srcLevel = lvl('A.src_audio.audioLevel'), inLevel = lvl('B.in_audio.audioLevel');
+    const srcEnergy = get(last, 'A.src_audio.totalAudioEnergy'), inEnergy = get(last, 'B.in_audio.totalAudioEnergy');
+    Kit.check('audio levels are valid numbers in [0, 1]', 'source and inbound audioLevel within [0, 1], energies >= 0',
+      'max source ' + ex(srcLevel) + ', max inbound ' + ex(inLevel) + ', energy source ' + ex(srcEnergy) + ' inbound ' + ex(inEnergy),
+      srcLevel >= 0 && srcLevel <= 1 && inLevel >= 0 && inLevel <= 1 && srcEnergy >= 0 && inEnergy >= 0);
+    Kit.info('audio source stats (after audio processing)', pickKeys(last.A.src_audio, ['echoReturnLoss', 'echoReturnLossEnhancement', 'totalSamplesDuration', 'audioLevel', 'totalAudioEnergy']));
+    const conc = get(last, 'B.in_audio.concealedSamples'), tot = get(last, 'B.in_audio.totalSamplesReceived');
+    Kit.check('inbound audio is real samples, not concealment', 'concealedSamples <= 10 % of totalSamplesReceived', conc + ' / ' + tot + ' (' + round(100 * conc / tot, 2) + ' %), jitter ' + get(last, 'B.in_audio.jitter'), tot > 0 && conc <= 0.1 * tot);
+    Kit.info('remote element playback', remoteMode);
+    try { Kit.info('autoplay policy reported for the remote element', navigator.getAutoplayPolicy ? navigator.getAutoplayPolicy(R) : '(navigator.getAutoplayPolicy not available)'); } catch (e) { Kit.info('autoplay policy', 'cannot read: ' + errs(e)); }
+    // The remote element plays at volume 0.1 and WebRTC applies that gain to the int16 samples before it measures the level: a quiet but
+    // not silent microphone (rms 1-3 LSB, measured with --use-file-for-fake-audio-capture) reaches the receiver as all-zero samples and
+    // its inbound energy is exactly 0 on a healthy path. So the check is asserted only when the loudest source level is at least
+    // 0.003 (about 100 LSB of 32768, about 10 LSB after the gain); below that it is n/a.
+    const LOUD_ENOUGH = 0.003;
+    if (!remoteMode.startsWith('unmuted')) Kit.na('inbound audio carries the signal (inbound energy > 0)', 'the remote element is muted (' + remoteMode + '): the playout volume is applied before the level is measured, so the level reads 0');
+    else if (!(srcEnergy > 0)) Kit.na('inbound audio carries the signal (inbound energy > 0)', 'the source energy is ' + ex(srcEnergy) + ' (a digitally silent microphone): there is nothing to compare');
+    else if (!(srcLevel >= LOUD_ENOUGH)) Kit.na('inbound audio carries the signal (inbound energy > 0)', 'source level ' + ex(srcLevel) + ' (max audioLevel, source energy ' + ex(srcEnergy) + ') too low to survive the 0.1 playout gain (needs >= ' + LOUD_ENOUGH + ', about 100 LSB; inbound energy was ' + ex(inEnergy) + ', max inbound level ' + ex(inLevel) + ')');
+    else Kit.check('inbound audio carries the signal (inbound energy > 0)', 'inbound totalAudioEnergy > 0 while the max source level is ' + ex(srcLevel) + ' (>= ' + LOUD_ENOUGH + ') and the source energy ' + ex(srcEnergy), 'inbound ' + ex(inEnergy) + ', max inbound level ' + ex(inLevel) + ' (volume 0.1)', inEnergy > 0);
+    Kit.info('rnn_fc.cc reached? (the RNN VAD skips its layers for digital silence)', srcEnergy > 0
+      ? 'source energy ' + ex(srcEnergy) + ' > 0: the capture was not digitally silent, so the VAD had a signal to analyse; whether a frame passed its own silence threshold (spectral energy 0.04) cannot be read from getStats'
+      : 'source energy ' + ex(srcEnergy) + ': digital silence, the VAD most likely skipped its RNN layers, so this run did not even exercise rnn_fc');
+    const erl = get(last, 'A.src_audio.echoReturnLoss');
+    Kit.check('WebRTC audio processing is in the capture path (echo-canceller statistics on the source)', 'echoReturnLoss is a number', 'echoReturnLoss ' + erl + ', echoReturnLossEnhancement ' + get(last, 'A.src_audio.echoReturnLossEnhancement'), typeof erl === 'number' && isFinite(erl));
+    Kit.check('tracks are not muted after the flow window', 'audio muted=false, video muted=false', 'audio muted=' + at.muted + ', video muted=' + vt.muted, at.muted === false && vt.muted === false);
+
+    // ---- codecs negotiated
+    const codecOf = (S, side, kind) => { const s = S[side + '_' + kind]; return s && s.codecId ? S.codec[s.codecId] : null; };
+    const cd = o => o ? o.mimeType + ' pt ' + o.payloadType + ' ' + o.clockRate + ' Hz' + (o.channels ? ' ch ' + o.channels : '') + (o.sdpFmtpLine ? ' [' + o.sdpFmtpLine + ']' : '') : '(none)';
+    const codecs = { audioSend: cd(codecOf(last.A, 'out', 'audio')), audioRecv: cd(codecOf(last.B, 'in', 'audio')), videoSend: cd(codecOf(last.A, 'out', 'video')), videoRecv: cd(codecOf(last.B, 'in', 'video')) };
+    Kit.info('codecs negotiated (getStats codec entries)', codecs);
+    Kit.info('every codec entry in the stats', { A: Object.values(last.A.codec).map(cd), B: Object.values(last.B.codec).map(cd) });
+    const ac = codecOf(last.B, 'in', 'audio'), vc = codecOf(last.B, 'in', 'video');
+    Kit.check('audio codec negotiated is Opus (WebRTC default)', 'audio/opus', ac ? ac.mimeType : '(no codec entry)', !!ac && /^audio\/opus$/i.test(ac.mimeType));
+    Kit.check('a video codec was negotiated', 'video/<codec>', vc ? vc.mimeType : '(no codec entry)', !!vc && /^video\//i.test(vc.mimeType));
+    Kit.info('encoder / decoder implementation', { encoder: get(last, 'A.out_video.encoderImplementation'), decoder: get(last, 'B.in_video.decoderImplementation'),
+      encoderPowerEfficient: get(last, 'A.out_video.powerEfficientEncoder'), decoderPowerEfficient: get(last, 'B.in_video.powerEfficientDecoder'), qualityLimit: get(last, 'A.out_video.qualityLimitationReason') });
+    Kit.info('video frame rate / size seen by the receiver (last)', { fps: get(last, 'B.in_video.framesPerSecond'), size: fw + 'x' + fh, sentSize: get(last, 'A.out_video.frameWidth') + 'x' + get(last, 'A.out_video.frameHeight'), keyFrames: get(last, 'B.in_video.keyFramesDecoded') });
+    const pair = last.A.pairs.find(p => last.A.transport && p.id === last.A.transport.selectedCandidatePairId) || last.A.pairs.find(p => p.nominated && p.state === 'succeeded');
+    if (pair) Kit.info('selected ICE pair', { local: pickKeys(last.A.cand[pair.localCandidateId], ['candidateType', 'protocol', 'address']), remote: pickKeys(last.A.cand[pair.remoteCandidateId], ['candidateType', 'protocol', 'address']), rttSeconds: pair.currentRoundTripTime, state: pair.state });
+    try { Kit.info('sender capabilities (codecs the build can send)', { audio: RTCRtpSender.getCapabilities('audio').codecs.map(c => c.mimeType).filter((x, i, a) => a.indexOf(x) === i),
+      video: RTCRtpSender.getCapabilities('video').codecs.map(c => c.mimeType).filter((x, i, a) => a.indexOf(x) === i) }); } catch (e) {}
+    try { Kit.info('H.264 in the video sender capabilities', RTCRtpSender.getCapabilities('video').codecs.some(c => /h264/i.test(c.mimeType)) ? 'yes' : 'no'); } catch (e) {}
+
+    // the per-second table (also in the screenshot and in the result)
+    const rows = ['  t(s)  aPktRx  aSamplesRx  aLvlRx  vPktRx  vFrDec  vFps  vSize     aPktTx  vFrEnc  srcSamplesDur  remoteFrames'];
+    for (const s of samples) rows.push([String(Math.round(s.t / 1000)).padStart(6), String(get(s, 'B.in_audio.packetsReceived')).padStart(7), String(get(s, 'B.in_audio.totalSamplesReceived')).padStart(11),
+      String(round(get(s, 'B.in_audio.audioLevel'), 4)).padStart(7), String(get(s, 'B.in_video.packetsReceived')).padStart(7), String(get(s, 'B.in_video.framesDecoded')).padStart(7),
+      String(round(get(s, 'B.in_video.framesPerSecond'), 1)).padStart(5), (get(s, 'B.in_video.frameWidth') + 'x' + get(s, 'B.in_video.frameHeight')).padStart(9),
+      String(get(s, 'A.out_audio.packetsSent')).padStart(8), String(get(s, 'A.out_video.framesEncoded')).padStart(7), String(round(get(s, 'A.src_audio.totalSamplesDuration'), 2)).padStart(14), String(s.remoteFrames - rf0).padStart(13)].join(' '));
+    el('timeline').textContent = rows.join('\n');
+    extra.webrtc.timeline = samples.map(s => ({ t: s.t, aPktRx: get(s, 'B.in_audio.packetsReceived'), aSamplesRx: get(s, 'B.in_audio.totalSamplesReceived'), aLevelRx: get(s, 'B.in_audio.audioLevel'),
+      aEnergyRx: get(s, 'B.in_audio.totalAudioEnergy'), vPktRx: get(s, 'B.in_video.packetsReceived'), vFramesDecoded: get(s, 'B.in_video.framesDecoded'), aPktTx: get(s, 'A.out_audio.packetsSent'),
+      vFramesEncoded: get(s, 'A.out_video.framesEncoded'), srcSamplesDuration: get(s, 'A.src_audio.totalSamplesDuration'), srcLevel: get(s, 'A.src_audio.audioLevel'), remoteFrames: s.remoteFrames }));
+    extra.webrtc.codecs = codecs;
+    extra.webrtc.states = states;
+  } catch (e) {
+    if (!/^Error: stop:/.test(String(e)) && !/^stop:/.test(String(e && e.message))) Kit.check('loopback run completed without an exception', 'no exception', errs(e), false);
+    else Kit.info('run ended early', e.message);
+  }
+
+  // a getUserMedia that timed out but may still answer (a prompt nobody has answered yet): give it a moment, so that an answer that comes
+  // soon is seen to be stopped; one that comes later is stopped too, silently (the verdict is already out)
+  if (waitingLate.size) await Promise.race([Promise.allSettled(Array.from(waitingLate)), sleep(3000)]);
+  // ---- cleanup is part of the test: tracks end, peer connections close
+  try {
+    cleanup();
+    if (at && vt) Kit.check('stopping the tracks ends them', 'audio ended, video ended', 'audio ' + at.readyState + ', video ' + vt.readyState, at.readyState === 'ended' && vt.readyState === 'ended');
+    if (pcA && pcB) Kit.check('closing the peer connections closes them', 'A closed, B closed', 'A ' + pcA.connectionState + ', B ' + pcB.connectionState, pcA.connectionState === 'closed' && pcB.connectionState === 'closed');
+  } catch (e) { Kit.check('cleanup', 'no exception', errs(e), false); }
+  clearTimeout(hard);
+  pageEnded = true;
+  extra.webrtc.lateGetUserMedia = lateGum;
+  await Kit.done(extra);
+})();
+</script>

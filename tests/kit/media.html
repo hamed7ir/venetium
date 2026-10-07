@@ -1,0 +1,347 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Venetium kit — media</title>
+<script src="lib/configs.js"></script>
+<script src="lib/kit.js"></script>
+<script src="data/media-index.js"></script>
+<script src="lib/media-wav.js"></script>
+<style>
+  #mx h3 { font: bold 15px "Segoe UI", Arial, sans-serif; margin: 10px 0 4px; }
+  #mt { border-collapse: collapse; margin: 4px 0; }
+  #mt td, #mt th { border: 1px solid #999; padding: 1px 6px; font: 12px Consolas, monospace; text-align: left; vertical-align: top; }
+  #players { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 10px; }
+  .cell { width: 200px; font: 11px Consolas, monospace; word-break: break-all; }
+  .cell video { width: 200px; height: 112px; background: #222; display: block; }
+  .cell video.aud { height: 32px; }   /* an audio-only clip, played through a (muted) <video> element on purpose, see makeCell */
+</style>
+<div id="mx">
+  <h3>Codec table — canPlayType and MediaSource.isTypeSupported (primary row of each format is the one the checks use)</h3>
+  <table id="mt"></table>
+  <h3>Players — one local clip per format, played muted from a blob: URL, every clip through a &lt;video&gt; element (the audio-only ones too: without a user gesture only a muted &lt;video&gt; may autoplay, a muted &lt;audio&gt; may not); a played clip is replaced by a snapshot of its last frame</h3>
+  <div id="players"></div>
+</div>
+<script>
+// BATCH-X86-2 §1 media.html: the codec table, then a short local clip for every format, played from a blob: URL.
+//  - table: canPlayType and MediaSource.isTypeSupported for avc1, hvc1, vp8, vp9, av01, opus, vorbis, mp4a.40.2, mp3, flac and pcm,
+//    plus navigator.mediaCapabilities.decodingInfo (information: smooth / powerEfficient = hardware decoding).
+//  - D13 (his decision 10-02, video and audio on): avc1 (H.264) and mp4a.40.2 (AAC) MUST be supported (canPlayType "probably",
+//    isTypeSupported true) and MUST play. HEVC may say no (Chromium decodes it only through the platform): it is reported, not failed.
+//    The other formats (vp8, vp9, av01, opus, vorbis, mp3, flac, pcm) are THE KIT'S OWN ASSUMPTION, stricter than the batch (which fixes
+//    only H.264 and AAC): "every Chromium build supports them", so "" from canPlayType is a failure, and every such failure says so
+//    in its message (a build that is meant to ship without one of them gets a false FAIL there: read the message).
+//  - playback: for every clip: no error, currentTime passes 2 s, video: totalVideoFrames > 0 + decoded size + a picture that is not
+//    blank, audio: webkitAudioDecodedByteCount > 0 + decodeAudioData gives non-silent PCM of the right length.
+//    A format whose table row says "supported" must play; avc1 and mp4a.40.2 are played even if the table says no (they must work),
+//    and so is every kit-assumption format (a failure of one of those clips says it is the kit's assumption).
+//  - NO USER GESTURE, device autoplay policy: the launchers pass no --autoplay-policy flag, so the browser's default applies
+//    (document-user-activation-required) and nobody clicks before the page runs. Chromium exempts only a MUTED <VIDEO> from that
+//    policy (a muted <audio> gets NotAllowedError), so EVERY clip is played muted through a <video> element, the audio-only ones
+//    too (an audio-only file in a <video> element is decoded and played the same: currentTime, webkitAudioDecodedByteCount).
+//  - MSE: the fragmented avc1 + mp4a.40.2 file through MediaSource / SourceBuffer, the way YouTube-style players feed the decoder.
+//  - the clips are Chromium's own media/test/data files (manifest/media.tsv); the pcm clip is generated (lib/media-wav.js), since no
+//    WAV there is longer than 1.07 s. Every clip is hashed after decoding the base64 and compared with its catalog sha256.
+//  - which decoder runs is not visible to the page: the runner records it from the DevTools Media domain (notes: kit-notes\media.md).
+// No %-natives syntax anywhere in this page. A page-wide budget (no new clip starts after 110 s; one clip takes at most ~55 s,
+// and the index gives this page 180 s) stops the clips that are left, each reported as a failed check, so the page always ends with a verdict.
+async function main() {
+  const T0 = performance.now(), BUDGET_MS = 110000;
+  const IDX = {}; for (const c of window.KIT_MEDIA_INDEX || []) IDX[c.id] = c;
+  const mt = document.getElementById('mt'), playersEl = document.getElementById('players');
+  const sleep = Kit.sleep;
+  const withTimeout = (p, ms, what) => { let t; return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(what + ' timed out after ' + ms + ' ms')), ms); })]).finally(() => clearTimeout(t)); };
+  const until = async (cond, ms, step) => { const end = performance.now() + ms; for (;;) { let v = false; try { v = cond(); } catch (e) {} if (v) return true; if (performance.now() >= end) return false; await sleep(step || 50); } };
+  const hex = buf => Array.prototype.map.call(new Uint8Array(buf), b => b.toString(16).padStart(2, '0')).join('');
+  const f2 = x => (typeof x === 'number' && isFinite(x)) ? x.toFixed(2) : String(x);
+  const errText = e => e ? ('MediaError ' + e.code + (e.message ? ' ' + e.message : '')) : 'null';
+
+  Kit.info('page', { MediaSource: typeof window.MediaSource, ManagedMediaSource: typeof window.ManagedMediaSource, mediaCapabilities: !!(navigator.mediaCapabilities && navigator.mediaCapabilities.decodingInfo),
+    OfflineAudioContext: typeof window.OfflineAudioContext, cryptoSubtle: !!(window.crypto && crypto.subtle), catalogClips: Object.keys(IDX).length,
+    userActivationHasBeenActive: navigator.userActivation ? navigator.userActivation.hasBeenActive : 'n/a (no gesture is ever made: every clip below starts by muted-<video> autoplay)' });
+  { const kt = document.getElementById('kit-table'); if (kt) kt.parentNode.insertBefore(document.getElementById('mx'), kt); }   // table and players above the check list
+
+  // ---------- the format table ----------
+  // level: must = D13; stock = THE KIT'S ASSUMPTION that every Chromium build has it (a "" is a failure, and its message says it is
+  // the kit's assumption, not a batch requirement); optional = reported only.
+  const T = (c, codecs) => c + '; codecs="' + codecs + '"';
+  const FORMATS = [
+    { id: 'avc1', name: 'avc1 (H.264)', level: 'must', primary: T('video/mp4', 'avc1.64001F'), types: [T('video/mp4', 'avc1.42E01E'), T('video/mp4', 'avc1.4D401E'), T('video/mp4', 'avc1.64001F')], clips: ['avc1'] },
+    { id: 'hvc1', name: 'hvc1 (HEVC)', level: 'optional', primary: T('video/mp4', 'hvc1.1.6.L93.B0'), types: [T('video/mp4', 'hvc1.1.6.L93.B0'), T('video/mp4', 'hev1.1.6.L93.B0')], clips: ['hvc1'] },
+    { id: 'vp8', name: 'vp8', level: 'stock', primary: T('video/webm', 'vp8'), types: [T('video/webm', 'vp8')], clips: ['vp8'] },
+    { id: 'vp9', name: 'vp9', level: 'stock', cap: T('video/webm', 'vp09.00.10.08'), primary: T('video/webm', 'vp9'), types: [T('video/webm', 'vp9'), T('video/webm', 'vp09.00.10.08'), T('video/mp4', 'vp09.00.10.08')], clips: ['vp9'] },
+    { id: 'av01', name: 'av01 (AV1)', level: 'stock', primary: T('video/webm', 'av01.0.00M.08'), types: [T('video/webm', 'av01.0.00M.08'), T('video/mp4', 'av01.0.00M.08')], clips: ['av01'] },
+    { id: 'opus', name: 'opus', level: 'stock', primary: T('audio/ogg', 'opus'), types: [T('audio/ogg', 'opus'), T('audio/webm', 'opus'), T('audio/mp4', 'opus')], clips: ['opus'] },
+    { id: 'vorbis', name: 'vorbis', level: 'stock', primary: T('audio/webm', 'vorbis'), types: [T('audio/webm', 'vorbis'), T('audio/ogg', 'vorbis')], clips: ['vorbis'] },
+    { id: 'aac', name: 'mp4a.40.2 (AAC)', level: 'must', primary: T('audio/mp4', 'mp4a.40.2'), types: [T('audio/mp4', 'mp4a.40.2'), 'audio/aac'], clips: ['aac', 'aac-adts'] },
+    { id: 'mp3', name: 'mp3', level: 'stock', primary: 'audio/mpeg', types: ['audio/mpeg', T('audio/mpeg', 'mp3'), T('audio/mp4', 'mp3')], clips: ['mp3'] },
+    { id: 'flac', name: 'flac', level: 'stock', primary: 'audio/flac', types: ['audio/flac', T('audio/ogg', 'flac'), T('audio/mp4', 'flac')], clips: ['flac', 'flac-native'] },
+    { id: 'pcm', name: 'pcm (wav)', level: 'stock', primary: T('audio/wav', '1'), types: [T('audio/wav', '1'), 'audio/wav'], clips: ['pcm'] },
+    { id: 'avc1aac', name: 'avc1 + mp4a.40.2', level: 'must', primary: T('video/mp4', 'avc1.64001E, mp4a.40.2'), types: [T('video/mp4', 'avc1.64001F, mp4a.40.2'), T('video/mp4', 'avc1.64001E, mp4a.40.2')], clips: [], mseClip: 'avc1-aac', cap: T('video/mp4', 'avc1.64001E') },
+  ];
+  const ROLE = { must: 'MUST (D13)', stock: 'kit assumption: must be supported', optional: 'optional' };
+  // appended to the "got" of every failing row of a kit-assumption format, so a failure reads as the kit's own assumption, not as a requirement
+  const ASSUMED = ' — KIT ASSUMPTION, not a batch requirement (the batch fixes only H.264 and AAC): the kit assumes every Chromium build supports this format; if this build is meant to ship without it, this FAIL is the kit\'s, not the browser\'s';
+  const probe = document.createElement('video');
+  const hasMSE = typeof window.MediaSource === 'function' || typeof window.MediaSource === 'object';
+  const mseOf = t => { try { return hasMSE ? MediaSource.isTypeSupported(t) : null; } catch (e) { return 'threw ' + e.message; } };
+  const capOf = async f => {
+    const mc = navigator.mediaCapabilities;
+    if (!mc || !mc.decodingInfo) return { error: 'no mediaCapabilities' };
+    const cfg = { type: 'file' };
+    const ct = f.cap || f.primary;   // decodingInfo takes one codec per config, and a full vp9 string
+    if (/^video\//.test(ct)) cfg.video = { contentType: ct, width: 640, height: 360, bitrate: 1000000, framerate: 30 };
+    else cfg.audio = { contentType: ct, channels: '2', bitrate: 128000, samplerate: 44100 };
+    try { const r = await withTimeout(mc.decodingInfo(cfg), 8000, 'decodingInfo'); return { supported: r.supported, smooth: r.smooth, powerEfficient: r.powerEfficient }; }
+    catch (e) { return { error: String(e.message || e) }; }
+  };
+  const capText = c => c.error ? 'error: ' + c.error : 'supported=' + c.supported + ' smooth=' + c.smooth + ' powerEfficient=' + c.powerEfficient;
+  const caps = await Promise.all(FORMATS.map(capOf));
+  const codecTable = [];
+  const hdr = document.createElement('tr'); for (const h of ['format', 'type string', 'canPlayType', 'MSE isTypeSupported', 'role', 'mediaCapabilities.decodingInfo (primary row; vp9 asked as vp09.00.10.08, avc1 + aac as avc1 alone)']) { const th = document.createElement('th'); th.textContent = h; hdr.appendChild(th); } mt.appendChild(hdr);
+  const tableOk = {};   // format id -> canPlayType of the primary row
+  FORMATS.forEach((f, i) => {
+    for (const t of f.types) {
+      const cp = probe.canPlayType(t), ms = mseOf(t), primary = t === f.primary;
+      if (primary) tableOk[f.id] = cp;
+      codecTable.push({ format: f.name, type: t, canPlayType: cp, mse: ms, primary, role: f.level, mediaCapabilities: primary ? caps[i] : undefined });
+      const tr = document.createElement('tr');
+      tr.className = cp === '' ? (f.level === 'optional' ? 'kit-na' : (primary ? 'kit-bad' : 'kit-na')) : 'kit-ok';
+      for (const x of [primary ? f.name : '', t, cp === '' ? '""' : cp, String(ms), primary ? ROLE[f.level] : '', primary ? capText(caps[i]) : '']) { const td = document.createElement('td'); td.textContent = x; tr.appendChild(td); }
+      mt.appendChild(tr);
+    }
+  });
+  FORMATS.forEach(f => {
+    const cp = tableOk[f.id], ms = mseOf(f.primary);
+    if (f.level === 'must') {
+      Kit.check(f.name + ': canPlayType(' + f.primary + ')', 'probably', cp, cp === 'probably');
+      Kit.check(f.name + ': MediaSource.isTypeSupported(' + f.primary + ')', true, ms, ms === true);
+    } else if (f.level === 'stock') {
+      Kit.check(f.name + ': canPlayType(' + f.primary + ') is not empty (the kit\'s assumption: every Chromium build supports it)', 'probably or maybe (kit assumption, not in the batch)', cp === '' ? '""' + ASSUMED : cp, cp !== '');
+      Kit.info(f.name + ': MediaSource.isTypeSupported(' + f.primary + ')', ms);
+    } else {
+      Kit.info(f.name + ' (optional, D13 does not require it): canPlayType / isTypeSupported of ' + f.primary, (cp === '' ? '""' : cp) + ' / ' + ms);
+    }
+  });
+
+  // ---------- clip loading ----------
+  const integrity = [];
+  async function loadClip(id) {
+    const c = IDX[id];
+    if (!c) throw new Error('no catalog entry for ' + id);
+    await Kit.loadScript('data/media-' + id + '.js');
+    const b64 = (window.KIT_MEDIA || {})[id];
+    if (!b64) throw new Error('data/media-' + id + '.js loaded but KIT_MEDIA[' + id + '] is empty');
+    const bytes = Kit.bytes(b64); delete window.KIT_MEDIA[id];
+    let digest = null;
+    if (window.crypto && crypto.subtle) digest = hex(await crypto.subtle.digest('SHA-256', bytes));
+    integrity.push({ id, bytes: bytes.length, wantBytes: c.bytes, digest, want: c.sha256, ok: bytes.length === c.bytes && (digest === null || digest === c.sha256) });
+    return { c, bytes };
+  }
+  function frameStats(video) {
+    try {
+      const W = 64, H = 36, cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+      const g = cv.getContext('2d', { willReadFrequently: true });
+      g.drawImage(video, 0, 0, W, H);
+      const d = g.getImageData(0, 0, W, H).data; let s = 0, s2 = 0, n = W * H;
+      for (let i = 0; i < d.length; i += 4) { const y = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]; s += y; s2 += y * y; }
+      const mean = s / n; return { mean: +mean.toFixed(1), sd: +Math.sqrt(Math.max(0, s2 / n - mean * mean)).toFixed(1) };
+    } catch (e) { return { error: String(e.message || e) }; }
+  }
+  async function decodePcm(bytes) {
+    const Ctx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!Ctx) return { error: 'no OfflineAudioContext' };
+    try {
+      const buf = await withTimeout(new Ctx(1, 1, 44100).decodeAudioData(bytes.slice().buffer), 20000, 'decodeAudioData');
+      const ch = buf.getChannelData(0); let s2 = 0, peak = 0;
+      for (let i = 0; i < ch.length; i++) { const a = ch[i]; s2 += a * a; const m = a < 0 ? -a : a; if (m > peak) peak = m; }
+      return { channels: buf.numberOfChannels, rate: buf.sampleRate, duration: +buf.duration.toFixed(3), rms: +Math.sqrt(s2 / Math.max(1, ch.length)).toFixed(4), peak: +peak.toFixed(4) };
+    } catch (e) { return { error: String(e.message || e) }; }
+  }
+  function makeCell(label, video) {
+    const cell = document.createElement('div'); cell.className = 'cell';
+    // ALWAYS a <video> element, audio-only clips too: the device runs with Chromium's default autoplay policy and no gesture, and only a
+    // muted <video> may start playing then (a muted <audio> gets NotAllowedError). An audio-only file in a <video> element is demuxed,
+    // decoded and clocked exactly like in an <audio> element (currentTime, webkitAudioDecodedByteCount), it just has no picture.
+    const el = document.createElement('video');
+    el.muted = true; el.preload = 'auto'; el.setAttribute('playsinline', ''); el.setAttribute('data-clip', label);
+    if (!video) { el.controls = true; el.className = 'aud'; }
+    const cap = document.createElement('div'); cap.textContent = label + (video ? '' : ' (audio only, in a muted <video>)') + ' …';
+    cell.appendChild(el); cell.appendChild(cap); playersEl.appendChild(cell);
+    return { el, cap, cell };
+  }
+  // after a clip's evidence is taken: keep a 200x112 snapshot of the last frame (for the screenshot), release the decoder and the Blob
+  function retire(cell, el, url, isVideo) {
+    try {
+      let snap = null;
+      if (isVideo && el.videoWidth) { snap = document.createElement('canvas'); snap.width = 200; snap.height = 112; snap.style.cssText = 'display:block;background:#222'; snap.getContext('2d').drawImage(el, 0, 0, 200, 112); }
+      el.pause(); el.removeAttribute('src'); el.load();
+      if (snap) cell.replaceChild(snap, el); else cell.removeChild(el);
+      URL.revokeObjectURL(url);
+    } catch (e) {}
+  }
+  // plays el until currentTime passes `need` seconds (or it ends, errors, stalls for 8 s, or 20 s have gone); returns the evidence
+  async function watch(el, spec, runPlay) {
+    const r = { playError: null };
+    const t0 = performance.now(); let last = -1, lastChange = t0;   // 22 s in all for play() + reaching 2 s
+    try { const p = runPlay(); await withTimeout(Promise.resolve(p), 12000, 'play()'); } catch (e) { r.playError = (e.name || 'Error') + ': ' + (e.message || e); }
+    while (performance.now() - t0 < 22000) {
+      if (el.error) break;
+      const ct = el.currentTime;
+      if (spec.short ? el.ended : ct > 2.0) break;
+      if (el.ended) break;
+      if (ct !== last) { last = ct; lastChange = performance.now(); } else if (performance.now() - lastChange > 8000) { r.stalled = true; break; }
+      await sleep(50);
+    }
+    r.ms = Math.round(performance.now() - t0);
+    return r;
+  }
+  function snapshot(el, r) {
+    r.currentTime = el.currentTime; r.duration = el.duration; r.ended = el.ended; r.readyState = el.readyState; r.networkState = el.networkState;
+    r.error = el.error ? { code: el.error.code, message: el.error.message } : null;
+    r.videoWidth = el.videoWidth || 0; r.videoHeight = el.videoHeight || 0;
+    if (typeof el.getVideoPlaybackQuality === 'function') { const q = el.getVideoPlaybackQuality(); r.totalVideoFrames = q.totalVideoFrames; r.droppedVideoFrames = q.droppedVideoFrames; r.corruptedVideoFrames = q.corruptedVideoFrames; }
+    if ('webkitAudioDecodedByteCount' in el) r.audioDecodedBytes = el.webkitAudioDecodedByteCount;
+    if ('webkitVideoDecodedByteCount' in el) r.videoDecodedBytes = el.webkitVideoDecodedByteCount;
+    return r;
+  }
+  async function playBlob(label, spec, bytes, mime) {
+    const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+    const { el, cap, cell } = makeCell(label, spec.video);
+    const r = { id: spec.id, mime, bytes: bytes.length };
+    const t0 = performance.now(); el.src = url;
+    r.metadata = await until(() => el.readyState >= 1 || el.error, 12000, 50);
+    r.loadMs = Math.round(performance.now() - t0);
+    Object.assign(r, await watch(el, spec, () => el.play()));
+    snapshot(el, r);
+    if (spec.video && !r.error) r.frame = frameStats(el);
+    el.pause();
+    if (spec.audio && !r.error) r.decode = await decodePcm(bytes);
+    cap.textContent = label + ' — ' + f2(r.currentTime) + ' s' + (spec.video ? ', ' + r.totalVideoFrames + ' frames' : '') + (r.error ? ' — ' + errText(r.error) : '');
+    retire(cell, el, url, spec.video);
+    return r;
+  }
+
+  // ---------- one clip's checks ----------
+  // asInfo: the result is reported but cannot fail (hvc1 while the table says "no"). planted: the avc1 size check takes Kit.want.
+  // assumed: the clip's format is one of the kit's own assumptions (the table said "" and the clip was played anyway): a failing row says so
+  function report(label, spec, r, asInfo, assumed) {
+    const rows = [];
+    const add = (name, want, got, ok) => rows.push({ name: label + ': ' + name, want, got: ok || !assumed ? got : got + ASSUMED, ok });
+    const dOk = isFinite(r.duration) && Math.abs(r.duration - spec.dur) < 0.1;
+    add('loads: no error, duration = the clip\'s', f2(spec.dur) + ' s, error null', f2(r.duration) + ' s, ' + errText(r.error) + (r.playError ? ', play() ' + r.playError : ''), !r.error && !r.playError && r.metadata && dOk);
+    if (spec.short) add('plays to its end (clip is only ' + f2(spec.dur) + ' s)', 'ended, currentTime = duration', (r.ended ? 'ended' : 'not ended') + ' at ' + f2(r.currentTime) + ' s', r.ended && Math.abs(r.currentTime - spec.dur) < 0.15 && !r.error);
+    else add('currentTime passes 2 s', '> 2 s', f2(r.currentTime) + ' s' + (r.stalled ? ' (stalled)' : ''), r.currentTime > 2);
+    if (spec.video) {
+      add('getVideoPlaybackQuality().totalVideoFrames > 0', '> 0', r.totalVideoFrames + ' (dropped ' + r.droppedVideoFrames + ')', r.totalVideoFrames > 0);
+      const wantSize = spec.id === 'avc1' ? Kit.want(spec.w + 'x' + spec.h, (spec.w + 1) + 'x' + spec.h) : spec.w + 'x' + spec.h;
+      const gotSize = r.videoWidth + 'x' + r.videoHeight;
+      add('decoded frame size', wantSize, gotSize, gotSize === wantSize);
+      const fr = r.frame || {};
+      add('the frame has picture content (not blank or black)', 'luma sd > 8, mean 5..250', fr.error ? fr.error : 'mean ' + fr.mean + ' sd ' + fr.sd, !fr.error && fr.sd > 8 && fr.mean > 5 && fr.mean < 250);
+    }
+    if (spec.audio) {
+      if (r.audioDecodedBytes === undefined) rows.push({ name: label + ': audio decoded (webkitAudioDecodedByteCount)', want: 'n/a', got: 'attribute not present', ok: true, na: true });
+      else add('audio decoded (webkitAudioDecodedByteCount > 0)', '> 0', r.audioDecodedBytes, r.audioDecodedBytes > 0);
+      const d = r.decode || {};
+      const wantDur = spec.dur;
+      const dok = !d.error && d.rms > (spec.pcm ? 0.15 : 0.002) && Math.abs(d.duration - wantDur) < 0.4 && (!spec.pcm || Math.abs(d.peak - spec.amp) < 0.03);
+      add('decodeAudioData gives non-silent PCM of the right length' + (spec.pcm ? ' and level (sine peak ' + spec.amp + ')' : ''), f2(wantDur) + ' s, rms > ' + (spec.pcm ? '0.15' : '0.002'),
+        d.error ? d.error : f2(d.duration) + ' s, ' + d.channels + ' ch, rms ' + d.rms + ', peak ' + d.peak, dok);
+    }
+    if (!asInfo) { for (const x of rows) { if (x.na) Kit.na(x.name, x.got); else Kit.check(x.name, x.want, x.got, x.ok); } }
+    else Kit.info(label + ' (not asserted: the table says unsupported)', rows.map(x => (x.ok ? 'ok ' : 'NO ') + x.name.slice(label.length + 2) + ' [' + x.got + ']').join(' | '));
+    return rows.every(x => x.ok);
+  }
+  function budgetGone(label) {
+    if (performance.now() - T0 < BUDGET_MS) return false;
+    Kit.check(label + ': played', 'played within the page budget', 'not run: the page\'s ' + (BUDGET_MS / 1000) + ' s budget is used up', false);
+    return true;
+  }
+
+  // ---------- MSE: the fragmented H.264 + AAC file through MediaSource ----------
+  async function mseTest(bytes) {
+    const label = 'MSE avc1 + mp4a.40.2', spec = { id: 'mse', video: true, audio: true, dur: IDX['avc1-aac'].dur };
+    const type = T('video/mp4', 'avc1.64001E, mp4a.40.2');
+    const out = { type };
+    if (!hasMSE) { Kit.check(label + ': MediaSource exists', 'MediaSource', 'undefined', false); return out; }
+    let ms, el, cap, cell, url;
+    try {
+      ms = new MediaSource();
+      ({ el, cap, cell } = makeCell(label, true));
+      const open = new Promise(res => ms.addEventListener('sourceopen', res, { once: true }));
+      el.src = url = URL.createObjectURL(ms);
+      await withTimeout(open, 10000, 'sourceopen');
+      const sb = ms.addSourceBuffer(type);
+      const done = new Promise((res, rej) => { sb.addEventListener('updateend', () => res(), { once: true }); sb.addEventListener('error', () => rej(new Error('SourceBuffer error event')), { once: true }); });
+      sb.appendBuffer(bytes);
+      await withTimeout(done, 15000, 'appendBuffer');
+      out.buffered = el.buffered.length ? f2(el.buffered.start(0)) + '-' + f2(el.buffered.end(0)) : 'empty';
+      ms.endOfStream();
+      out.appended = true;
+    } catch (e) { out.appendError = String(e.message || e); }
+    Kit.check(label + ': addSourceBuffer + appendBuffer accepted the fragmented MP4', 'updateend, buffered > 0 s', out.appendError || ('updateend, buffered ' + out.buffered), !!out.appended && out.buffered !== 'empty');
+    if (!out.appended) { if (cell) retire(cell, el, url, true); return out; }
+    const r = { id: 'mse' };
+    Object.assign(r, await watch(el, spec, () => el.play()));
+    snapshot(el, r); r.frame = frameStats(el); el.pause();
+    Object.assign(out, r);
+    cap.textContent = label + ' — ' + f2(r.currentTime) + ' s, ' + r.totalVideoFrames + ' frames' + (r.error ? ' — ' + errText(r.error) : '');
+    retire(cell, el, url, true);
+    Kit.check(label + ': no error', 'MediaError null', errText(r.error) + (r.playError ? ', play() ' + r.playError : ''), !r.error && !r.playError);
+    Kit.check(label + ': currentTime passes 2 s', '> 2 s', f2(r.currentTime) + ' s' + (r.stalled ? ' (stalled)' : ''), r.currentTime > 2);
+    Kit.check(label + ': getVideoPlaybackQuality().totalVideoFrames > 0', '> 0', r.totalVideoFrames + ' (dropped ' + r.droppedVideoFrames + ')', r.totalVideoFrames > 0);
+    const fr = r.frame || {};
+    Kit.check(label + ': the frame has picture content (not blank or black)', 'luma sd > 8, mean 5..250', fr.error ? fr.error : 'mean ' + fr.mean + ' sd ' + fr.sd, !fr.error && fr.sd > 8 && fr.mean > 5 && fr.mean < 250);
+    if (r.audioDecodedBytes === undefined) Kit.na(label + ': audio decoded', 'webkitAudioDecodedByteCount not present'); else Kit.check(label + ': audio decoded (webkitAudioDecodedByteCount > 0)', '> 0', r.audioDecodedBytes, r.audioDecodedBytes > 0);
+    return out;
+  }
+
+  // ---------- play every format's clips ----------
+  const clipStats = [];
+  let mseStats = null;
+  for (const f of FORMATS) {
+    const supported = tableOk[f.id] !== '';
+    for (const id of f.clips) {
+      const label = f.name + ' / ' + id;
+      if (budgetGone(label)) continue;
+      const asInfo = f.level === 'optional' && !supported;
+      const assumed = f.level === 'stock' && !supported;   // table row empty: the kit's assumption already failed above; this clip's failures say so too
+      try {
+        let spec, bytes, mime;
+        if (id === 'pcm') {
+          const w = KitWav.make();
+          spec = { id: 'pcm', video: false, audio: true, dur: w.seconds, pcm: true, amp: w.amp }; bytes = w.bytes; mime = 'audio/wav';
+          integrity.push({ id: 'pcm', bytes: bytes.length, wantBytes: 44 + Math.round(w.seconds * w.rate) * 2, digest: null, want: null, ok: bytes.length === 44 + Math.round(w.seconds * w.rate) * 2 });
+        } else {
+          const L = await loadClip(id); spec = L.c; bytes = L.bytes; mime = spec.mime;
+        }
+        const r = await playBlob(label, spec, bytes, mime);
+        clipStats.push(r);
+        report(label, spec, r, asInfo, assumed);
+      } catch (e) {
+        if (asInfo) Kit.info(label + ' (not asserted: the table says unsupported)', 'could not run: ' + (e.message || e));
+        else Kit.check(label + ': played', 'plays', 'page error: ' + (e.message || e) + (assumed ? ASSUMED : ''), false);
+      }
+    }
+  }
+
+  // MSE (avc1 + mp4a.40.2): the fragmented file is not a direct-playback clip (see its catalog note), it is the MediaSource feed
+  for (const f of FORMATS) {
+    if (!f.mseClip || budgetGone('MSE avc1 + mp4a.40.2')) continue;
+    try { const L = await loadClip(f.mseClip); mseStats = await mseTest(L.bytes); }
+    catch (e) { Kit.check('MSE avc1 + mp4a.40.2: ran', 'runs', 'page error: ' + (e.message || e), false); }
+  }
+
+  // ---------- integrity of the embedded data ----------
+  const hashed = integrity.filter(x => x.digest !== null), badInt = integrity.filter(x => !x.ok);
+  if (window.crypto && crypto.subtle) Kit.check('embedded clips match their recorded size and sha256', hashed.length + '/' + hashed.length + ' hashes match (originals in manifest/media.tsv)', (hashed.length - hashed.filter(x => !x.ok).length) + '/' + hashed.length + (badInt.length ? ' — bad: ' + badInt.map(x => x.id).join(', ') : ''), badInt.length === 0 && hashed.length > 0);
+  else { Kit.na('embedded clips match their sha256', 'crypto.subtle is not available here; sizes checked: ' + (badInt.length ? 'BAD ' + badInt.map(x => x.id).join(', ') : 'ok')); }
+  if (clipStats.length) Kit.info('clips played / page time', clipStats.length + ' clips, ' + Math.round((performance.now() - T0) / 1000) + ' s');
+  return { codecTable, clips: clipStats, mse: mseStats, integrity, pageSeconds: Math.round((performance.now() - T0) / 100) / 10 };
+}
+// whatever goes wrong inside, the page still ends with a verdict
+(async () => {
+  let extra = {};
+  try { extra = await main(); } catch (e) { Kit.check('the media page ran to its end', 'no exception', String((e && (e.stack || e.message)) || e).slice(0, 400), false); }
+  await Kit.done(extra);
+})();
+</script>

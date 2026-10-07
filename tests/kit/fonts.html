@@ -1,0 +1,272 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Venetium kit — fonts</title>
+<script src="lib/configs.js"></script>
+<script src="lib/kit.js"></script>
+<script src="data/fonts-strings.js"></script>
+<script>
+// Venetium's name in the scripts its translations use (BATCH-X86-2 §1.1 page "fonts"). The strings are the product-name messages of every
+// translation the build contains (data/fonts-strings.js, read from the built paks): the app menu's "About Venetium", the app-menu tooltip, the
+// "not responding" message and the "set as default browser" title, in 82 languages (the 84 translations in the build minus the two pseudo-locales). Hindi and Nepali write the name itself in Devanagari
+// (the Venetium name is "वेनेटियम" there); every other translation keeps the Latin name inside native-script text. What is tested is that the NATIVE
+// letters of those strings (Latin letters are left out) are drawn with a real font, never with the missing-glyph box ("tofu"):
+//   * the missing-glyph box is measured first: seven unassigned code points (U+0378 …) are drawn on a canvas and must give one identical, visible box
+//     (this is the reference); an empty canvas and a space must read as blank and "A" must be neither empty nor the box, and unassigned code points inside six script blocks (Thai, Lao, Khmer, Ethiopic, Bengali, Hebrew), drawn with that block's language, must be classified as the box (controls, so the test cannot be vacuous);
+//   * every distinct native letter / mark of a locale is drawn alone and compared, pixel for pixel, with that box and with an empty canvas;
+//   * each string's native letters are drawn as one run and compared with a run of the same number of missing-glyph boxes (a string whose
+//     glyphs all render as tofu fails);
+//   * the canvas carries the locale's language (the lang attribute and ctx.lang), as the browser UI does, so Han letters get the Chinese,
+//     Japanese or Korean font; a control checks that the language changes the drawing: four Han characters drawn under ja, zh-CN, zh-TW and ko
+//     must each give four different drawings.
+// "Which font drew it" is information: each installed font that is a realistic fallback for the script (probed by metrics) is tried first in the
+// font list, and the ones whose drawing is pixel-identical with the default drawing are named. That is an inference — a font that is installed
+// but lacks the script is also "identical" (it falls through to the same default); the ground truth (CSS.getPlatformFontsForNode, x86 server) is in kit-tools\fonts\fonts-groundtruth.txt.
+// Missing fonts are an environment finding, so the page names the fonts it could not find, per script, in an info row and in the failing row.
+(async () => {
+  const t0 = performance.now();
+  const picked = [];                                          // for the result: the font that drew each script
+  let holder = null, nLocales = 0, nCases = 0;
+  // Everything below runs inside this try: if the data script did not load, or anything throws, that is recorded as one failed check and
+  // Kit.done still runs, so the verdict reaches index.html / the runner at once instead of after their timeouts.
+  try {
+    const D = window.FONTS_DATA;
+    if (!D || !Array.isArray(D.cases) || !D.cases.length) throw new Error('data/fonts-strings.js did not load: window.FONTS_DATA has no cases');
+    nCases = D.cases.length;
+    const UI ='"Segoe UI", Arial, sans-serif';            // the stack of the kit's own pages (lib/kit.js); the missing-glyph box is this stack's
+    const FONT_L = '40px ' + UI, FONT_S = '24px ' + UI;
+    const NAME_HI = '\u0935\u0947\u0928\u0947\u091f\u093f\u092f\u092e';          // वेनेटियम
+    const CHROMIUM_HI = '\u0915\u094d\u0930\u094b\u092e\u093f\u092f\u092e';      // क्रोमियम (what the name was before Venetium)
+    const REF_CPS = [0x378, 0x379, 0x380, 0x381, 0x38b, 0x38d, 0x3a2];          // unassigned (General_Category=Cn), Greek block
+    const BUDGET_MS = 50000;
+    await new Promise(r => document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', () => r()) : r());
+    const yieldNow = () => new Promise(r => setTimeout(r, 0));
+    const cpHex = ch => 'U+' + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0');
+
+    // ---- canvas helpers: one hidden canvas per (language, size) -------------------------------------------------------------------------
+    holder = document.createElement('div');
+    holder.style.cssText = 'position:absolute;left:-9999px;top:0;width:1px;height:1px;overflow:hidden';
+    document.body.appendChild(holder);
+    const surfaces = new Map();
+    let ctxLang = 'unsupported';
+    function surface(lang, w, h) {
+      const k = lang + '|' + w + 'x' + h;
+      let s = surfaces.get(k);
+      if (!s) {
+        const c = document.createElement('canvas'); c.width = w; c.height = h; c.setAttribute('lang', lang); holder.appendChild(c);
+        const x = c.getContext('2d', { willReadFrequently: true });
+        if ('lang' in x) { x.lang = lang; ctxLang = 'supported'; }
+        s = { c, x, w, h, emptyKey: null }; surfaces.set(k, s);
+      }
+      return s;
+    }
+    // draws black text on a transparent canvas. The key is the canvas encoded as a PNG data URL (the browser's own encoder: no per-pixel JS, so the
+    // cost does not depend on the JS tier): equal key = identical pixels. ink is 0 when the drawing equals the empty canvas of the same size.
+    function draw(text, lang, font, w, h) {
+      const s = surface(lang, w, h), x = s.x;
+      x.clearRect(0, 0, w, h);
+      if (s.emptyKey === null) s.emptyKey = s.c.toDataURL('image/png');
+      x.fillStyle = '#000'; x.font = font; x.textBaseline = 'alphabetic';
+      if (text) x.fillText(text, 6, Math.round(h * 0.72));
+      const key = s.c.toDataURL('image/png');
+      return { ink: key === s.emptyKey ? 0 : 1, key };
+    }
+    const refCache = new Map();
+    function tofuRef(lang) {                                  // the missing-glyph box for this language: the most common drawing of the unassigned code points
+      let r = refCache.get(lang);
+      if (!r) {
+        const keys = REF_CPS.map(cp => draw(String.fromCodePoint(cp), lang, FONT_L, 96, 80));
+        const n = new Map(); for (const k of keys) n.set(k.key, (n.get(k.key) || 0) + 1);
+        const best = [...n.entries()].sort((a, b) => b[1] - a[1])[0];
+        r = { key: best[0], agree: best[1], of: keys.length, ink: keys.find(k => k.key === best[0]).ink };
+        refCache.set(lang, r);
+      }
+      return r;
+    }
+    const letterCache = new Map();
+    function letterState(ch, lang) {                          // 'ok' | 'tofu' | 'blank'
+      const k = lang + '|' + ch;
+      let v = letterCache.get(k);
+      if (!v) { const d = draw(ch, lang, FONT_L, 96, 80); v = d.ink === 0 ? 'blank' : (d.key === tofuRef(lang).key ? 'tofu' : 'ok'); letterCache.set(k, v); }
+      return v;
+    }
+
+    // ---- font probe (information only) ------------------------------------------------------------------------------------------------
+    const CAND = {
+      Devanagari: ['Nirmala UI', 'Mangal', 'Kokila', 'Utsaah', 'Aparajita'], Bengali: ['Nirmala UI', 'Vrinda', 'Shonar Bangla'],
+      Gurmukhi: ['Nirmala UI', 'Raavi'], Gujarati: ['Nirmala UI', 'Shruti'], Oriya: ['Nirmala UI', 'Kalinga'], Tamil: ['Nirmala UI', 'Latha', 'Vijaya'],
+      Telugu: ['Nirmala UI', 'Gautami', 'Vani'], Kannada: ['Nirmala UI', 'Tunga'], Malayalam: ['Nirmala UI', 'Kartika'], Sinhala: ['Nirmala UI', 'Iskoola Pota'],
+      Thai: ['Leelawadee UI', 'Tahoma', 'Leelawadee', 'Angsana New', 'Cordia New'], Lao: ['Leelawadee UI', 'DokChampa', 'Lao UI'],
+      Khmer: ['Leelawadee UI', 'Khmer UI', 'DaunPenh', 'MoolBoran'], Myanmar: ['Myanmar Text', 'Myanmar3'],
+      Georgian: ['Segoe UI', 'Sylfaen'], Armenian: ['Segoe UI', 'Sylfaen'], Ethiopic: ['Ebrima', 'Nyala'],
+      Arabic: ['Segoe UI', 'Tahoma', 'Arial', 'Times New Roman', 'Traditional Arabic', 'Simplified Arabic'], Hebrew: ['Segoe UI', 'Tahoma', 'Arial', 'David', 'Miriam'],
+      Cyrillic: ['Segoe UI', 'Tahoma', 'Arial'], Greek: ['Segoe UI', 'Tahoma', 'Arial'], Latin: ['Segoe UI', 'Tahoma', 'Arial'],
+    };
+    const CAND_LOC = {
+      'zh-CN': ['Microsoft YaHei', 'Microsoft YaHei UI', 'SimSun', 'SimHei', 'DengXian'],
+      'zh-TW': ['Microsoft JhengHei', 'Microsoft JhengHei UI', 'PMingLiU', 'MingLiU'], 'zh-HK': ['Microsoft JhengHei', 'Microsoft JhengHei UI', 'PMingLiU', 'MingLiU'],
+      'ja': ['Yu Gothic', 'Yu Gothic UI', 'Meiryo', 'Meiryo UI', 'MS Gothic', 'MS PGothic', 'MS UI Gothic'],
+      'ko': ['Malgun Gothic', 'Gulim', 'Dotum', 'Batang'],
+    };
+    const probeText = 'mmmmmmmmmmlliWW0Oo';
+    const widthOf = (font) => { const x = surface('en', 10, 10).x; x.font = font; return x.measureText(probeText).width; };
+    const probeCache = new Map();
+    function installed(name) {                                // a named font changes the width of a Latin text against all three generic fonts
+      let v = probeCache.get(name);
+      if (v === undefined) {
+        v = ['monospace', 'serif', 'sans-serif'].some(base => widthOf('64px "' + name + '", ' + base) !== widthOf('64px ' + base));
+        probeCache.set(name, v);
+      }
+      return v;
+    }
+    const candidatesFor = c => CAND_LOC[c.loc] || CAND[c.script] || [];
+
+    // ---- the data -----------------------------------------------------------------------------------------------------------------------
+    const isLM = /[\p{L}\p{M}]/u, isLatin = /\p{Script=Latin}/u, isCommon = /\p{Script=Common}/u, isInherited = /\p{Script=Inherited}/u;
+    const nameForm = new RegExp('Venetium|' + NAME_HI);
+    const langOf = c => c.loc === 'latin' ? 'en' : c.loc;
+    const prep = D.cases.map(c => {
+      const latin = c.script === 'Latin';
+      const letters = new Set(), foreign = new Set();
+      const allowedRe = latin ? null : new RegExp('[' + (c.allowed || [c.script]).map(a => '\\p{Script_Extensions=' + a + '}').join('') + ']', 'u');
+      for (const t of c.texts) for (const ch of t) {
+        if (!isLM.test(ch)) continue;
+        if (latin) { if (!isLatin.test(ch)) foreign.add(ch); else if (ch.codePointAt(0) > 0x7f) letters.add(ch); }
+        else if (!isLatin.test(ch) && !isCommon.test(ch)) { if (allowedRe.test(ch) || isInherited.test(ch)) letters.add(ch); else foreign.add(ch); }
+      }
+      const runs = [...new Set(c.texts.map(t => [...t].filter(ch => letters.has(ch)).join('')).filter(r => r))];
+      const step = Math.max(1, Math.floor(runs.length / 8));
+      return { c, lang: langOf(c), letters: [...letters], foreign: [...foreign], runs: runs.filter((_, i) => i % step === 0).slice(0, 8),
+               noName: c.texts.filter(t => !nameForm.test(t)).length };
+    });
+
+    // ---- controls: the test must be able to tell a glyph from the missing-glyph box ------------------------------------------------------
+    const ref = tofuRef('en');
+    const empty = draw('', 'en', FONT_L, 96, 80), space = draw(' ', 'en', FONT_L, 96, 80);
+    Kit.check('control: the reference code points are unassigned (no character, so no font can have a glyph)', 'all ' + REF_CPS.length + ' are \\p{Cn}',
+      REF_CPS.filter(cp => /\p{Cn}/u.test(String.fromCodePoint(cp))).length + ' of ' + REF_CPS.length, REF_CPS.every(cp => /\p{Cn}/u.test(String.fromCodePoint(cp))));
+    Kit.check('control: an empty canvas, and a space drawn with fillText, are blank (the blank test works)', 'blank, blank', (empty.ink === 0 ? 'blank' : 'has ink') + ', ' + (space.ink === 0 ? 'blank' : 'has ink'), empty.ink === 0 && space.ink === 0);
+    Kit.check('control: the missing-glyph box is visible and the same for every unassigned code point', REF_CPS.length + ' identical drawings, not blank',
+      ref.agree + ' identical, ' + (ref.ink ? 'not blank' : 'BLANK'), ref.agree === REF_CPS.length && ref.ink > 0 && ref.key !== empty.key);
+    const ctrl = ['A', '\u00e9', '\u0416', '\u03b1'].map(ch => [ch, letterState(ch, 'en')]);
+    Kit.check('control: A, é, Ж, α (Latin, Cyrillic, Greek) are drawn, neither empty nor the box', 'ok x4', ctrl.map(x => x[0] + ':' + x[1]).join(' '), ctrl.every(x => x[1] === 'ok'));
+    // the detector must be able to flag a box in a script's OWN language: an unassigned code point inside a script block, drawn with that block's
+    // lang, has no glyph in any font, so the same classifier the language rows below use must call it the missing-glyph box ("tofu"). A detector that
+    // always said "ok" would pass every language row; this control fails it. (Measured on the Server 2022 reference: all six give the same box as the
+    // Greek-block reference; the code points are asserted unassigned here, so a future Unicode that assigns one fails this control loudly instead of silently.)
+    const BLOCK_CPS = [['th', 0xe00], ['lo', 0xe80], ['km', 0x17de], ['am', 0x1249], ['bn', 0x984], ['he', 0x5c8]];     // Thai, Lao, Khmer, Ethiopic, Bengali, Hebrew
+    const blockRes = BLOCK_CPS.map(([lang, cp]) => { const ch = String.fromCodePoint(cp); return { lang, ch, unassigned: /\p{Cn}/u.test(ch), state: letterState(ch, lang) }; });
+    Kit.check('control: an unassigned code point inside a script block (U+0E00 Thai, U+0E80 Lao, U+17DE Khmer, ...) drawn with that block language is classified as the missing-glyph box (the detector can flag a box)',
+      'tofu x' + BLOCK_CPS.length, blockRes.map(r => r.lang + ' ' + cpHex(r.ch) + ':' + (r.unassigned ? '' : 'ASSIGNED(bad control) ') + r.state).join(' '),
+      blockRes.every(r => r.unassigned && r.state === 'tofu'));
+    // the language the canvas carries must reach the font choice: the same Han ideographs are drawn with the Japanese, the Simplified Chinese, the
+    // Traditional Chinese and the Korean font under ja, zh-CN, zh-TW and ko (four different UI fonts, regional glyph forms), so four different
+    // languages must give four different drawings of each character. If the canvas language were ignored, every language would draw the same
+    // default font, and the ja / ko / zh rows below would pass with ANY CJK font instead of testing the right one. (If a device lacks one of the
+    // four fonts, two languages fall back to the same font and this control fails: that is then a missing-font finding, named by the row.)
+    const HAN_CPS = [0x76f4, 0x9aa8, 0x4ee4, 0x9ad8], HAN_LANGS = ['ja', 'zh-CN', 'zh-TW', 'ko'];
+    const hanRes = HAN_CPS.map(cp => {
+      const ch = String.fromCodePoint(cp);
+      return { ch, distinct: new Set(HAN_LANGS.map(l => draw(ch, l, FONT_L, 96, 80).key)).size, states: HAN_LANGS.map(l => letterState(ch, l)) };
+    });
+    Kit.check('control: the canvas language is honoured: the Han characters U+76F4, U+9AA8, U+4EE4 and U+9AD8 drawn under ja, zh-CN, zh-TW and ko give four different drawings each (so the Han rows test the Japanese, Chinese and Korean fonts)',
+      HAN_LANGS.length + ' distinct drawings of each, every one drawn with a glyph', hanRes.map(r => cpHex(r.ch) + ': ' + r.distinct + ' distinct' + (r.states.every(s => s === 'ok') ? '' : ' (' + HAN_LANGS.map((l, i) => l + ' ' + r.states[i]).join(', ') + ')')).join('; '),
+      hanRes.every(r => r.distinct === HAN_LANGS.length && r.states.every(s => s === 'ok')));
+    Kit.info('canvas language', 'canvas lang attribute set; ctx.lang ' + ctxLang + '; font stack ' + UI);
+
+    // ---- the name itself in Devanagari (hi, ne) ---------------------------------------------------------------------------------------------
+    const hi = D.cases.find(c => c.loc === 'hi'), ne = D.cases.find(c => c.loc === 'ne');
+    const hiWord = (hi.texts[0].match(/[\u0900-\u097f]+/) || [''])[0];
+    const wantName = Kit.want(NAME_HI, CHROMIUM_HI);                                  // armed: planted wrong (the old name, क्रोमियम)
+    Kit.check('hi: the menu item "About Venetium" names Venetium in Devanagari (वेनेटियम)', wantName, hiWord, hiWord === wantName);
+    Kit.check('ne: the menu item "About Venetium" starts with the name in Devanagari (वेनेटियम)', NAME_HI + '…', ne.texts[0].slice(0, 12),
+      ne.texts[0].startsWith(NAME_HI));
+    Kit.check('hi: the name in Devanagari is in all ' + hi.texts.length + ' product-name strings', hi.texts.length + ' of ' + hi.texts.length,
+      hi.texts.filter(t => t.includes(NAME_HI)).length + ' of ' + hi.texts.length, hi.texts.every(t => t.includes(NAME_HI)));
+    Kit.check('hi, ne: no string still carries the old Devanagari name (क्रोमियम)', '0', String(D.cases.filter(c => c.loc === 'hi' || c.loc === 'ne')
+      .reduce((n, c) => n + c.texts.filter(t => t.includes(CHROMIUM_HI)).length, 0)), D.cases.filter(c => c.loc === 'hi' || c.loc === 'ne').every(c => c.texts.every(t => !t.includes(CHROMIUM_HI))));
+
+    for (const lang of ['hi', 'ne']) {                                                // the name on its own, as the menu draws it
+      const a = draw(NAME_HI, lang, FONT_S, 640, 48), tofu = draw('\u0378'.repeat([...NAME_HI].length), lang, FONT_S, 640, 48), old = draw(CHROMIUM_HI, lang, FONT_S, 640, 48);
+      Kit.check(lang + ': the name वेनेटियम drawn on its own has real glyphs: not blank, not a run of ' + [...NAME_HI].length + ' boxes, not the old name',
+        'ink, differs from tofu and from क्रोमियम', (a.ink ? 'ink' : 'BLANK') + ', ' + (a.key !== tofu.key ? 'differs from tofu' : 'SAME AS TOFU') + ', ' + (a.key !== old.key ? 'differs from the old name' : 'SAME AS OLD NAME'),
+        a.ink > 0 && a.key !== tofu.key && a.key !== old.key);
+    }
+
+    // ---- the data is what it claims to be -----------------------------------------------------------------------------------------------
+    nLocales = D.cases.reduce((n, c) => n + (c.locales ? c.locales.length : 1), 0);
+    const noName = prep.filter(p => p.noName);
+    Kit.check('data: every product-name string carries the name (Venetium, or वेनेटियम)', 'all strings of ' + nLocales + ' locales', noName.length ? noName.map(p => p.c.loc + ' ' + p.noName).join(', ') : 'all',
+      noName.length === 0);
+    const foreign = prep.filter(p => p.foreign.length);
+    Kit.check('data: the native letters of each locale are all in its script (no corrupted text)', 'every letter in its script', foreign.length ? foreign.map(p => p.c.loc + ':' + p.foreign.map(cpHex).join(',')).join(' ') : 'yes',
+      foreign.length === 0);
+    const few = prep.filter(p => p.letters.length < (p.c.script === 'Latin' ? 20 : 3));
+    Kit.check('data: every locale has native letters to test (at least 3, Latin accents at least 20)', 'enough', few.length ? few.map(p => p.c.loc + ':' + p.letters.length).join(' ') : prep.map(p => p.letters.length).reduce((a, b) => a + b, 0) + ' letters in ' + prep.length + ' cases', few.length === 0);
+
+    // ---- one row per language/script -----------------------------------------------------------------------------------------------------
+    let skipped = 0, rendered = 0;
+    for (const p of prep) {
+      if (performance.now() - t0 > BUDGET_MS) { skipped++; continue; }
+      await yieldNow();
+      const { c, lang } = p;
+      const states = p.letters.map(ch => [ch, letterState(ch, lang)]);
+      const bad = states.filter(s => s[1] !== 'ok');
+      const tofu = tofuRef(lang);
+      const runRes = p.runs.map(r => {
+        const a = draw(r, lang, FONT_S, 640, 48), b = draw('\u0378'.repeat([...r].length), lang, FONT_S, 640, 48);
+        return a.ink > 0 && a.key !== b.key;
+      });
+      // (a check that each whole string has ink was dropped: every string contains the Latin name, so it always has ink - and a box has ink too - which made it vacuous)
+      // which font: only native letters are drawn, so the Latin part of the strings cannot decide
+      const cands = candidatesFor(c).filter(installed), absent = candidatesFor(c).filter(n => !installed(n));
+      const nativeRun = p.runs[0] || '';
+      let who = 'unknown';
+      if (nativeRun) {
+        const base = draw(nativeRun, lang, FONT_S, 640, 48).key;
+        const same = cands.filter(n => draw(nativeRun, lang, '24px "' + n + '", ' + UI, 640, 48).key === base);
+        who = same.length ? 'consistent with ' + same.join(' / ') : (cands.length ? 'none of the installed ' + cands.join(', ') + ' matches' : 'no candidate font found installed');
+      }
+      picked.push({ loc: c.loc, script: c.script, who, absent });
+      const ok = bad.length === 0 && runRes.every(Boolean) && tofu.ink > 0 && p.letters.length > 0;
+      const title = 'fonts ' + (c.loc === 'latin' ? 'Latin script (' + c.locales.length + ' locales: ' + c.locales.join(' ') + ')' : c.loc + ' ' + c.script + (c.shipped ? '' : ' (translation only, not a shipped locale)'));
+      const got = p.letters.length + ' letters' + (bad.length ? ', NOT RENDERED: ' + bad.slice(0, 12).map(s => cpHex(s[0]) + ' ' + s[1]).join(', ') + (bad.length > 12 ? ' (+' + (bad.length - 12) + ')' : '') : ', none missing')
+        + '; ' + runRes.filter(Boolean).length + '/' + runRes.length + ' string runs differ from tofu; font ' + who
+        + (bad.length && absent.length ? '; fonts not found here: ' + absent.join(', ') : '');
+      Kit.check(title, 'every letter drawn with a glyph (not the box, not blank); each string run differs from tofu', got, ok);
+      rendered++;
+    }
+    if (skipped) Kit.check('fonts: all cases checked within ' + BUDGET_MS / 1000 + ' s', '0 skipped', skipped + ' skipped', false);
+
+    // ---- information: fonts and scope -------------------------------------------------------------------------------------------------------
+    const allNames = [...new Set([].concat(...Object.values(CAND), ...Object.values(CAND_LOC)))];
+    Kit.info('fonts found installed (probe by metrics)', allNames.filter(installed).join(', '));
+    Kit.info('fonts not found (not installed, or with no Latin glyphs for the probe)', allNames.filter(n => !installed(n)).join(', '));
+    Kit.info('font that drew each script (inference by identical pixels)', picked.map(x => x.loc + ' ' + x.script + ': ' + x.who).join(' | '));
+    const shippedLocs = D.cases.filter(c => c.shipped && c.loc !== 'latin').map(c => c.loc), unshipped = D.cases.filter(c => !c.shipped).map(c => c.loc + ' ' + c.script);
+    Kit.info('scope', nLocales + ' translations tested in ' + D.cases.length + ' cases; non-Latin shipped locales: ' + shippedLocs.join(' ') + '; translation-only (no locale pak in this build): ' + unshipped.join(', '));
+    Kit.info('ui', navigator.userAgent + ' | languages ' + (navigator.languages || []).join(','));
+
+    // ---- the specimen: what the person sees ---------------------------------------------------------------------------------------------------
+    const st = document.createElement('style');
+    st.textContent = '#spec{margin:14px 0}#spec h2{font:bold 15px "Segoe UI",Arial,sans-serif;margin:6px 0}#spec .r{display:flex;gap:10px;align-items:baseline;border-bottom:1px solid #ddd;padding:2px 0}' +
+      '#spec .l{flex:0 0 190px;font:12px Consolas,monospace;color:#444}#spec .t{font:22px "Segoe UI",Arial,sans-serif}';
+    document.head.appendChild(st);
+    const spec = document.createElement('div'); spec.id = 'spec';
+    spec.innerHTML = '<h2>What the browser draws (a box instead of letters means a missing font; the checks above test each letter)</h2>';
+    for (const c of D.cases) {
+      const r = document.createElement('div'); r.className = 'r';
+      const l = document.createElement('div'); l.className = 'l'; l.textContent = c.loc === 'latin' ? 'Latin script' : c.loc + ' ' + c.script + (c.shipped ? '' : ' *');
+      const t = document.createElement('div'); t.className = 't'; t.lang = langOf(c);
+      t.textContent = c.loc === 'latin' ? [...new Set(c.texts.join('').match(/[\u00c0-\u024f\u1e00-\u1eff]/g) || [])].join(' ') : c.texts[0] + '   ' + c.texts[1];
+      r.append(l, t); spec.appendChild(r);
+    }
+    const foot = document.createElement('div'); foot.style.cssText = 'font:12px Consolas,monospace;color:#444;margin-top:4px'; foot.textContent = '* translation only: no locale pak of this build';
+    spec.appendChild(foot);
+    document.body.appendChild(spec);
+  } catch (e) {
+    Kit.check('page: ran to the end with no exception (a data file that did not load counts)', 'no exception', String(e && (e.stack || e)).slice(0, 600), false);
+  }
+  if (holder) holder.remove();
+  await Kit.done({ fonts: picked, cases: nCases, locales: nLocales, ms: Math.round(performance.now() - t0) });
+})();
+</script>

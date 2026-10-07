@@ -1,0 +1,51 @@
+Venetium 0043 - ARM32 renderer lockdown token USER_LIMITED (fixes the sandboxed-renderer DLL-load death on Windows 10 ARM32 /
+Tegra, build 15035). PROVEN cause (his device, 2026-10-07): Windows 10's parallel module loader maps a process's DLLs on
+LoaderWorker threads that run under the process PRIMARY token. Chromium creates the renderer with the USER_LOCKDOWN primary token
+(its only restricting SID is the NULL SID) and impersonates the permissive initial token on the MAIN thread only (broker_services.cc),
+which the loader worker threads do not share -- so every DLL file open on a worker thread fails and the renderer dies before it can
+log. Setting IFEO MaxLoaderThreads=1 for venetium.exe (serial loading) makes pages load, confirming the cause; but serial loading
+slows every process startup noticeably on Tegra, so this patch keeps the parallel loader fully enabled and instead lowers ONLY the
+ARM32 renderer's lockdown token to USER_LIMITED -- the exact token the GPU process already runs with successfully on this hardware
+(content/browser/gpu/gpu_process_host.cc: "we gotten as far as USER_LIMITED; USER_RESTRICTED breaks DirectX+OpenGL"). USER_LIMITED's
+restricting SIDs (Users/World/RESTRICTED/logon) let the loader worker threads read the application and system DLLs, while still
+enforcing a real restricted-token sandbox (integrity stays LOW -> delayed UNTRUSTED, lockdown job, win32k lockdown, all mitigations).
+Weaker than USER_LOCKDOWN, far stronger than --no-sandbox. The override is placed in the renderer delegate's InitializeConfig, which
+sandbox_win.cc invokes AFTER AddDefaultConfigForSandboxedProcess() has set USER_LOCKDOWN, so the second SetTokenLevel() cleanly
+overrides it (ConfigBase::SetTokenLevel only stores the levels and checks initial>=lockdown). Guarded by ARCH_CPU_ARMEL so the x86
+build keeps USER_LOCKDOWN. Supersedes 0038 (its S-1-5-12 app-dir grant was built on the wrong premise and is unnecessary under
+USER_LIMITED, where Users/World already read the app dir); 0038 is dropped from the series.
+
+--- a/content/browser/renderer_host/renderer_sandboxed_process_launcher_delegate.cc
++++ b/content/browser/renderer_host/renderer_sandboxed_process_launcher_delegate.cc
+@@ -108,6 +108,31 @@ bool RendererSandboxedProcessLauncherDelegateWin::InitializeConfig(
+     sandbox::TargetConfig* config) {
+   DCHECK(!config->IsConfigured());
+
++#if defined(ARCH_CPU_ARMEL)
++  // Venetium 0043: Windows 10 ARM32 (Tegra, build 15035) maps a process's
++  // DLLs on parallel loader worker threads that run under the process PRIMARY
++  // token. Chromium creates the renderer with the USER_LOCKDOWN primary token
++  // (its only restricting SID is the NULL SID) and impersonates the permissive
++  // initial token on the MAIN thread only -- which the loader worker threads
++  // do not share. Every DLL file open on a worker thread therefore fails and
++  // the renderer dies before it can log. Give the ARM32 renderer the
++  // USER_LIMITED lockdown token instead: it is the exact token the GPU process
++  // already runs with successfully on this hardware (see gpu_process_host.cc),
++  // and its restricting SIDs (Users/World/RESTRICTED/logon) let the loader
++  // worker threads read the application and system DLLs while still enforcing a
++  // real restricted-token sandbox. This overrides the USER_LOCKDOWN set by
++  // AddDefaultConfigForSandboxedProcess(), which runs before this delegate
++  // hook. Preferred over disabling the parallel loader, which serializes
++  // process startup and is noticeably slow on Tegra.
++  {
++    const sandbox::ResultCode result = config->SetTokenLevel(
++        sandbox::USER_RESTRICTED_SAME_ACCESS, sandbox::USER_LIMITED);
++    if (result != sandbox::SBOX_ALL_OK) {
++      return false;
++    }
++  }
++#endif  // defined(ARCH_CPU_ARMEL)
++
+   sandbox::policy::SandboxWin::AddBaseHandleClosePolicy(config);
+
+   ContentBrowserClient::AppContainerFlags ac_flags(

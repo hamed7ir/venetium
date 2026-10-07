@@ -1,0 +1,694 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Venetium kit — canvas-webgl</title>
+<style>
+  #gallery { display: flex; flex-wrap: wrap; gap: 12px; margin: 14px 0 6px; }
+  #gallery figure { margin: 0; font: 11px Arial, sans-serif; max-width: 330px; }
+  #gallery canvas { border: 1px solid #888; image-rendering: pixelated; background: #fff; display: block; }
+</style>
+<script src="lib/configs.js"></script>
+<script src="lib/build.js"></script>
+<script src="lib/kit.js"></script>
+<script src="lib/canvas-webgl-model.js"></script>
+<script src="data/canvas-webgl-golden.js"></script>
+<script>
+// BATCH-X86-2 §1 page canvas-webgl: 2D canvas with pixel checksums, WebGL 1 and WebGL 2.
+//  * The 2D checks are real checks everywhere. The "exact" scene (lib/canvas-webgl-model.js) uses only integer, axis-aligned,
+//    opaque drawing, so its pixels are predicted by an independent software model and by golden values made under Node
+//    (data/canvas-webgl-golden.js): any difference is the canvas, or the JS engine running the model. Anti-aliased shapes, gradients,
+//    blurs and text are checked with tolerances (or only reported), because those are backend / font dependent.
+//  * WebGL: the requirement is per version and comes from the run (URL ?webgl=..., or window.KIT_BUILD.webgl from lib/build.js, written
+//    by the packaging step), never from the browser under test: 'required' = WebGL 1 must exist (WebGL 2 is reported only: a GPU at
+//    Direct3D feature level 9_x gives WebGL 1 but no WebGL 2); 'webgl2' = WebGL 1 and WebGL 2 must both exist; nothing = neither is
+//    required. A missing context that is required is a failed check. A missing context that is not required is information
+//    (Kit.info) and the page says so loudly: WebGL 1 missing (no WebGL at all) gets a RED banner, the info row "WebGL coverage" and
+//    result.webglTested, so a PASS with skipped WebGL cannot be mistaken for a WebGL pass; WebGL 2 missing while WebGL 1 works gets a
+//    GREY information banner only (normal, not a defect, and not red); a required version that is missing is red. An unrecognised
+//    setting value is a failed check (a typo must not silently run unrequired). When a context exists it is checked for real:
+//    strings, clear + readPixels, shaders (compile, link, active attribute and uniforms), textures, FBO, depth, blend, 2D-canvas interop.
+//  * No V8 natives here: this page does not prove a tier (js-f1 / js-jit do); it feeds the JS engine integer pixel arithmetic.
+(async () => {
+  const timings = {}; let current = 'start';
+  // `stopped` goes true when the result is published. main() can still be running then (a hung section, a late continuation); from
+  // that moment the page's own Kit.check / Kit.info / Kit.na calls do nothing, so nothing is added to a result that is already out.
+  let stopped = false;
+  const KitReal = window.Kit;
+  const Kit = Object.create(KitReal);
+  Kit.check = (...a) => stopped ? false : KitReal.check(...a);
+  Kit.info = (...a) => { if (!stopped) KitReal.info(...a); };
+  Kit.na = (...a) => { if (!stopped) KitReal.na(...a); };
+  if (!window.CW || !window.CW_GOLDEN) {   // a missing script file: report it instead of throwing at the first use of CW
+    KitReal.check('page: its scripts loaded (lib/canvas-webgl-model.js, data/canvas-webgl-golden.js)', 'CW and CW_GOLDEN defined', 'CW is ' + typeof window.CW + ', CW_GOLDEN is ' + typeof window.CW_GOLDEN, false);
+    await KitReal.done({ timings, webgl: {} });
+    return;
+  }
+  const GOLD = window.CW_GOLDEN, CW = window.CW, W = CW.W, H = CW.H, hx = CW.hex;
+  // does this run require WebGL? (a requirement of the run, not something the browser under test tells us)
+  // 'required' = WebGL 1 required (WebGL 2 reported only); 'webgl2' = WebGL 1 and 2 required; absent = nothing required. The stricter of the
+  // URL and lib/build.js wins; any other value is reported as a failed check below and ignored.
+  const WEBGL_SOURCES = [['the URL ?webgl=', new URLSearchParams(location.search).get('webgl')], ['lib/build.js KIT_BUILD.webgl = ', KitReal.build ? KitReal.build.webgl : null]]
+    .filter(s => s[1] !== null && s[1] !== undefined && s[1] !== '' && s[1] !== false);
+  const WEBGL_SETTING = WEBGL_SOURCES.some(s => s[1] === 'webgl2') ? 'webgl2' : WEBGL_SOURCES.some(s => s[1] === 'required') ? 'required' : 'none';
+  const WEBGL_FROM = WEBGL_SETTING === 'none' ? 'no requirement' : WEBGL_SOURCES.filter(s => s[1] === WEBGL_SETTING).map(s => s[0] + JSON.stringify(s[1])).join(' and ');
+  const REQ = { 1: WEBGL_SETTING !== 'none', 2: WEBGL_SETTING === 'webgl2' };   // which WebGL versions this run requires
+  const REQ_TEXT = { none: 'no WebGL version', required: 'WebGL 1 only (WebGL 2 is reported)', webgl2: 'WebGL 1 and WebGL 2' }[WEBGL_SETTING];
+  const BAD_SETTINGS = WEBGL_SOURCES.filter(s => s[1] !== 'required' && s[1] !== 'webgl2');
+  if (BAD_SETTINGS.length) Kit.check('the WebGL requirement setting is recognised', 'absent, "required" (WebGL 1) or "webgl2" (WebGL 1 and 2)', BAD_SETTINGS.map(s => s[0] + JSON.stringify(s[1])).join(', ') + ' (ignored: no WebGL version is required by it)', false);
+  let bannerKind = 'none';   // 'none' | 'grey' | 'red': what glCoverage() showed at the top of the page
+  const glTested = { 1: false, 2: false };   // true once a context of that version existed and its checks ran
+  const T =(p, ms, what) => new Promise((res, rej) => {
+    const t = setTimeout(() => rej(new Error('timeout after ' + ms + ' ms: ' + what)), ms);
+    p.then(v => { clearTimeout(t); res(v); }, e => { clearTimeout(t); rej(e); });
+  });
+  const near = (a, b, t) => a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) <= t);
+  const fmt = a => '(' + Array.from(a).join(',') + ')';
+  const mk = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+  const ctxOf = c => c.getContext('2d', { willReadFrequently: true });
+  const px2 = (ctx, x, y) => Array.from(ctx.getImageData(x, y, 1, 1).data);
+  const loadImage = (src, ms) => T(new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('image failed to load')); i.src = src; }), ms || 10000, 'image load');
+  const toBlob = (c, type, q) => T(new Promise(res => c.toBlob(res, type, q)), 10000, 'toBlob ' + type);
+  const magic = async b => Array.from(new Uint8Array(await b.slice(0, 12).arrayBuffer()));
+  const hexs = a => a.map(v => ('0' + v.toString(16)).slice(-2)).join('');
+  function diffPx(got, want) {
+    let n = 0, first = null;
+    for (let i = 0; i < want.length; i += 4) {
+      if (got[i] !== want[i] || got[i + 1] !== want[i + 1] || got[i + 2] !== want[i + 2] || got[i + 3] !== want[i + 3]) {
+        if (!n) first = { x: (i >> 2) % W, y: ((i >> 2) / W) | 0, got: fmt([got[i], got[i + 1], got[i + 2], got[i + 3]]), want: fmt([want[i], want[i + 1], want[i + 2], want[i + 3]]) };
+        n++;
+      }
+    }
+    return { n, first };
+  }
+  const diffText = d => d.n + ' differing pixel(s)' + (d.first ? ', first at (' + d.first.x + ',' + d.first.y + ') got ' + d.first.got + ' want ' + d.first.want : '');
+  async function sec(name, fn) {
+    if (stopped) return;
+    current = name; const t = performance.now();
+    try { await fn(); } catch (e) { Kit.check(name + ': ran without an exception', 'no exception', (e && e.name ? e.name + ': ' : '') + (e && e.message || e), false); }
+    timings[name] = Math.round(performance.now() - t);
+  }
+  if (document.readyState === 'loading') await new Promise(r => document.addEventListener('DOMContentLoaded', r));
+  const gallery = document.createElement('div'); gallery.id = 'gallery'; document.body.appendChild(gallery);
+  function show(label, canvas, w, h) {
+    const f = document.createElement('figure'); canvas.style.width = w + 'px'; canvas.style.height = h + 'px'; f.appendChild(canvas);
+    const c = document.createElement('figcaption'); c.textContent = label; f.appendChild(c); gallery.appendChild(f); return canvas;
+  }
+  // Everything below runs under a page watchdog (see the end): a section that never returns must fail, not hang.
+  async function main() {
+    const ops = CW.scene();
+    let modelPx = null, sceneCanvas = null;
+
+    // ===================================================== 2D: the exact scene =====================================================
+    await sec('reference model', async () => {
+      const opsCrc = hx(CW.crcStr(JSON.stringify(ops)));
+      Kit.check('scene generator reproduces the golden operation list (JS engine, no canvas)', GOLD.opsCrc + ' (' + GOLD.ops + ' ops)', opsCrc + ' (' + ops.length + ' ops)', opsCrc === GOLD.opsCrc && ops.length === GOLD.ops);
+      const crcs = [];
+      for (let i = 0; i < 3; i++) { modelPx = CW.model(ops); crcs.push(hx(CW.crc32(modelPx))); }
+      Kit.check('reference model (software rasteriser in JS) reproduces the golden CRC32, 3 runs (JS engine, no canvas)', GOLD.crc, crcs.join(' '), crcs.every(c => c === GOLD.crc));
+    });
+    if (!modelPx) modelPx = CW.model(ops);
+
+    await sec('2d exact scene', async () => {
+      const cv = show('2D exact scene, default context (x2)', mk(W, H), W * 2, H * 2);
+      const ctx = cv.getContext('2d');
+      Kit.info('2D context attributes (default context)', ctx.getContextAttributes ? JSON.stringify(ctx.getContextAttributes()) : 'getContextAttributes missing');
+      CW.render(ctx, ops);
+      const d = ctx.getImageData(0, 0, W, H).data;
+      const crc = hx(CW.crc32(d));
+      const want = Kit.want(GOLD.crc, GOLD.crc.slice(0, 7) + (GOLD.crc[7] === '0' ? '1' : '0'));   // armed: the planted wrong expectation
+      Kit.check('2D canvas (default context): CRC32 of the ' + W + 'x' + H + ' exact scene = golden', want, crc, crc === want);
+      const df = diffPx(d, modelPx);
+      Kit.check('2D canvas: every pixel of the exact scene equals the reference model (' + W * H + ' pixels, ' + GOLD.transparentPixels + ' transparent)', '0 differing pixel(s)', diffText(df), df.n === 0);
+    });
+
+    await sec('2d exact scene, software canvas', async () => {
+      const cv = show('2D exact scene, willReadFrequently (x2)', mk(W, H), W * 2, H * 2);
+      sceneCanvas = cv;
+      const ctx = cv.getContext('2d', { willReadFrequently: true });
+      CW.render(ctx, ops);
+      const crc = hx(CW.crc32(ctx.getImageData(0, 0, W, H).data));
+      Kit.check('2D canvas (willReadFrequently, software): CRC32 of the exact scene = golden', GOLD.crc, crc, crc === GOLD.crc);
+      // a canvas reset (width = width) clears it, and drawing again gives the same bytes
+      const w0 = cv.width; cv.width = w0;
+      const cleared = px2(ctx, 80, 60).concat(px2(ctx, 0, 0));
+      Kit.check('canvas.width = canvas.width clears the canvas (transparent black)', '(0,0,0,0)(0,0,0,0)', fmt(cleared.slice(0, 4)) + fmt(cleared.slice(4)), cleared.every(v => v === 0));
+      CW.render(ctx, ops);
+      const crc2 = hx(CW.crc32(ctx.getImageData(0, 0, W, H).data));
+      Kit.check('after the reset the scene drawn again gives the golden CRC32', GOLD.crc, crc2, crc2 === GOLD.crc);
+    });
+
+    await sec('offscreen canvas', async () => {
+      if (typeof OffscreenCanvas === 'undefined') { Kit.na('OffscreenCanvas exact scene', 'OffscreenCanvas is not defined in this browser'); return; }
+      const oc = new OffscreenCanvas(W, H), ctx = oc.getContext('2d');
+      if (!ctx) { Kit.check('OffscreenCanvas getContext("2d")', 'a context', 'null', false); return; }
+      CW.render(ctx, ops);
+      const crc = hx(CW.crc32(ctx.getImageData(0, 0, W, H).data));
+      Kit.check('OffscreenCanvas (main thread): CRC32 of the exact scene = golden', GOLD.crc, crc, crc === GOLD.crc);
+    });
+
+    // ----- encode + decode round trips of the exact scene
+    await sec('png round trip', async () => {
+      const png = await toBlob(sceneCanvas, 'image/png');
+      const mg = png ? await magic(png) : [];
+      Kit.check('canvas.toBlob("image/png") yields a PNG', 'type image/png, bytes 89504e470d0a1a0a', (png ? png.type + ', ' + png.size + ' bytes, ' : 'null blob, ') + hexs(mg.slice(0, 8)), !!png && png.type === 'image/png' && hexs(mg.slice(0, 8)) === '89504e470d0a1a0a' && png.size > 200);
+      const url = URL.createObjectURL(png);
+      const im = await loadImage(url);
+      const c = mk(W, H), x = ctxOf(c); x.drawImage(im, 0, 0);
+      const crc = hx(CW.crc32(x.getImageData(0, 0, W, H).data));
+      Kit.check('PNG blob: URL decoded by <img> and drawn back: CRC32 = golden (lossless round trip, incl. transparent holes)', GOLD.crc, crc + ' (' + im.naturalWidth + 'x' + im.naturalHeight + ')', crc === GOLD.crc && im.naturalWidth === W && im.naturalHeight === H);
+      URL.revokeObjectURL(url);
+      const du = sceneCanvas.toDataURL('image/png');
+      const im2 = await loadImage(du);
+      const c2 = mk(W, H), x2 = ctxOf(c2); x2.drawImage(im2, 0, 0);
+      const crc2 = hx(CW.crc32(x2.getImageData(0, 0, W, H).data));
+      Kit.check('toDataURL("image/png") decoded by <img> and drawn back: CRC32 = golden', GOLD.crc, crc2 + ' (data URL ' + du.length + ' chars)', crc2 === GOLD.crc && du.indexOf('data:image/png;base64,') === 0);
+    });
+
+    await sec('createImageBitmap', async () => {
+      const bmp = await T(createImageBitmap(sceneCanvas), 10000, 'createImageBitmap');
+      const c = mk(W, H), x = ctxOf(c); x.drawImage(bmp, 0, 0);
+      const crc = hx(CW.crc32(x.getImageData(0, 0, W, H).data));
+      Kit.check('createImageBitmap(canvas) drawn back: CRC32 = golden', GOLD.crc, crc + ' (' + bmp.width + 'x' + bmp.height + ')', crc === GOLD.crc && bmp.width === W && bmp.height === H);
+      if (bmp.close) bmp.close();
+    });
+
+    // ----- lossy encoders: a JPEG-friendly picture, tolerance on the mean absolute error
+    await sec('lossy encoders', async () => {
+      const w = 128, h = 96, src = mk(w, h), s = ctxOf(src);
+      const quad = [['rgb(200,40,40)', 0, 0], ['rgb(40,200,40)', 64, 0], ['rgb(40,40,200)', 0, 36], ['rgb(220,220,60)', 64, 36]];
+      for (const [c, x, y] of quad) { s.fillStyle = c; s.fillRect(x, y, 64, 36); }
+      const g = s.createLinearGradient(0, 0, w, 0); g.addColorStop(0, '#000'); g.addColorStop(1, '#fff'); s.fillStyle = g; s.fillRect(0, 72, w, 24);
+      const ref = s.getImageData(0, 0, w, h).data;
+      function mae(d) { let sum = 0, mx = 0; for (let i = 0; i < ref.length; i += 4) for (let k = 0; k < 3; k++) { const e = Math.abs(d[i + k] - ref[i + k]); sum += e; if (e > mx) mx = e; } return { mae: sum / (w * h * 3), max: mx }; }
+      for (const [type, q, sig, limit] of [['image/jpeg', 0.92, 'ffd8ff', 4], ['image/webp', 0.9, '52494646', 4]]) {
+        const b = await toBlob(src, type, q);
+        if (!b || b.type !== type) { Kit.info('toBlob(' + type + ') encoder', 'not provided: got ' + (b ? b.type : 'null') + ' (falls back to PNG)'); continue; }
+        const m = await magic(b);
+        const sigOk = hexs(m).indexOf(sig) === 0 && (type !== 'image/webp' || hexs(m.slice(8, 12)) === '57454250');
+        Kit.check('toBlob(' + type + ') yields a valid container', 'signature ' + sig + (type === 'image/webp' ? '..57454250' : ''), hexs(m) + ', ' + b.size + ' bytes', sigOk && b.size > 100);
+        const url = URL.createObjectURL(b); const im = await loadImage(url); URL.revokeObjectURL(url);
+        const c = mk(w, h), x = ctxOf(c); x.drawImage(im, 0, 0);
+        const r = mae(x.getImageData(0, 0, w, h).data);
+        Kit.check(type + ' encode + decode: mean absolute RGB error (picture of flat blocks and a gradient, quality ' + q + ')', '<= ' + limit + ', size ' + w + 'x' + h, r.mae.toFixed(2) + ' (max ' + r.max + '), ' + im.naturalWidth + 'x' + im.naturalHeight + ', ' + b.size + ' bytes', r.mae <= limit && im.naturalWidth === w && im.naturalHeight === h);
+      }
+    });
+
+    // ===================================================== 2D: tolerance checks (anti-aliasing, blends, gradients) ================
+    await sec('2d blends', async () => {
+      let c = mk(8, 8), x = ctxOf(c);
+      x.fillStyle = '#fff'; x.fillRect(0, 0, 8, 8); x.fillStyle = 'rgba(255,0,0,0.5)'; x.fillRect(0, 0, 8, 8);
+      let p = px2(x, 3, 3);
+      Kit.check('source-over: rgba(255,0,0,0.5) over opaque white', '(255,128,128,255) +-1', fmt(p), near(p, [255, 128, 128, 255], 1));
+      x.clearRect(0, 0, 8, 8); x.globalAlpha = 0.25; x.fillStyle = '#000'; x.fillRect(0, 0, 8, 8); p = px2(x, 3, 3);
+      Kit.check('globalAlpha 0.25 black on transparent: alpha 64 +-1, colour black', '(0,0,0,64) +-1', fmt(p), near(p, [0, 0, 0, 64], 1));
+      // xor
+      c = mk(40, 40); x = ctxOf(c);
+      x.fillStyle = 'rgb(255,0,0)'; x.fillRect(0, 0, 20, 20); x.globalCompositeOperation = 'xor'; x.fillStyle = 'rgb(0,255,0)'; x.fillRect(10, 10, 20, 20);
+      let r = [px2(x, 5, 5), px2(x, 15, 15), px2(x, 25, 25), px2(x, 35, 35)];
+      Kit.check('composite xor: red | overlap | green | outside', '(255,0,0,255) (0,0,0,0) (0,255,0,255) (0,0,0,0)', r.map(fmt).join(' '), near(r[0], [255, 0, 0, 255], 0) && near(r[1], [0, 0, 0, 0], 0) && near(r[2], [0, 255, 0, 255], 0) && near(r[3], [0, 0, 0, 0], 0));
+      // destination-out and destination-over
+      c = mk(20, 20); x = ctxOf(c);
+      x.fillStyle = 'rgb(255,0,0)'; x.fillRect(0, 0, 10, 20); x.globalCompositeOperation = 'destination-over'; x.fillStyle = 'rgb(0,0,255)'; x.fillRect(0, 0, 20, 20);
+      r = [px2(x, 5, 5), px2(x, 15, 5)];
+      Kit.check('composite destination-over: red stays on top where it is, blue behind elsewhere', '(255,0,0,255) (0,0,255,255)', r.map(fmt).join(' '), near(r[0], [255, 0, 0, 255], 0) && near(r[1], [0, 0, 255, 255], 0));
+      x.globalCompositeOperation = 'destination-out'; x.fillStyle = '#000'; x.fillRect(0, 0, 10, 20); r = [px2(x, 5, 5), px2(x, 15, 5)];
+      Kit.check('composite destination-out: the covered half is erased, the rest stays', '(0,0,0,0) (0,0,255,255)', r.map(fmt).join(' '), near(r[0], [0, 0, 0, 0], 0) && near(r[1], [0, 0, 255, 255], 0));
+      // lighter and multiply
+      c = mk(8, 8); x = ctxOf(c);
+      x.fillStyle = 'rgb(100,50,0)'; x.fillRect(0, 0, 8, 8); x.globalCompositeOperation = 'lighter'; x.fillStyle = 'rgb(100,100,100)'; x.fillRect(0, 0, 8, 8); p = px2(x, 4, 4);
+      Kit.check('composite lighter: (100,50,0) + (100,100,100)', '(200,150,100,255) +-1', fmt(p), near(p, [200, 150, 100, 255], 1));
+      c = mk(8, 8); x = ctxOf(c);
+      x.fillStyle = 'rgb(128,128,128)'; x.fillRect(0, 0, 8, 8); x.globalCompositeOperation = 'multiply'; x.fillStyle = 'rgb(128,128,128)'; x.fillRect(0, 0, 8, 8); p = px2(x, 4, 4);
+      Kit.check('composite multiply: 128 x 128 / 255', '(64,64,64,255) +-1', fmt(p), near(p, [64, 64, 64, 255], 1));
+    });
+
+    await sec('2d shadows and filters', async () => {
+      let c = mk(80, 80), x = ctxOf(c);
+      x.shadowColor = 'rgb(255,0,0)'; x.shadowOffsetX = 10; x.shadowOffsetY = 5; x.shadowBlur = 0; x.fillStyle = 'rgb(0,0,255)'; x.fillRect(20, 20, 30, 30);
+      let r = [px2(x, 25, 25), px2(x, 55, 53), px2(x, 58, 30), px2(x, 15, 15), px2(x, 25, 52)];
+      Kit.check('shadow without blur, offset (10,5): blue box, red shadow right and below, nothing outside', '(0,0,255,255) (255,0,0,255) (255,0,0,255) (0,0,0,0) (0,0,0,0)', r.map(fmt).join(' '),
+        near(r[0], [0, 0, 255, 255], 0) && near(r[1], [255, 0, 0, 255], 0) && near(r[2], [255, 0, 0, 255], 0) && near(r[3], [0, 0, 0, 0], 0) && near(r[4], [0, 0, 0, 0], 0));
+      c = mk(100, 100); x = ctxOf(c);
+      x.shadowColor = 'rgb(0,0,0)'; x.shadowBlur = 10; x.fillStyle = 'rgb(255,255,255)'; x.fillRect(30, 30, 40, 40);
+      const a = (px, py) => px2(x, px, py)[3];
+      const near3 = a(27, 50), far = a(5, 50), sym = [Math.abs(a(29 - 2, 50) - a(70 + 2, 50)), Math.abs(a(50, 29 - 2) - a(50, 70 + 2))];
+      Kit.check('shadowBlur 10: soft edge 3 px outside the box (alpha 20..180), nothing 25 px away, left/right and top/bottom symmetric (+-2)', 'alpha 20..180, 0, symmetric', 'alpha ' + near3 + ', ' + far + ', asym ' + sym.join('/'), near3 >= 20 && near3 <= 180 && far === 0 && sym[0] <= 2 && sym[1] <= 2);
+      if (!('filter' in x)) { Kit.na('ctx.filter', 'CanvasRenderingContext2D.filter is not available in this browser'); return; }
+      c = mk(20, 20); x = ctxOf(c);
+      x.filter = 'invert(1)'; x.fillStyle = 'rgb(10,20,30)'; x.fillRect(2, 2, 16, 16); x.filter = 'none';
+      const p = px2(x, 10, 10), q = px2(x, 0, 0);
+      Kit.check('ctx.filter = invert(1) on a (10,20,30) box', '(245,235,225,255) +-2 inside, (0,0,0,0) outside', fmt(p) + ' ' + fmt(q), near(p, [245, 235, 225, 255], 2) && near(q, [0, 0, 0, 0], 0));
+      c = mk(60, 60); x = ctxOf(c);
+      x.filter = 'blur(4px)'; x.fillStyle = '#000'; x.fillRect(20, 20, 20, 20); x.filter = 'none';
+      const edge = px2(x, 20, 30)[3], mid = px2(x, 30, 30)[3], out = px2(x, 2, 30)[3];
+      Kit.check('ctx.filter = blur(4px): box centre opaque, edge half-covered (alpha 60..200), 18 px away empty', 'centre >= 240, edge 60..200, away 0', 'centre ' + mid + ', edge ' + edge + ', away ' + out, mid >= 240 && edge >= 60 && edge <= 200 && out === 0);
+    });
+
+    await sec('2d anti-aliased shapes', async () => {
+      const c = mk(80, 80), x = ctxOf(c);
+      x.fillStyle = '#000'; x.beginPath(); x.arc(40, 40, 30, 0, Math.PI * 2); x.fill();
+      const d = x.getImageData(0, 0, 80, 80).data; let area = 0, asymH = 0, asymV = 0;
+      for (let y = 0; y < 80; y++) for (let xx = 0; xx < 80; xx++) {
+        const al = d[(y * 80 + xx) * 4 + 3]; area += al / 255;
+        asymH = Math.max(asymH, Math.abs(al - d[(y * 80 + 79 - xx) * 4 + 3])); asymV = Math.max(asymV, Math.abs(al - d[((79 - y) * 80 + xx) * 4 + 3]));
+      }
+      const exp = Math.PI * 900;
+      Kit.check('anti-aliased circle r=30: coverage sums to pi*r^2 (+-1%)', exp.toFixed(1), area.toFixed(1), Math.abs(area - exp) <= exp * 0.01);
+      Kit.check('anti-aliased circle: centre opaque, corner empty, mirror-symmetric left/right and top/bottom (alpha diff <= 40; a half-pixel shift would give >= 100)', 'alpha 255, 0, asym <= 40', 'alpha ' + d[(40 * 80 + 40) * 4 + 3] + ', ' + d[3] + ', asym h ' + asymH + ' v ' + asymV, d[(40 * 80 + 40) * 4 + 3] === 255 && d[3] === 0 && asymH <= 40 && asymV <= 40);
+      // linear gradient: pixel x of a black->white gradient over 256 px is ~ x + 0.5
+      const g = mk(256, 2), gx = ctxOf(g), lg = gx.createLinearGradient(0, 0, 256, 0); lg.addColorStop(0, '#000'); lg.addColorStop(1, '#fff'); gx.fillStyle = lg; gx.fillRect(0, 0, 256, 2);
+      const gd = gx.getImageData(0, 0, 256, 2).data; let maxErr = 0, back = 0, rowDiff = 0;
+      for (let i = 0; i < 256; i++) { const v = gd[i * 4]; maxErr = Math.max(maxErr, Math.abs(v - (i + 0.5))); if (i && v < gd[(i - 1) * 4] - 1) back++; rowDiff = Math.max(rowDiff, Math.abs(v - gd[(256 + i) * 4])); }
+      Kit.check('linear gradient black->white over 256 px: pixel x = x+0.5 (+-2), monotonic, rows equal', 'max err <= 2, no decreasing step, row diff <= 1', 'max err ' + maxErr.toFixed(2) + ', decreasing steps ' + back + ', row diff ' + rowDiff, maxErr <= 2 && back === 0 && rowDiff <= 1);
+      // radial gradient: red at the centre -> blue at r=40, padded outside
+      const r = mk(80, 80), rx = ctxOf(r), rg = rx.createRadialGradient(40, 40, 0, 40, 40, 40); rg.addColorStop(0, 'rgb(255,0,0)'); rg.addColorStop(1, 'rgb(0,0,255)'); rx.fillStyle = rg; rx.fillRect(0, 0, 80, 80);
+      const pc = px2(rx, 40, 40), pm = px2(rx, 60, 40), pe = px2(rx, 0, 0);
+      Kit.check('radial gradient red->blue r=40: centre red, r=20.5 about half (R 124 +-8), corner (padded) blue', 'R>=248 / R 116..132 / B>=248', fmt(pc) + ' ' + fmt(pm) + ' ' + fmt(pe), pc[0] >= 248 && pc[2] <= 8 && Math.abs(pm[0] - 124) <= 8 && pe[2] >= 248 && pe[0] <= 8);
+      // pattern: a 2x2 tile repeats exactly
+      const t = mk(2, 2), tx = ctxOf(t); const tcol = [['rgb(255,0,0)', 0, 0], ['rgb(0,255,0)', 1, 0], ['rgb(0,0,255)', 0, 1], ['rgb(255,255,255)', 1, 1]];
+      for (const [cc, tx0, ty0] of tcol) { tx.fillStyle = cc; tx.fillRect(tx0, ty0, 1, 1); }
+      const pc2 = mk(8, 8), pcx = ctxOf(pc2); pcx.fillStyle = pcx.createPattern(t, 'repeat'); pcx.fillRect(0, 0, 8, 8);
+      const pd = pcx.getImageData(0, 0, 8, 8).data; let pbad = 0;
+      const exps = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255]];
+      for (let y = 0; y < 8; y++) for (let xx = 0; xx < 8; xx++) { const e = exps[(y % 2) * 2 + (xx % 2)], i = (y * 8 + xx) * 4; if (!near([pd[i], pd[i + 1], pd[i + 2], pd[i + 3]], [e[0], e[1], e[2], 255], 1)) pbad++; }
+      Kit.check('createPattern: a 2x2 tile repeated over 8x8 (64 pixels, +-1)', '0 wrong pixels', pbad + ' wrong pixels', pbad === 0);
+      // reported only: the CRC of an anti-aliased scene, to compare x86 with ARM32 by eye (backend dependent, so not checked)
+      const aa = show('anti-aliased scene (CRC reported, not checked) (x2)', mk(160, 120), 320, 240), ax = aa.getContext('2d', { willReadFrequently: true });
+      ax.fillStyle = '#fff'; ax.fillRect(0, 0, 160, 120);
+      ax.strokeStyle = '#c00'; ax.lineWidth = 3; ax.beginPath(); ax.moveTo(5, 5); ax.lineTo(150, 100); ax.stroke();
+      ax.strokeStyle = '#06c'; ax.lineWidth = 1; ax.beginPath(); ax.moveTo(10, 110); ax.bezierCurveTo(40, 0, 100, 140, 150, 20); ax.stroke();
+      ax.fillStyle = '#080'; ax.beginPath(); ax.arc(50, 50, 25, 0.3, 5.5); ax.fill();
+      const lg2 = ax.createLinearGradient(90, 0, 150, 0); lg2.addColorStop(0, '#f80'); lg2.addColorStop(1, '#80f'); ax.fillStyle = lg2; ax.fillRect(90, 70, 60, 40);
+      ax.shadowColor = 'rgba(0,0,0,0.6)'; ax.shadowBlur = 6; ax.fillStyle = '#fc0'; ax.fillRect(100, 10, 30, 20);
+      Kit.info('anti-aliased scene CRC32 (informational: compare x86 with ARM32; backend dependent)', hx(CW.crc32(ax.getImageData(0, 0, 160, 120).data)));
+    });
+
+    await sec('2d images and pixels', async () => {
+      const s = mk(2, 2), sx = ctxOf(s);
+      const cols = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255]];
+      cols.forEach((c, i) => { sx.fillStyle = 'rgb(' + c.join(',') + ')'; sx.fillRect(i % 2, (i / 2) | 0, 1, 1); });
+      let d = mk(8, 8), dx = ctxOf(d); dx.imageSmoothingEnabled = false; dx.drawImage(s, 0, 0, 2, 2, 0, 0, 8, 8);
+      let bad = 0; const dd = dx.getImageData(0, 0, 8, 8).data;
+      for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) { const e = cols[((y / 4) | 0) * 2 + ((x / 4) | 0)], i = (y * 8 + x) * 4; if (!near([dd[i], dd[i + 1], dd[i + 2], dd[i + 3]], [e[0], e[1], e[2], 255], 0)) bad++; }
+      Kit.check('drawImage 2x2 -> 8x8 with imageSmoothingEnabled = false: exact 4x4 blocks', '0 wrong pixels', bad + ' wrong pixels', bad === 0);
+      d = mk(8, 8); dx = ctxOf(d); dx.imageSmoothingEnabled = true; dx.imageSmoothingQuality = 'low'; dx.drawImage(s, 0, 0, 2, 2, 0, 0, 8, 8);
+      const corner = px2(dx, 0, 0), mid = px2(dx, 4, 4);
+      Kit.check('drawImage 2x2 -> 8x8 smoothed: corner keeps the source red (+-3), pixel (4,4) is a blend of all four (every channel 20..240)', '(255,0,0,255) / blend', fmt(corner) + ' ' + fmt(mid), near(corner, [255, 0, 0, 255], 3) && mid.slice(0, 3).every(v => v >= 20 && v <= 240) && mid[3] === 255);
+      // putImageData / getImageData
+      const id = new ImageData(4, 4); for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) { const i = (y * 4 + x) * 4; id.data[i] = x * 60 + 7; id.data[i + 1] = y * 60 + 9; id.data[i + 2] = (x + y) * 30 + 11; id.data[i + 3] = 255; }
+      const pc = mk(4, 4), px = ctxOf(pc); px.putImageData(id, 0, 0); const back = px.getImageData(0, 0, 4, 4);
+      let pb = 0; for (let i = 0; i < 64; i++) if (back.data[i] !== id.data[i]) pb++;
+      Kit.check('putImageData + getImageData of opaque pixels: exact (64 bytes)', '0 differing bytes', pb + ' differing bytes', pb === 0 && back.width === 4 && back.height === 4);
+      const a = new ImageData(new Uint8ClampedArray([200, 100, 50, 128]), 1, 1), ac = mk(1, 1), ax = ctxOf(ac); ax.putImageData(a, 0, 0); const ab = px2(ax, 0, 0);
+      Kit.check('putImageData / getImageData of a half-transparent pixel (200,100,50,128): alpha exact, colour within +-2 (premultiplied storage)', '(200,100,50,128)', fmt(ab), ab[3] === 128 && near(ab.slice(0, 3), [200, 100, 50], 2));
+      const edge = px.getImageData(-2, -2, 4, 4).data;
+      const outside = edge[0] + edge[1] + edge[2] + edge[3] + edge[4 * 4 + 3];
+      Kit.check('getImageData partly outside the canvas: the outside is transparent black, the inside is the canvas', 'outside 0, inside (' + back.data[0] + ',' + back.data[1] + ',' + back.data[2] + ',255)', 'outside ' + outside + ', inside (' + edge[(2 * 4 + 2) * 4] + ',' + edge[(2 * 4 + 2) * 4 + 1] + ',' + edge[(2 * 4 + 2) * 4 + 2] + ',' + edge[(2 * 4 + 2) * 4 + 3] + ')',
+        outside === 0 && edge[(2 * 4 + 2) * 4] === back.data[0] && edge[(2 * 4 + 2) * 4 + 3] === 255);
+      Kit.check('ImageData constructors', '24 bytes, height 2', new ImageData(3, 2).data.length + ' bytes, height ' + new ImageData(new Uint8ClampedArray(16), 2).height, new ImageData(3, 2).data.length === 24 && new ImageData(new Uint8ClampedArray(16), 2).height === 2);
+      // Path2D, hit testing, state stack
+      const hx2 = ctxOf(mk(20, 20)), p = new Path2D('M0 0 H10 V10 H0 Z'); hx2.lineWidth = 4;
+      const hit = [hx2.isPointInPath(p, 5, 5), hx2.isPointInPath(p, 15, 5), hx2.isPointInStroke(p, 10, 5), hx2.isPointInStroke(p, 13, 5)];
+      Kit.check('Path2D: isPointInPath inside / outside, isPointInStroke on / 3 px off the edge (lineWidth 4)', 'true,false,true,false', hit.join(), hit.join() === 'true,false,true,false');
+      const st = ctxOf(mk(4, 4)); st.fillStyle = '#123456'; st.globalAlpha = 0.5; st.setTransform(2, 0, 0, 2, 3, 4); st.save(); st.fillStyle = '#abcdef'; st.globalAlpha = 1; st.setTransform(1, 0, 0, 1, 0, 0); st.restore();
+      const m = st.getTransform();
+      Kit.check('save / restore bring back fillStyle, globalAlpha and the transform', '#123456, 0.5, a=2 e=3 f=4', st.fillStyle + ', ' + st.globalAlpha + ', a=' + m.a + ' e=' + m.e + ' f=' + m.f, st.fillStyle === '#123456' && st.globalAlpha === 0.5 && m.a === 2 && m.e === 3 && m.f === 4);
+    });
+
+    await sec('2d text', async () => {
+      const c = show('2D text (not in any checksum) (x1)', mk(320, 60), 320, 60), x = c.getContext('2d', { willReadFrequently: true });
+      x.fillStyle = '#fff'; x.fillRect(0, 0, 320, 60); x.fillStyle = '#000'; x.textBaseline = 'alphabetic';
+      const txt = 'Hamburgefonstiv 0123';
+      x.font = '24px Arial, Helvetica, sans-serif'; const font24 = x.font;   // the font the text is drawn and measured with (x.font is reassigned below)
+      const w1 = x.measureText(txt).width, wW = x.measureText('WWWW').width, wi = x.measureText('iiii').width;
+      x.fillText(txt, 4, 40);
+      const d = x.getImageData(0, 0, 320, 60).data; let ink = 0, minX = 999, maxX = -1, minY = 999, maxY = -1;
+      for (let y = 0; y < 60; y++) for (let xx = 0; xx < 320; xx++) if (d[(y * 320 + xx) * 4] < 128) { ink++; if (xx < minX) minX = xx; if (xx > maxX) maxX = xx; if (y < minY) minY = y; if (y > maxY) maxY = y; }
+      Kit.check('fillText draws ink: some dark pixels, but not a filled box', '150..8000 dark pixels', ink + ' dark pixels, box x ' + minX + '..' + maxX + ' y ' + minY + '..' + maxY, ink >= 150 && ink <= 8000);
+      Kit.check('the text ink lies where it was drawn: starts near x=4, ends near x=4+measureText width, between y=15 and y=48', 'x 3..' + Math.round(4 + w1 + 4) + ', y 15..48', 'x ' + minX + '..' + maxX + ', y ' + minY + '..' + maxY, minX >= 3 && minX <= 8 && maxX <= 4 + w1 + 4 && maxX >= 4 + w1 * 0.8 && minY >= 15 && maxY <= 48);
+      x.font = '48px Arial, Helvetica, sans-serif'; const w2 = x.measureText(txt).width;
+      Kit.check('measureText: proportional font ("WWWW" wider than "iiii"), width scales with the size (48px / 24px = 2 +-0.15)', 'W > 1.5 * i, ratio 1.85..2.15', 'WWWW ' + wW.toFixed(1) + ' iiii ' + wi.toFixed(1) + ' ratio ' + (w2 / w1).toFixed(3), wW > wi * 1.5 && w2 / w1 >= 1.85 && w2 / w1 <= 2.15 && w1 > 80);
+      Kit.info('text ink CRC32 (informational: depends on the installed font and its rasteriser)', hx(CW.crc32(x.getImageData(0, 0, 320, 60).data)) + ', text drawn and measured with font = ' + font24 + ': measureText("' + txt + '").width = ' + w1.toFixed(2) + ' px');
+    });
+
+    await sec('2d large canvas', async () => {
+      const big = mk(2048, 2048), x = big.getContext('2d', { willReadFrequently: true });
+      x.fillStyle = 'rgb(200,10,20)'; x.fillRect(0, 0, 2048, 2048); x.fillStyle = 'rgb(10,20,200)'; x.fillRect(2047, 2047, 1, 1);
+      const p = [px2(x, 0, 0), px2(x, 1024, 1024), px2(x, 2047, 2047), px2(x, 2046, 2047)];
+      Kit.check('a 2048x2048 canvas (16 MB): fill + read back corners and centre', '(200,10,20,255) x3 around one (10,20,200,255)', p.map(fmt).join(' '), near(p[0], [200, 10, 20, 255], 0) && near(p[1], [200, 10, 20, 255], 0) && near(p[2], [10, 20, 200, 255], 0) && near(p[3], [200, 10, 20, 255], 0));
+      big.width = big.height = 1;
+    });
+
+    // ===================================================== WebGL =====================================================
+    // each suite under sec(): a throw in its setup (outside every gt()) is a failed check, and the other version still runs
+    await sec('webgl1', () => glSuite(1));
+    await sec('webgl2', () => glSuite(2));
+    glCoverage();
+  }
+  // What the WebGL part covered. A run in which a context could not be created has no checks for that version at all: say so where the person
+  // reading the verdict will see it, instead of letting the PASS stand for something it did not test. "No WebGL at all" (WebGL 1 missing,
+  // or a version this run requires missing) is red; "WebGL 2 missing while WebGL 1 works, and WebGL 2 not required" is grey information.
+  function glCoverage() {
+    const have1 = glTested[1], have2 = glTested[2], gl2Only = have1 && !have2 && !REQ[2];   // the normal case on a Direct3D feature level 9_x GPU
+    const desc = v => 'WebGL ' + v + ': ' + (glTested[v] ? 'tested'
+      : v === 2 && have1 ? 'NOT AVAILABLE while WebGL 1 works (' + (REQ[2] ? 'REQUIRED by this run: a failed check' : 'information, not a failure: the WebGL 2 checks did not run') + ')'
+      : 'NOT TESTED, no context (' + (REQ[v] ? 'REQUIRED by this run: a failed check' : 'not required by this run: the verdict does not cover it') + ')');
+    Kit.info('WebGL coverage', 'requirement: ' + REQ_TEXT + ' (' + WEBGL_FROM + '); ' + desc(1) + '; ' + desc(2) +
+      (!have1 && !have2 ? '; NO WEBGL AT ALL: neither version could be created' : ''));
+    if (have1 && have2) return;
+    const b = document.createElement('div'); b.id = 'webgl-banner';
+    if (gl2Only) {
+      bannerKind = 'grey';
+      b.style.cssText = 'background:#eee;border:1px solid #999;color:#444;font:13px Arial,sans-serif;padding:6px 10px;margin:10px 0;max-width:900px';
+      b.textContent = 'Information: WebGL 2 is not available here, WebGL 1 works and was tested. This is normal on a GPU that only reaches Direct3D feature level 9_x. ' +
+        'The WebGL 2 checks did not run; this run does not require WebGL 2. Not a failure.';
+    } else {
+      bannerKind = 'red';
+      b.style.cssText = 'background:#fff3cd;border:3px solid #c00;color:#900;font:bold 16px Arial,sans-serif;padding:8px 12px;margin:10px 0;max-width:900px';
+      b.textContent = !have1 && !have2
+        ? 'NO WEBGL AT ALL: neither a WebGL 1 nor a WebGL 2 context could be created, so none of the WebGL checks ran. ' + (REQ[1] ? 'This run requires WebGL: see the failed rows "WebGL 1 context". ' : 'This run does not require WebGL, so the verdict above covers the 2D canvas only. ') + 'Read the rows "WebGL 1 context" / "WebGL 2 context".'
+        : !have1 ? 'WEBGL 1 NOT TESTED: no WebGL 1 context could be created (WebGL 2 works), so the WebGL 1 checks did not run. ' + (REQ[1] ? 'This run requires it: see the failed row "WebGL 1 context".' : 'The verdict does not cover WebGL 1.')
+        : 'WEBGL 2 REQUIRED BUT NOT AVAILABLE: this run requires WebGL 2 (' + WEBGL_FROM + '); WebGL 1 works, but no WebGL 2 context could be created: see the failed row "WebGL 2 context".';
+    }
+    document.body.insertBefore(b, document.body.firstChild);   // the very top, above the verdict line, where it is read first
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------------
+  const GLATTR = { alpha: true, antialias: false, depth: true, stencil: false, premultipliedAlpha: true, preserveDrawingBuffer: false, failIfMajorPerformanceCaveat: false };
+  const glInfo = {}, dataUrls = {};
+  async function glSuite(ver) {
+    const name = 'WebGL ' + ver + ': ';
+    const cv = show('WebGL ' + ver + ' canvas (16x16, x6)', mk(16, 16), 96, 96);
+    let msg = '';
+    cv.addEventListener('webglcontextcreationerror', e => { msg = e.statusMessage || ''; });
+    let gl = null;
+    try { gl = cv.getContext(ver === 2 ? 'webgl2' : 'webgl', GLATTR); } catch (e) { msg = 'getContext threw ' + e.name + ': ' + e.message; }
+    const ctorName = ver === 2 ? 'WebGL2RenderingContext' : 'WebGLRenderingContext';
+    Kit.info('typeof ' + ctorName, typeof window[ctorName]);
+    if (!gl) {
+      glInfo['webgl' + ver] = 'none';
+      const ask = 'getContext("' + (ver === 2 ? 'webgl2' : 'webgl') + '")';
+      const why = ask + ' returned null' + (msg ? ' (' + msg + ')' : '');
+      if (REQ[ver]) Kit.check('WebGL ' + ver + ' context', 'a ' + ctorName + ' context (this run requires ' + REQ_TEXT + ': ' + WEBGL_FROM + ')', why + ' — the WebGL ' + ver + ' checks could not run', false);
+      else if (ver === 2 && glTested[1]) Kit.info('WebGL 2 context', 'NOT AVAILABLE while WebGL 1 works: ' + why + ' — the WebGL 2 checks are skipped (information, not a failure: this run requires ' + REQ_TEXT + '; a GPU that only reaches Direct3D feature level 9_x gives WebGL 1 and no WebGL 2)');
+      else Kit.info('WebGL ' + ver + ' context', 'NOT AVAILABLE: ' + why + ' — no GPU / no software GL here; the WebGL ' + ver + ' checks are skipped (information, not a failure, because this run requires ' + REQ_TEXT + ': the PASS does NOT cover WebGL ' + ver + ')');
+      return;
+    }
+    glTested[ver] = true;
+    const errs = [];
+    const flush = where => { let e, n = 0; while ((e = gl.getError()) !== 0 && n++ < 8) errs.push(where + ':0x' + e.toString(16)); };
+    async function gt(label, fn) {
+      if (stopped) return;
+      current = 'webgl' + ver + ': ' + label;
+      try { await fn(); } catch (e) { Kit.check(name + label + ': ran without an exception', 'no exception', (e && e.name ? e.name + ': ' : '') + (e && e.message || e), false); }
+      try { flush(label); } catch (e) { /* context lost */ }
+    }
+    const px = (x, y) => { const a = new Uint8Array(4); gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, a); return Array.from(a); };
+    const readAll = () => { const a = new Uint8Array(16 * 16 * 4); gl.readPixels(0, 0, 16, 16, gl.RGBA, gl.UNSIGNED_BYTE, a); return a; };
+    function sh(type, src) {
+      const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { const l = gl.getShaderInfoLog(s); gl.deleteShader(s); throw new Error('shader compile failed: ' + l + ' in: ' + src.slice(0, 80)); }
+      return s;
+    }
+    function prog(vs, fs, binds) {
+      const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+      for (const [n, i] of binds || []) gl.bindAttribLocation(p, i, n);
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('program link failed: ' + gl.getProgramInfoLog(p));
+      return p;
+    }
+    const buf = (target, data) => { const b = gl.createBuffer(); gl.bindBuffer(target, b); gl.bufferData(target, data, gl.STATIC_DRAW); return b; };
+    const v2 = ver === 2;
+    const SRC = v2 ? {
+      vs: '#version 300 es\nlayout(location=0) in vec2 p; uniform float z; out vec2 uv; void main(){ uv = p * 0.5 + 0.5; gl_Position = vec4(p, z, 1.0); }',
+      flat: '#version 300 es\nprecision mediump float; uniform vec4 c; out vec4 o; void main(){ o = c; }',
+      tex: '#version 300 es\nprecision mediump float; in vec2 uv; uniform sampler2D t; out vec4 o; void main(){ o = texture(t, uv); }',
+      vsCol: '#version 300 es\nlayout(location=0) in vec2 p; layout(location=1) in vec3 col; out vec3 vc; void main(){ vc = col; gl_Position = vec4(p, 0.0, 1.0); }',
+      fsCol: '#version 300 es\nprecision mediump float; in vec3 vc; out vec4 o; void main(){ o = vec4(vc, 1.0); }',
+    } : {
+      vs: 'attribute vec2 p; uniform float z; varying vec2 uv; void main(){ uv = p * 0.5 + 0.5; gl_Position = vec4(p, z, 1.0); }',
+      flat: 'precision mediump float; uniform vec4 c; void main(){ gl_FragColor = c; }',
+      tex: 'precision mediump float; varying vec2 uv; uniform sampler2D t; void main(){ gl_FragColor = texture2D(t, uv); }',
+      vsCol: 'attribute vec2 p; attribute vec3 col; varying vec3 vc; void main(){ vc = col; gl_Position = vec4(p, 0.0, 1.0); }',
+      fsCol: 'precision mediump float; varying vec3 vc; void main(){ gl_FragColor = vec4(vc, 1.0); }',
+    };
+    const B1 = [['p', 0]], B2 = [['p', 0], ['col', 1]];
+    let quad = null, tri = null, half = null, halfIdx = null;   // created inside gt('buffers'): a throwing createBuffer / bufferData is a failed check, not a lost page
+    const setPos = b => { gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0); };
+    const clear = (r, g, b, a) => { gl.clearColor(r / 255, g / 255, b / 255, a / 255); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); };
+    const colour = (p, r, g, b, a) => gl.uniform4f(gl.getUniformLocation(p, 'c'), r / 255, g / 255, b / 255, a / 255);
+    let flat = null, texP = null;
+
+    await gt('buffers', () => {
+      quad = buf(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]));
+      tri = buf(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1]));
+      half = buf(gl.ARRAY_BUFFER, new Float32Array([0, -1, 1, -1, 1, 1, 0, 1]));
+      halfIdx = buf(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 0, 2, 3]));
+    });
+    await gt('context', () => {
+      const ok = !gl.isContextLost() && gl.drawingBufferWidth === 16 && gl.drawingBufferHeight === 16 && gl.canvas === cv && gl.getError() === 0;
+      Kit.check(name + 'context created, not lost, drawing buffer 16x16, no GL error', 'true', 'lost=' + gl.isContextLost() + ' buffer ' + gl.drawingBufferWidth + 'x' + gl.drawingBufferHeight, ok);
+      const attrs = gl.getContextAttributes();
+      Kit.info(name + 'context attributes', JSON.stringify(attrs));
+    });
+    await gt('strings', () => {
+      const version = gl.getParameter(gl.VERSION), glsl = gl.getParameter(gl.SHADING_LANGUAGE_VERSION), vendor = gl.getParameter(gl.VENDOR), renderer = gl.getParameter(gl.RENDERER);
+      Kit.check(name + 'VERSION string', v2 ? 'starts with "WebGL 2.0"' : 'starts with "WebGL 1.0"', version, typeof version === 'string' && version.indexOf(v2 ? 'WebGL 2.0' : 'WebGL 1.0') === 0);
+      Kit.check(name + 'SHADING_LANGUAGE_VERSION string', v2 ? 'starts with "WebGL GLSL ES 3.00"' : 'starts with "WebGL GLSL ES 1.0"', glsl, typeof glsl === 'string' && glsl.indexOf(v2 ? 'WebGL GLSL ES 3.00' : 'WebGL GLSL ES 1.0') === 0);
+      Kit.check(name + 'VENDOR and RENDERER strings are non-empty', 'two non-empty strings', JSON.stringify(vendor) + ' / ' + JSON.stringify(renderer), typeof vendor === 'string' && vendor.length > 0 && typeof renderer === 'string' && renderer.length > 0);
+      const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+      let un = 'WEBGL_debug_renderer_info not available';
+      if (dbg) {
+        const uv = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL), ur = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+        un = 'vendor ' + JSON.stringify(uv) + ' / renderer ' + JSON.stringify(ur);
+        Kit.check(name + 'WEBGL_debug_renderer_info: unmasked vendor and renderer are non-empty strings', 'two non-empty strings', un, typeof uv === 'string' && uv.length > 0 && typeof ur === 'string' && ur.length > 0);
+        glInfo['webgl' + ver] = ur;
+      } else glInfo['webgl' + ver] = renderer;
+      Kit.info(name + 'renderer (the string asked for)', un + '; masked: ' + vendor + ' / ' + renderer + '; version ' + version + '; ' + glsl);
+    });
+    await gt('limits', () => {
+      const g = n => gl.getParameter(gl[n]);
+      const maxTex = g('MAX_TEXTURE_SIZE');
+      Kit.check(name + 'MAX_TEXTURE_SIZE >= 2048', '>= 2048', maxTex, typeof maxTex === 'number' && maxTex >= 2048);
+      const extra = ['MAX_RENDERBUFFER_SIZE', 'MAX_VERTEX_ATTRIBS', 'MAX_TEXTURE_IMAGE_UNITS', 'MAX_VARYING_VECTORS', 'MAX_FRAGMENT_UNIFORM_VECTORS'].map(n => n + '=' + g(n)).join(' ') + ' MAX_VIEWPORT_DIMS=' + Array.from(g('MAX_VIEWPORT_DIMS')).join('x');
+      Kit.info(name + 'limits', extra);
+      if (v2) {
+        const l3 = g('MAX_3D_TEXTURE_SIZE'), lc = g('MAX_COLOR_ATTACHMENTS'), la = g('MAX_ARRAY_TEXTURE_LAYERS');
+        Kit.check(name + 'ES 3.0 minimum limits: MAX_3D_TEXTURE_SIZE >= 256, MAX_COLOR_ATTACHMENTS >= 4, MAX_ARRAY_TEXTURE_LAYERS >= 256', '>= 256, >= 4, >= 256', l3 + ', ' + lc + ', ' + la, l3 >= 256 && lc >= 4 && la >= 256);
+      }
+      Kit.info(name + 'supported extensions', (gl.getSupportedExtensions() || []).length + ': ' + (gl.getSupportedExtensions() || []).join(' '));
+    });
+    await gt('clear', () => {
+      const cols = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 255, 255], [0, 0, 0, 255], [51, 102, 153, 255], [200, 100, 50, 255]];
+      let bad = '';
+      for (const c of cols) {
+        clear(c[0], c[1], c[2], c[3]);
+        for (const [x, y] of [[0, 0], [15, 0], [0, 15], [15, 15], [8, 8]]) { const g = px(x, y); if (!bad && !near(g, c, 1)) bad = fmt(c) + ' at ' + x + ',' + y + ' read ' + fmt(g); }
+      }
+      Kit.check(name + 'clearColor + clear + readPixels: 7 colours x 5 pixels (+-1)', 'all match', bad || 'all match', !bad);
+    });
+    await gt('scissor', () => {
+      clear(255, 0, 0, 255); gl.enable(gl.SCISSOR_TEST); gl.scissor(4, 4, 8, 8); clear(0, 255, 0, 255); gl.disable(gl.SCISSOR_TEST);
+      const inn = [px(4, 4), px(11, 11), px(8, 8)], out = [px(3, 3), px(12, 12), px(0, 15), px(15, 5)];
+      Kit.check(name + 'scissored clear: green inside 4..11, red outside (exact edges)', 'green x3, red x4', inn.map(fmt).join(' ') + ' | ' + out.map(fmt).join(' '),
+        inn.every(p => near(p, [0, 255, 0, 255], 1)) && out.every(p => near(p, [255, 0, 0, 255], 1)));
+    });
+    await gt('shaders', () => {
+      flat = prog(SRC.vs, SRC.flat, v2 ? [] : B1); texP = prog(SRC.vs, SRC.tex, v2 ? [] : B1);
+      // prog() throws when a shader does not compile or a program does not link (a failed check from gt()); this row asks the linked
+      // programs what they contain: the attached shaders, the active attribute and the active uniforms (name, type), which the page's
+      // own GLSL sources fix: so a translator or linker that drops, renames or retypes one is caught here.
+      const describe = p => {
+        const attrs = [], unis = [];
+        for (let i = 0, n = gl.getProgramParameter(p, gl.ACTIVE_ATTRIBUTES); i < n; i++) { const a = gl.getActiveAttrib(p, i); attrs.push(a.name + ':' + a.type + 'x' + a.size); }
+        for (let i = 0, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS); i < n; i++) { const u = gl.getActiveUniform(p, i); unis.push(u.name + ':' + u.type + 'x' + u.size); }
+        return gl.getProgramParameter(p, gl.ATTACHED_SHADERS) + ' shaders, link ' + gl.getProgramParameter(p, gl.LINK_STATUS) + ', attribute ' + attrs.sort().join(',') + ', uniforms ' + unis.sort().join(',');
+      };
+      const F = (n, t) => n + ':' + t + 'x1';   // GL enums: FLOAT_VEC2 0x8B50 = 35664, FLOAT 0x1406 = 5126, FLOAT_VEC4 0x8B52 = 35666, SAMPLER_2D 0x8B5E = 35678
+      const wantFlat = '2 shaders, link true, attribute ' + F('p', 35664) + ', uniforms ' + [F('c', 35666), F('z', 5126)].sort().join(',');
+      const wantTex = '2 shaders, link true, attribute ' + F('p', 35664) + ', uniforms ' + [F('t', 35678), F('z', 5126)].sort().join(',');
+      const gotFlat = describe(flat), gotTex = describe(texP);
+      Kit.check(name + 'GLSL ' + (v2 ? 'ES 3.00' : 'ES 1.00') + ' vertex + fragment shaders compile and link; the flat-colour and texture programs report 2 attached shaders, attribute p (vec2) and their uniforms (name:type) c (vec4) + z (float), t (sampler2D) + z (float)',
+        'flat: ' + wantFlat + ' | texture: ' + wantTex, 'flat: ' + gotFlat + ' | texture: ' + gotTex, gotFlat === wantFlat && gotTex === wantTex);
+    });
+    await gt('flat draw', () => {
+      clear(0, 0, 0, 255); gl.useProgram(flat); setPos(quad); colour(flat, 0, 128, 255, 255); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      const p = [px(0, 0), px(15, 15), px(8, 8)];
+      Kit.check(name + 'shader draw of a full-screen quad, colour (0,128,255): corners and centre (+-1)', '(0,128,255,255) x3', p.map(fmt).join(' '), p.every(q => near(q, [0, 128, 255, 255], 1)));
+      clear(0, 0, 0, 255); setPos(tri); colour(flat, 255, 255, 255, 255); gl.drawArrays(gl.TRIANGLES, 0, 3);
+      const inn = [px(2, 2), px(6, 2), px(2, 6)], out = [px(13, 13), px(10, 10), px(12, 6)];
+      Kit.check(name + 'triangle (-1,-1) (1,-1) (-1,1): the lower-left half is filled (readPixels y=0 is the bottom row), the upper-right half is not', 'white x3 lower-left, black x3 upper-right', inn.map(fmt).join(' ') + ' | ' + out.map(fmt).join(' '),
+        inn.every(q => near(q, [255, 255, 255, 255], 1)) && out.every(q => near(q, [0, 0, 0, 255], 1)));
+    });
+    await gt('drawElements', () => {
+      clear(0, 0, 0, 255); gl.useProgram(flat); setPos(half); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, halfIdx); colour(flat, 255, 255, 0, 255);
+      gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+      const r = [px(12, 8), px(8, 0), px(3, 8), px(7, 15)];
+      Kit.check(name + 'drawElements (Uint16 indices): the right half is yellow, the left half stays black', '(255,255,0,255) (255,255,0,255) | (0,0,0,255) (0,0,0,255)', r.map(fmt).join(' '),
+        near(r[0], [255, 255, 0, 255], 1) && near(r[1], [255, 255, 0, 255], 1) && near(r[2], [0, 0, 0, 255], 1) && near(r[3], [0, 0, 0, 255], 1));
+    });
+    await gt('varying', () => {
+      const p = prog(SRC.vsCol, SRC.fsCol, v2 ? [] : B2);
+      const vb = buf(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, 0, 0, 1, -1, 0, 0, 1, -1, 1, 1, 0, 0, 1, 1, 0, 0, 1]));
+      clear(0, 0, 0, 255); gl.useProgram(p); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+      gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 20, 0); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 20, 8);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); gl.disableVertexAttribArray(1);
+      let bad = 0, worst = '';
+      for (let x = 0; x < 16; x++) for (const y of [2, 13]) {
+        const u = (x + 0.5) / 16, e = [255 * (1 - u), 0, 255 * u, 255], g = px(x, y);
+        if (!near(g, e.map(Math.round), 6)) { if (!bad) worst = 'x=' + x + ' y=' + y + ' read ' + fmt(g) + ' expected ~' + fmt(e.map(Math.round)); bad++; }
+      }
+      Kit.check(name + 'interleaved vertex colours (stride 20, offset 8) interpolate across the quad: red -> blue, 32 pixels (+-6)', '0 wrong pixels', bad + ' wrong pixels' + (worst ? ', first ' + worst : ''), bad === 0);
+    });
+    // 2x2 NEAREST texture: each 8x8 quadrant is one texel
+    const T2 = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255]);   // texel (0,0) red, (1,0) green, (0,1) blue, (1,1) yellow
+    const T2col = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255]];
+    const texParams = () => { gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); };
+    function drawTex(tex) { clear(0, 0, 0, 255); gl.useProgram(texP); setPos(quad); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(gl.getUniformLocation(texP, 't'), 0); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); }
+    function checkQuadrants(label, extraWhy) {
+      const a = readAll(); let bad = 0, first = '';
+      for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) { const e = T2col[((y >> 3) << 1) | (x >> 3)], i = (y * 16 + x) * 4; if (!near([a[i], a[i + 1], a[i + 2], a[i + 3]], e, 1)) { if (!bad) first = 'x=' + x + ' y=' + y + ' read ' + fmt([a[i], a[i + 1], a[i + 2], a[i + 3]]) + ' want ' + fmt(e); bad++; } }
+      Kit.check(name + label, '0 wrong pixels of 256', bad + ' wrong pixels' + (first ? ', first ' + first : ''), bad === 0);
+    }
+    await gt('texture', () => {
+      const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, T2); texParams();
+      drawTex(tex);
+      checkQuadrants('2x2 RGBA texture (texImage2D from a Uint8Array), NEAREST, sampled by a shader over 16x16: every pixel is its texel');
+      // the same frame, taken through the 2D canvas: drawImage(glCanvas) must be upright (GL row 0 is the bottom)
+      const c2 = mk(16, 16), x2 = ctxOf(c2); x2.drawImage(cv, 0, 0); const d = x2.getImageData(0, 0, 16, 16).data; let bad = 0, first = '';
+      for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) { const e = T2col[(((15 - y) >> 3) << 1) | (x >> 3)], i = (y * 16 + x) * 4; if (!near([d[i], d[i + 1], d[i + 2], d[i + 3]], e, 1)) { if (!bad) first = 'x=' + x + ' y=' + y + ' read ' + fmt([d[i], d[i + 1], d[i + 2], d[i + 3]]) + ' want ' + fmt(e); bad++; } }
+      Kit.check(name + 'drawImage(webglCanvas) into a 2D canvas, same task: upright (texel row 1 at the top), 256 pixels (+-1)', '0 wrong pixels', bad + ' wrong pixels' + (first ? ', first ' + first : ''), bad === 0);
+      dataUrls[ver] = cv.toDataURL('image/png');   // decoded later (asynchronous), same expectation
+    });
+    await gt('toDataURL', async () => {
+      const du = dataUrls[ver];
+      if (!du) return;
+      const im = await loadImage(du), c2 = mk(16, 16), x2 = ctxOf(c2); x2.drawImage(im, 0, 0); const d = x2.getImageData(0, 0, 16, 16).data; let bad = 0;
+      for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) { const e = T2col[(((15 - y) >> 3) << 1) | (x >> 3)], i = (y * 16 + x) * 4; if (!near([d[i], d[i + 1], d[i + 2], d[i + 3]], e, 1)) bad++; }
+      Kit.check(name + 'webglCanvas.toDataURL("image/png") taken right after drawing, decoded and read back: upright, 256 pixels', '0 wrong pixels', bad + ' wrong pixels (PNG ' + im.naturalWidth + 'x' + im.naturalHeight + ')', bad === 0 && im.naturalWidth === 16);
+    });
+    await gt('texture from 2D canvas', () => {
+      const c2 = mk(16, 16), x2 = ctxOf(c2);
+      const cols = [['rgb(255,0,0)', 0, 0], ['rgb(0,255,0)', 8, 0], ['rgb(0,0,255)', 0, 8], ['rgb(255,255,0)', 8, 8]];
+      for (const [c, x, y] of cols) { x2.fillStyle = c; x2.fillRect(x, y, 8, 8); }
+      x2.fillStyle = 'rgb(255,255,255)'; x2.fillRect(0, 0, 1, 1);   // a marker pixel: the canvas's top-left corner
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c2); texParams();
+      drawTex(tex);
+      const a = readAll(), want = x2.getImageData(0, 0, 16, 16).data; let bad = 0, first = '';
+      // UNPACK_FLIP_Y false: the canvas's first row is texture row 0 = the bottom row of the drawing buffer (readPixels row 0)
+      for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) { const i = (y * 16 + x) * 4; if (!near([a[i], a[i + 1], a[i + 2], a[i + 3]], [want[i], want[i + 1], want[i + 2], want[i + 3]], 1)) { if (!bad) first = 'x=' + x + ' y=' + y + ' read ' + fmt([a[i], a[i + 1], a[i + 2], a[i + 3]]) + ' want ' + fmt([want[i], want[i + 1], want[i + 2], want[i + 3]]); bad++; } }
+      Kit.check(name + 'texImage2D from a 2D <canvas> (with a white marker pixel), drawn through a shader: all 256 pixels equal the canvas (+-1)', '0 wrong pixels', bad + ' wrong pixels' + (first ? ', first ' + first : ''), bad === 0);
+    });
+    await gt('framebuffer', () => {
+      const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 16, 16, 0, gl.RGBA, gl.UNSIGNED_BYTE, null); texParams();
+      const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      clear(0, 0, 255, 255); const inFbo = px(8, 8);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null); clear(0, 0, 0, 255); const inMain = px(8, 8);
+      drawTex(tex); const shown = px(8, 8);
+      Kit.check(name + 'render to a texture through an FBO: complete, cleared blue inside, the main buffer untouched, then the texture drawn onto the main buffer is blue', 'COMPLETE, (0,0,255,255), (0,0,0,255), (0,0,255,255)', 'status 0x' + st.toString(16) + ', ' + fmt(inFbo) + ', ' + fmt(inMain) + ', ' + fmt(shown),
+        st === gl.FRAMEBUFFER_COMPLETE && near(inFbo, [0, 0, 255, 255], 1) && near(inMain, [0, 0, 0, 255], 1) && near(shown, [0, 0, 255, 255], 1));
+    });
+    await gt('depth', () => {
+      if (!gl.getContextAttributes().depth) { Kit.na(name + 'depth test', 'the context has no depth buffer'); return; }
+      gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); clear(0, 0, 0, 255); gl.useProgram(flat);
+      const zl = gl.getUniformLocation(flat, 'z');
+      gl.uniform1f(zl, 0.5); colour(flat, 0, 255, 0, 255); setPos(quad); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);                                   // far green, everywhere
+      gl.uniform1f(zl, -0.5); colour(flat, 255, 0, 0, 255); setPos(half); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, halfIdx); gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);   // nearer red, right half
+      gl.uniform1f(zl, 0.8); colour(flat, 0, 0, 255, 255); setPos(quad); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);                                   // farthest blue, drawn last: must be hidden
+      gl.uniform1f(zl, 0); gl.disable(gl.DEPTH_TEST);
+      const r = [px(3, 8), px(12, 8), px(0, 0), px(15, 15)];
+      Kit.check(name + 'depth test (LESS): a nearer red quad hides the green one, a farther blue quad drawn last is hidden everywhere', '(0,255,0) left, (255,0,0) right, no blue', r.map(fmt).join(' '),
+        near(r[0], [0, 255, 0, 255], 1) && near(r[1], [255, 0, 0, 255], 1) && near(r[2], [0, 255, 0, 255], 1) && near(r[3], [255, 0, 0, 255], 1));
+    });
+    await gt('blend', () => {
+      clear(0, 0, 255, 255); gl.enable(gl.BLEND); gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ZERO, gl.ONE);
+      gl.useProgram(flat); setPos(quad); colour(flat, 255, 0, 0, 128); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); gl.disable(gl.BLEND);
+      const p = px(8, 8);
+      Kit.check(name + 'blending: red at alpha 128/255 over blue = (128,0,127) +-3, destination alpha kept 255', '(128,0,127,255) +-3', fmt(p), near(p, [128, 0, 127, 255], 3));
+    });
+    if (v2) {
+      await gt('instancing', () => {
+        const p = prog('#version 300 es\nlayout(location=0) in vec2 p; out vec4 vcol; void main(){ float off = gl_InstanceID == 0 ? -0.5 : 0.5; vcol = gl_InstanceID == 0 ? vec4(1.0,0.0,0.0,1.0) : vec4(0.0,0.0,1.0,1.0); gl_Position = vec4(p.x * 0.5 + off, p.y, 0.0, 1.0); }',
+          '#version 300 es\nprecision mediump float; in vec4 vcol; out vec4 o; void main(){ o = vcol; }');
+        clear(0, 0, 0, 255); gl.useProgram(p); setPos(quad); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, 2);
+        const r = [px(4, 8), px(12, 8), px(7, 3), px(8, 3)];
+        Kit.check(name + 'drawArraysInstanced with gl_InstanceID: instance 0 paints the left half red, instance 1 the right half blue', '(255,0,0) (0,0,255) (255,0,0) (0,0,255)', r.map(fmt).join(' '),
+          near(r[0], [255, 0, 0, 255], 1) && near(r[1], [0, 0, 255, 255], 1) && near(r[2], [255, 0, 0, 255], 1) && near(r[3], [0, 0, 255, 255], 1));
+      });
+      await gt('uniform buffer', () => {
+        const p = prog(SRC.vs, '#version 300 es\nprecision mediump float; layout(std140) uniform Block { vec4 color; }; out vec4 o; void main(){ o = color; }');
+        const ub = gl.createBuffer(); gl.bindBuffer(gl.UNIFORM_BUFFER, ub); gl.bufferData(gl.UNIFORM_BUFFER, new Float32Array([1, 128 / 255, 0, 1]), gl.STATIC_DRAW);
+        const bi = gl.getUniformBlockIndex(p, 'Block'); gl.uniformBlockBinding(p, bi, 0); gl.bindBufferBase(gl.UNIFORM_BUFFER, 0, ub);
+        clear(0, 0, 0, 255); gl.useProgram(p); setPos(quad); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        const q = px(8, 8);
+        Kit.check(name + 'std140 uniform buffer object supplies the colour (255,128,0)', '(255,128,0,255) +-1', 'block index ' + bi + ', ' + fmt(q), bi !== gl.INVALID_INDEX && near(q, [255, 128, 0, 255], 1));
+      });
+      await gt('integer texture', () => {
+        const p = prog(SRC.vs, '#version 300 es\nprecision mediump float; uniform highp usampler2D t; out vec4 o; void main(){ uvec4 u = texelFetch(t, ivec2(0, 0), 0); o = vec4(u) / 255.0; }');
+        const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8UI, 1, 1, 0, gl.RGBA_INTEGER, gl.UNSIGNED_BYTE, new Uint8Array([10, 20, 30, 255]));
+        clear(0, 0, 0, 255); gl.useProgram(p); setPos(quad); gl.activeTexture(gl.TEXTURE0); gl.uniform1i(gl.getUniformLocation(p, 't'), 0); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        const q = px(8, 8);
+        Kit.check(name + 'RGBA8UI integer texture read with texelFetch (usampler2D): (10,20,30,255)', '(10,20,30,255) +-1', fmt(q), near(q, [10, 20, 30, 255], 1));
+      });
+      await gt('3d texture', () => {
+        const data = new Uint8Array(2 * 2 * 2 * 4);
+        for (let z = 0; z < 2; z++) for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) { const i = ((z * 2 + y) * 2 + x) * 4; data[i] = x * 120 + 10; data[i + 1] = y * 120 + 10; data[i + 2] = z * 120 + 10; data[i + 3] = 255; }
+        const p = prog(SRC.vs, '#version 300 es\nprecision mediump float; uniform highp sampler3D t; out vec4 o; void main(){ o = texelFetch(t, ivec3(1, 0, 1), 0); }');
+        const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_3D, tex);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, 2, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+        clear(0, 0, 0, 255); gl.useProgram(p); setPos(quad); gl.activeTexture(gl.TEXTURE0); gl.uniform1i(gl.getUniformLocation(p, 't'), 0); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        const q = px(8, 8);
+        Kit.check(name + '2x2x2 3D texture (texImage3D), texelFetch of texel (1,0,1): (130,10,130,255)', '(130,10,130,255) +-1', fmt(q), near(q, [130, 10, 130, 255], 1));
+      });
+      await gt('immutable texture', () => {
+        const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, 2, 2); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 2, 2, gl.RGBA, gl.UNSIGNED_BYTE, T2); texParams();
+        drawTex(tex);
+        checkQuadrants('texStorage2D + texSubImage2D (immutable 2x2 RGBA8 texture): every pixel is its texel');
+      });
+    }
+    await gt('final picture', () => {   // leave something to look at in the screenshot: the 2x2 quadrant texture
+      const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, T2); texParams(); drawTex(tex);
+    });
+    await gt('no GL errors', () => {
+      Kit.check(name + 'no GL error was raised by any of the calls above (getError after every step)', 'none', errs.length ? errs.join(' ') : 'none', errs.length === 0);
+    });
+    // context loss and restore, on a second context so that the picture above stays
+    await gt('context loss', async () => {
+      const c = mk(4, 4); c.style.display = 'none'; document.body.appendChild(c);
+      const g2 = c.getContext(ver === 2 ? 'webgl2' : 'webgl', GLATTR);
+      if (!g2) { Kit.info(name + 'second context for the loss test', 'could not be created'); return; }
+      const ext = g2.getExtension('WEBGL_lose_context');
+      if (!ext) { Kit.info(name + 'WEBGL_lose_context', 'extension not available: context loss not exercised'); return; }
+      const ev = (n, pd) => T(new Promise(res => c.addEventListener(n, e => { if (pd) e.preventDefault(); res(); }, { once: true })), 15000, 'event ' + n);   // preventDefault in the same listener: restoreContext() is only allowed once the loss event was cancelled
+      const lost = ev('webglcontextlost', true);
+      ext.loseContext(); await lost;
+      await Kit.sleep(20);   // Blink sets 'restore allowed' only after the loss event's dispatch has returned: restoreContext() from the handler itself is refused
+      const wasLost = g2.isContextLost();
+      const restored = ev('webglcontextrestored'); ext.restoreContext(); await restored;
+      g2.clearColor(1, 0, 0, 1); g2.clear(g2.COLOR_BUFFER_BIT); const a = new Uint8Array(4); g2.readPixels(0, 0, 1, 1, g2.RGBA, g2.UNSIGNED_BYTE, a);
+      Kit.check(name + 'loseContext() -> webglcontextlost, isContextLost() true; restoreContext() -> webglcontextrestored, usable again (clear red reads red)', 'lost=true, restored, (255,0,0,255)', 'lost=' + wasLost + ', isContextLost after restore=' + g2.isContextLost() + ', ' + fmt(a), wasLost === true && !g2.isContextLost() && near(Array.from(a), [255, 0, 0, 255], 1));
+      c.remove();
+    });
+  }
+
+  // The whole page runs under a watchdog: a hang is a failed check, not a hang. A throw that escapes every sec() / gt() (the scene
+  // generator, a failed setup) is a failed check as well, and the page still publishes what it has.
+  let settled = false, wd = null;
+  const m = main().then(() => {}, e => {
+    Kit.check('page: uncaught exception in section ' + current, 'no exception', (e && e.name ? e.name + ': ' : '') + (e && e.message || e), false);
+  }).then(() => { settled = true; });
+  const watchdog = new Promise(res => { wd = setTimeout(res, 45000); });
+  await Promise.race([m, watchdog]);
+  clearTimeout(wd);
+  if (!settled) Kit.check('the page finished within 45 s', 'finished', 'still running in section "' + current + '"', false);
+  stopped = true;   // main() may still be running (hung section): from here on it adds nothing to the published result
+  await KitReal.done({ timings, webgl: glInfo, webglTested: glTested, webglRequired: REQ, webglSetting: WEBGL_SETTING, webglBanner: bannerKind, model: { crc: GOLD.crc, ops: GOLD.ops } });
+})().catch(async e => {   // a throw before main() (the page's own setup): still a failed check and a published result, never a silent hang
+  try { window.Kit.check('page: uncaught exception in the page setup', 'no exception', (e && e.name ? e.name + ': ' : '') + (e && e.message || e), false); } catch (x) { /* nothing more to do */ }
+  try { await window.Kit.done({}); } catch (x) { /* nothing more to do */ }
+});
+</script>

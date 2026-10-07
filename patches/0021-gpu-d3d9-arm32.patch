@@ -1,0 +1,80 @@
+Venetium 0021 - GPU on Windows ARM32: ANGLE's D3D9 backend (feature level 9_x hardware such as the Surface 2's Tegra).
+
+BATCH-ARM-1 section 3E, his decision 9 (ARM-1-DECISIONS.md). CR77's GPU solution (SUPERMIUM-3 section 2, GPU-PORT-LIST-150.md),
+re-derived for 150. 3 files:
+- third_party/angle/gni/angle.gni: angle_enable_d3d11 and angle_enable_vulkan are off for current_cpu == "arm"; D3D9 and GL stay on.
+  (gn args on out/arm-rt21: angle_enable_d3d11 = false, angle_enable_d3d9 = true, angle_enable_vulkan = false, angle_enable_gl = true.)
+- ui/gl/gl_features.cc: kAllowANGLED3D9Fallback is enabled by default on Windows ARM32 only (x86/x64/arm64 keep DISABLED): without it
+  ARM32 would get neither D3D11 (excluded) nor D3D9 (gated off) - no ANGLE display at all.
+- third_party/angle/src/libANGLE/renderer/d3d/d3d9/Renderer9.cpp: ANGLE_SUPPORT_SHADER_MODEL_2 = 1 for _M_ARM only (pixel shader 2.0,
+  feature level 9_x); other targets keep shader model 3.
+CR77's NPOT hunk is dropped (his decision: a no-op on Windows 10). SwiftShader and ANGLE's WebGPU backend are off for ARM in
+venetium/args/out-arm-rt21.gn (args, not this patch).
+Checked (RUNTIME, real arm-rt21 graph after gn gen): 399 ANGLE objects including the D3D9 backend and gl_features.obj compile as
+ARMNT; linking libGLESv2/libEGL waits on libc++ (TOOLCHAIN-ISSUES, ARM32 C++ EH). Device-only: D3D9 on the Tegra at FL 9_x.
+
+diff --git a/third_party/angle/gni/angle.gni b/third_party/angle/gni/angle.gni
+index 43ef5a9..88dd9c8 100644
+--- a/third_party/angle/gni/angle.gni
++++ b/third_party/angle/gni/angle.gni
+@@ -216,7 +216,10 @@ declare_args() {
+   angle_standalone = !build_with_chromium
+ 
+   angle_enable_d3d9 = is_win && !angle_is_winuwp
+-  angle_enable_d3d11 = is_win
++
++  # Venetium 0021: Windows ARM32 (Surface 2 / Tegra 4) renders through ANGLE's
++  # D3D9 backend (and GL); the D3D11 and Vulkan backends are not built there.
++  angle_enable_d3d11 = is_win && current_cpu != "arm"
+   angle_enable_gl =
+       (ozone_platform_drm || ozone_platform_wayland || !is_linux ||
+        ((angle_use_x11 && !is_chromeos) || angle_use_wayland || is_castos)) &&
+@@ -224,7 +227,7 @@ declare_args() {
+ 
+   angle_enable_vulkan =
+       angle_has_build &&
+-      ((is_win && !angle_is_winuwp) ||
++      ((is_win && !angle_is_winuwp && current_cpu != "arm") ||
+        ((is_linux || is_chromeos) &&
+         (angle_use_x11 || angle_use_wayland || angle_use_vulkan_display)) ||
+        is_android || is_fuchsia || is_mac)
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d9/Renderer9.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d9/Renderer9.cpp
+index cabd5ad..ea23d79 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d9/Renderer9.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d9/Renderer9.cpp
+@@ -68,7 +68,13 @@
+ // Enable ANGLE_SUPPORT_SHADER_MODEL_2 if you wish devices with only shader model 2.
+ // Such a device would not be conformant.
+ #ifndef ANGLE_SUPPORT_SHADER_MODEL_2
+-#    define ANGLE_SUPPORT_SHADER_MODEL_2 0
++// Venetium 0021: Windows ARM32 only. Its D3D9 devices (feature level 9_x GPUs) report pixel
++// shader 2.0, so accept PS 2.0 there; every other CPU keeps the stock floor of PS 3.0.
++#    if defined(_M_ARM)
++#        define ANGLE_SUPPORT_SHADER_MODEL_2 1
++#    else
++#        define ANGLE_SUPPORT_SHADER_MODEL_2 0
++#    endif
+ #endif
+ 
+ namespace rx
+diff --git a/ui/gl/gl_features.cc b/ui/gl/gl_features.cc
+index 3434e8f..ed965eb 100644
+--- a/ui/gl/gl_features.cc
++++ b/ui/gl/gl_features.cc
+@@ -364,7 +364,15 @@ bool IsSoftwareGLFallbackDueToCrashesAllowed(
+   return base::FeatureList::IsEnabled(kAllowSoftwareGLFallbackDueToCrashes);
+ }
+ 
+-BASE_FEATURE(kAllowANGLED3D9Fallback, base::FEATURE_DISABLED_BY_DEFAULT);
++// Venetium 0021: on Windows ARM32 ANGLE is built without its D3D11 backend
++// (third_party/angle/gni/angle.gni), so D3D9 is the only ANGLE display type
++// there rather than a fallback. Stock (disabled) everywhere else.
++BASE_FEATURE(kAllowANGLED3D9Fallback,
++#if BUILDFLAG(IS_WIN) && defined(ARCH_CPU_ARMEL)
++             base::FEATURE_ENABLED_BY_DEFAULT);
++#else
++             base::FEATURE_DISABLED_BY_DEFAULT);
++#endif
+ 
+ bool IsANGLED3D9FallbackAllowed() {
+   return base::FeatureList::IsEnabled(kAllowANGLED3D9Fallback);

@@ -1,0 +1,65 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Venetium kit — GPU run</title>
+<!-- BATCH-GPU-1 §7.21: the GPU A/B page. Runs the video page then the stall page (each in an iframe), collects their results by
+     postMessage, then (1) leaves window.__kitResult for the server CDP runner (§5) and (2) prints one "KITGPU_RESULT <json>" line
+     to the console, which --enable-logging --v=1 --log-file captures on the device - so the zipped kit\gpu\logs\<config>\ folder
+     carries both chrome's GPU internals and the page's measured frames/gaps, with no download step for him to do.
+     URL params: ?config=<name>&video-seconds=N&stall-seconds=N (defaults 30 / 60). -->
+<style>
+  body { font: 15px/1.4 "Segoe UI", Arial, sans-serif; margin: 14px; }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  #state { font-size: 28px; font-weight: bold; margin: 8px 0; }
+  table { border-collapse: collapse; margin: 8px 0; } td, th { border: 1px solid #999; padding: 3px 8px; text-align: left; font: 13px Consolas, monospace; }
+  iframe { width: 820px; max-width: 97vw; height: 540px; border: 1px solid #ccc; display: block; margin: 8px 0; }
+</style>
+<h1>Venetium kit — GPU run</h1>
+<div id="state">running…</div>
+<table id="t"><tr><th>page</th><th>verdict</th><th>checks ok</th><th>key numbers</th></tr></table>
+<div id="frames"></div>
+<script src="../lib/configs.js"></script>
+<script>
+(async () => {
+  const q = new URLSearchParams(location.search);
+  const config = q.get('config') || 'default';
+  const vSec = Number(q.get('video-seconds') || 30);
+  const sSec = Number(q.get('stall-seconds') || 60);
+  const PAGES = [
+    { page: 'video', url: '../video/video.html', qs: 'seconds=' + vSec, limit: (vSec * 3 + 40) * 1000 },
+    { page: 'stall', url: '../stall/stall.html', qs: 'seconds=' + sSec, limit: (sSec + 40) * 1000 },
+  ];
+  const results = [];
+  function waitFor(frame, ms) {
+    return new Promise(resolve => {
+      const timer = setTimeout(() => { window.removeEventListener('message', on); resolve(null); }, ms);
+      function on(e) { if (e.source === frame.contentWindow && e.data && e.data.kit) { clearTimeout(timer); window.removeEventListener('message', on); resolve(e.data.kit); } }
+      window.addEventListener('message', on);
+    });
+  }
+  for (const p of PAGES) {
+    document.getElementById('state').textContent = 'running ' + p.page + '…';
+    const f = document.createElement('iframe'); f.title = p.page;
+    f.setAttribute('allow', 'autoplay *; fullscreen *');
+    document.getElementById('frames').appendChild(f);
+    f.scrollIntoView({ block: 'start' });
+    const wait = waitFor(f, p.limit);
+    f.src = p.url + '?config=' + encodeURIComponent(config) + '&' + p.qs;
+    const r = await wait;
+    const key = r && r.kind === 'video'
+      ? (r.clips || []).map(c => c.id + ':' + (c.decodedDuringRun != null ? c.decodedDuringRun + 'dec/' + c.droppedDuringRun + 'drop/' + c.gapsOver100 + 'gap' : (c.error || '?'))).join('  ')
+      : r && r.kind === 'stall' ? (r.stats ? r.stats.fps + 'fps gaps>' + r.stats.gapsOver100 + ' longest' + r.stats.longestGapMs + 'ms' : '') : '';
+    const rec = { page: p.page, verdict: r ? r.verdict : 'TIMEOUT', ok: r ? r.checks.filter(c => c.ok).length + '/' + r.checks.length : '0/0', key, result: r };
+    results.push(rec);
+    const tr = document.createElement('tr');
+    for (const x of [rec.page, rec.verdict, rec.ok, rec.key]) { const td = document.createElement('td'); td.textContent = String(x); tr.appendChild(td); }
+    document.getElementById('t').appendChild(tr);
+  }
+  const summary = { kind: 'gpu-run', config, videoSeconds: vSec, stallSeconds: sSec, userAgent: navigator.userAgent,
+                    verdict: results.every(r => r.verdict === 'PASS') ? 'PASS' : 'FAIL', pages: results };
+  window.__kitResult = summary;
+  document.getElementById('state').textContent = 'all done — ' + summary.verdict;
+  document.title = 'KITGPU ' + summary.verdict;
+  // the line the device's --log-file captures (renderer console → chrome_debug.log with --enable-logging --v=1)
+  try { console.log('KITGPU_RESULT ' + JSON.stringify(summary)); } catch (e) {}
+})();
+</script>

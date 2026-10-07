@@ -1,0 +1,105 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Venetium kit — video</title>
+<!-- BATCH-GPU-1 §7.19: plays the kit's embedded clips locally (no network) and records decoded/dropped frames and
+     requestVideoFrameCallback presentation gaps per clip. The 720p H.264 High clip (avc1.64001F) is the YouTube-codec case the
+     Surface 2 stalls on; it is looped to reach the target seconds. NOTE (server limitation, recorded in GPU-1-RESULTS.md): this
+     server has no x64 ffmpeg and the tree carries no media/test/data video, so only the kit's embedded bear clips are available -
+     H.264 is 1280x720, but VP9/AV1 are only 320x240 and there is no 854x480 H.264 control. Each clip's resolution is reported. -->
+<script src="../lib/configs.js"></script>
+<script src="../lib/kit.js"></script>
+<script src="../lib/gpu-scene.js"></script>
+<script src="../data/media-index.js"></script>
+<body>
+<script>
+(async () => {
+  const q = new URLSearchParams(location.search);
+  const seconds = Math.max(3, Number(q.get('seconds') || 30));   // per clip
+  const IDX = {}; for (const c of (window.KIT_MEDIA_INDEX || [])) IDX[c.id] = c;
+  // the clips to exercise, headline first; each entry: id from the catalog + whether it is the primary 720p case
+  const PLAN = [
+    { id: 'avc1', role: '720p H.264 High (avc1.64001F) — the YouTube case' },
+    { id: 'vp9',  role: 'VP9 (only 320x240 available on this server)' },
+    { id: 'av01', role: 'AV1 (only 320x240 available on this server)' },
+  ];
+
+  // report which ANGLE backend/feature level is live (proof of 9_3 vs D3D9), and whether WebGL 1 renders
+  const gl = GPUScene.webglReport();
+  Kit.info('WebGL renderer (unmasked)', gl.renderer || gl.error || '(none)');
+  Kit.info('WebGL MAX_VARYING_VECTORS', gl.maxVaryingVectors);
+  Kit.check('WebGL 1 renders (drew a non-background pixel)', true, gl.ok + (gl.error ? ' (' + gl.error + ')' : ''), gl.ok);
+
+  const vid = document.createElement('video');
+  vid.loop = true; vid.muted = true; vid.playsInline = true; vid.controls = false;
+  vid.style.cssText = 'width:640px;max-width:96vw;background:#000;border-radius:8px;display:block;margin:8px 0';
+  document.body.appendChild(vid);
+
+  const clipResults = [];
+  for (const p of PLAN) {
+    const meta = IDX[p.id];
+    if (!meta) { Kit.check('clip ' + p.id + ' present in catalog', 'present', 'missing', false); continue; }
+    const label = p.id + ' ' + (meta.w ? meta.w + 'x' + meta.h : '') + ' ' + meta.codecs;
+    let url = '';
+    try {
+      await Kit.loadScript('../data/media-' + p.id + '.js');
+      const b64 = (window.KIT_MEDIA || {})[p.id];
+      if (!b64) throw new Error('KIT_MEDIA[' + p.id + '] empty');
+      url = Kit.blobUrl(b64, meta.mime);
+      delete window.KIT_MEDIA[p.id];
+    } catch (e) {
+      Kit.check(label + ': clip loaded', 'loaded', String(e.message || e), false);
+      clipResults.push({ id: p.id, role: p.role, error: String(e.message || e) });
+      continue;
+    }
+
+    // play this clip for `seconds`, recording rVFC presentation gaps
+    const rec = { id: p.id, role: p.role, w: meta.w, h: meta.h, codecs: meta.codecs, seconds,
+                  firstFrameMs: null, decoded0: null, dropped0: null, decoded1: null, dropped1: null,
+                  presentedFrames: 0, gapsOver100: 0, longestGapMs: 0, gaps: [], error: null };
+    const hasRVFC = typeof vid.requestVideoFrameCallback === 'function';
+    await new Promise(resolve => {
+      let done = false, lastNow = null, startQ = null, t0 = performance.now();
+      const finish = () => { if (done) return; done = true; try { vid.pause(); } catch (e) {} resolve(); };
+      const errTimer = setTimeout(() => { if (rec.presentedFrames === 0 && rec.firstFrameMs === null) { rec.error = (rec.error || 'no frame within 8 s'); } }, 8000);
+      vid.onerror = () => { rec.error = 'media error ' + (vid.error ? vid.error.code + '/' + vid.error.message : '?'); };
+      function sampleQ() { if (typeof vid.getVideoPlaybackQuality === 'function') { const x = vid.getVideoPlaybackQuality(); return { d: x.totalVideoFrames, p: x.droppedVideoFrames }; } return null; }
+      function onRVFC(now, m) {
+        if (rec.firstFrameMs === null) { rec.firstFrameMs = Math.round(now - t0); startQ = sampleQ(); if (startQ) { rec.decoded0 = startQ.d; rec.dropped0 = startQ.p; } }
+        rec.presentedFrames++;
+        if (lastNow !== null) { const g = now - lastNow; if (g > 100) { rec.gapsOver100++; if (g > rec.longestGapMs) rec.longestGapMs = g; if (rec.gaps.length < 200) rec.gaps.push({ tMs: Math.round(now - t0), gapMs: Math.round(g) }); } }
+        lastNow = now;
+        if (now - t0 < seconds * 1000 && !done) vid.requestVideoFrameCallback(onRVFC);
+        else { const q = sampleQ(); if (q) { rec.decoded1 = q.d; rec.dropped1 = q.p; } rec.longestGapMs = Math.round(rec.longestGapMs); clearTimeout(errTimer); finish(); }
+      }
+      vid.src = url;
+      const play = vid.play();
+      if (play && play.catch) play.catch(e => { /* autoplay may need muted; it is muted */ });
+      if (hasRVFC) vid.requestVideoFrameCallback(onRVFC);
+      else {
+        // fallback: no rVFC — sample quality on a timer
+        rec.rvfc = false;
+        const startQ2 = sampleQ(); if (startQ2) { rec.decoded0 = startQ2.d; rec.dropped0 = startQ2.p; }
+        setTimeout(() => { const q = sampleQ(); if (q) { rec.decoded1 = q.d; rec.dropped1 = q.p; } clearTimeout(errTimer); finish(); }, seconds * 1000);
+      }
+    });
+    try { URL.revokeObjectURL(url); } catch (e) {}
+
+    const decoded = (rec.decoded1 != null && rec.decoded0 != null) ? rec.decoded1 - rec.decoded0 : rec.decoded1;
+    rec.decodedDuringRun = decoded;
+    rec.droppedDuringRun = (rec.dropped1 != null && rec.dropped0 != null) ? rec.dropped1 - rec.dropped0 : rec.dropped1;
+    clipResults.push(rec);
+    if (rec.error) {
+      Kit.check(label + ': plays without a media error', 'no error', rec.error, false);
+    } else {
+      Kit.check(label + ': decoded > 0 frames in ' + seconds + ' s', '> 0', (decoded != null ? decoded : '(no quality API)') + ' decoded', decoded != null ? decoded > 0 : rec.presentedFrames > 0);
+      Kit.info(label + ': dropped frames', rec.droppedDuringRun + ' of ' + decoded);
+      Kit.info(label + ': presented frames (rVFC)', rec.presentedFrames);
+      Kit.info(label + ': presentation gaps > 100 ms', rec.gapsOver100 + ' (longest ' + rec.longestGapMs + ' ms)');
+      Kit.info(label + ': first frame', rec.firstFrameMs + ' ms');
+    }
+  }
+
+  await Kit.done({ kind: 'video', seconds, webgl: gl, clips: clipResults });
+})();
+</script>
+</body>

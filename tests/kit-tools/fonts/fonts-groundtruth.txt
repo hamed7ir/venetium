@@ -1,0 +1,40 @@
+am: Ebrima:2
+ar: Segoe UI:3
+as: Nirmala UI:6
+be: Segoe UI:3
+bg: Segoe UI:8
+bn: Nirmala UI:5
+el: Segoe UI:11
+fa: Segoe UI:6
+gu: Nirmala UI:4
+he: Segoe UI:6
+hi: Nirmala UI:16
+hy: Segoe UI:6
+ja: Yu Gothic:4
+ka: Segoe UI:9
+kk: Segoe UI:6
+km: Leelawadee UI:4
+kn: Nirmala UI:3
+ko: Malgun Gothic:2
+ky: Segoe UI:7
+lo: Leelawadee UI:7
+mk: Segoe UI:2
+ml: Nirmala UI:8
+mn: Segoe UI:7
+mr: Nirmala UI:3
+my: Myanmar Text:8
+ne: Nirmala UI:16
+or: Nirmala UI:6
+pa: Nirmala UI:4
+ru: Segoe UI:1
+si: Nirmala UI:4
+sr: Segoe UI:2
+ta: Nirmala UI:6
+te: Nirmala UI:4
+th: Tahoma:9
+uk: Segoe UI:3
+ur: Segoe UI:9
+zh-CN: Microsoft YaHei:2
+zh-HK: 微軟正黑體:2
+zh-TW: 微軟正黑體:2
+en: Segoe UI:61

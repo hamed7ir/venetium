@@ -1,0 +1,51 @@
+Venetium 0031 - on Windows ARM32, link without Control Flow Guard (the compiler still emits CFG; only the link flag is dropped).
+
+BATCH-ARM-FIX-2, his decision (2026-10-04, "ship CFG-off now, lld fix later"), after the DEVICE-5 trip.
+
+On the Surface 2 (Windows 10 build 15035 ARM32) the 0029+0030 build fixed the sandbox launch, but the browser then ended ~1.4 s
+after start with exit 0xC0000409, fast-fail subcode 10 (FAST_FAIL_GUARD_ICALL_CHECK_FAILURE - a Control Flow Guard indirect-call
+check). Captured by the DEVICE-5 debugger launcher (dbgrun.exe), all four runs identical: the rejected indirect-call target is the
+delay-load helper thunk __imp___load_GetIfTable2 (GetIfTable2, iphlpapi, network-interface enumeration - the first delay-loaded
+call at startup), independent of the sandbox, the GPU and the segmentation feature.
+
+Root cause (a toolchain defect, TOOLCHAIN-ISSUES.md B6, handoff LLD-ARM-CFG-1): rt2.1 lld-link's ARM32 /guard:cf emits the CFG
+function table but leaves the Guard Address-Taken IAT Entry Table empty (GuardAddressTakenIatEntryCount = 0 on ARM32, versus 11
+on the x86 chrome.dll from the same linker). Delay-load thunks are therefore not valid indirect-call targets, and the first call
+through one fast-fails. This is lld's output, not the compiler or the source.
+
+1 file:
+- build/config/win/BUILD.gn: config("cfi_linker") adds the /guard:cf LINK flag under an added "&& current_cpu != \"arm\"" guard,
+  so ARM32 images are linked without CFG. The compile flag (default_cfg_compiler, /guard:cf) is unchanged, so the objects keep
+  their CFG instrumentation and nothing is recompiled - only the ARM32 images relink. An image linked without /guard:cf has no
+  GUARD_CF characteristic and no CF function table, so the loader does not enforce CFG and leaves the compiled guard-check calls
+  as no-ops. Every other architecture is unchanged.
+
+Effect on ARM32: CFG is no longer enforced. ASLR (DYNAMIC_BASE), DEP (NX_COMPAT) and the other hardening are unchanged. This is a
+workaround; remove 0031 when the lld-link ARM32 CFG gap is fixed (LLD-ARM-CFG-1), which restores CFG.
+
+Checked (STRUCTURAL): relink only, no recompiles (ninja: 0 CXX steps). chrome.dll, venetium.exe and chrome_elf.dll are ARMNT with
+the same sections, exports, version strings and import symbol sets as before; the only identity change is the DLL characteristics
+losing GUARD_CF (load config GuardCFFunctionCount 0, no CF_FUNCTION_TABLE_PRESENT); the __rt_* division shim is still present.
+
+NOT MEASURED: whether this clears the 0xC0000409 crash on the device (his re-run).
+
+diff --git a/build/config/win/BUILD.gn b/build/config/win/BUILD.gn
+index c1bac78..3073b47 100644
+--- a/build/config/win/BUILD.gn
++++ b/build/config/win/BUILD.gn
+@@ -371,7 +371,14 @@ config("cfi_linker") {
+   # ASan and CFG leads to slow process startup. Chromium's test runner uses
+   # lots of child processes, so this means things are really slow. Disable CFG
+   # for now. https://crbug.com/846966
+-  if (!is_debug && !is_asan) {
++  # Venetium 0031: not on Windows ARM32. rt2.1 lld-link's ARM32 /guard:cf does not emit the Guard Address-Taken IAT Entry
++  # Table (GuardAddressTakenIatEntryCount = 0 on ARM32, vs populated on x86 from the same linker), so the first indirect call
++  # through a delay-load thunk (GetIfTable2 during startup network-interface enumeration) is rejected by CFG and the process
++  # fast-fails on build 15035 (0xC0000409, FAST_FAIL_GUARD_ICALL_CHECK_FAILURE; DEVICE-5). Linking ARM32 without /guard:cf
++  # produces a non-CFG image, so the loader leaves the compiled guard-check calls as no-ops. The objects keep /guard:cf
++  # (compile is unchanged), so this is a relink, not a rebuild. Remove when the lld-link ARM32 CFG gap is fixed (toolchain
++  # handoff LLD-ARM-CFG-1).
++  if (!is_debug && !is_asan && current_cpu != "arm") {
+     # Turn on CFG bitmap generation and CFG load config.
+     ldflags = [ "/guard:cf" ]
+   }

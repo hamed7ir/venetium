@@ -1,0 +1,55 @@
+Venetium 0030 - on Windows ARM32 the sandbox no longer claims win32k lockdown (no fake-GDI interceptions).
+
+BATCH-ARM-FIX-2, his decision (2026-10-04, after review wf_8ca010d1-e4a: "Add 0030 now").
+
+Venetium 0029 creates sandboxed children on ARM32 without PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY (Windows 10 build 15035 ARM32
+refuses that attribute), so WIN32K_SYSTEM_CALL_DISABLE cannot take effect in the renderer and the services (storage service).
+Their sandbox config still asked for it, though, and with the flag set:
+- the broker installs its fake-GDI interceptions (ProcessMitigationsWin32KDispatcher: GdiDllInitialize returns success without
+  initialising gdi32, GetStockObject returns null, RegisterClassW pretends success);
+- base::win::IsUser32AndGdi32Available() reads the real process policy, finds win32k usable, and sends renderer code down its
+  user32/gdi32 paths.
+Upstream never ships that combination. (kWinSboxNoFakeGdiInit is disabled by default, so the fake-GDI rules are added on 15035,
+which maps to RS1.)
+
+1 file:
+- sandbox/policy/win/sandbox_win.cc: SandboxWin::AddWin32kLockdownPolicy() returns SBOX_ALL_OK at once under #if defined(_M_ARM),
+  without setting MITIGATION_WIN32K_DISABLE or SetFakeGdiInit(); its body is unchanged under #else. Both callers (the renderer in
+  sandbox_win.cc and kService / kServiceWithJit in utility_sandbox_delegate_win.cc) go through it. Every other architecture is
+  unchanged.
+
+Effect on ARM32: renderers and services run with user32/gdi32 usable and no win32k interceptions, as they do with --no-sandbox
+(device runs 3 and 4 started renderer and storage-service processes that way). No further protection is lost: win32k lockdown was
+already gone at launch with 0029. The config is now truthful, so chrome://sandbox no longer lists win32k lockdown for those
+processes on ARM32.
+
+NOT MEASURED: the device run (renderer and storage service under the sandbox).
+
+diff --git a/sandbox/policy/win/sandbox_win.cc b/sandbox/policy/win/sandbox_win.cc
+index 9ec89be..14b6984 100644
+--- a/sandbox/policy/win/sandbox_win.cc
++++ b/sandbox/policy/win/sandbox_win.cc
+@@ -750,6 +750,15 @@ ResultCode SandboxWin::AddAppContainerPolicy(TargetConfig* config,
+ // static
+ ResultCode SandboxWin::AddWin32kLockdownPolicy(TargetConfig* config) {
+   DCHECK(!config->IsConfigured());
++#if defined(_M_ARM)
++  // Venetium 0030: on Windows ARM32 sandboxed children are created without
++  // the mitigation-policy attribute (Venetium 0029: build 15035 refuses it),
++  // so win32k lockdown cannot take effect there. Do not claim it either: with
++  // the flag set the broker would still install its fake-GDI interceptions
++  // (gdi32 initialisation faked) in a process whose win32k works. Renderers
++  // and services then use user32/gdi32 as they do with --no-sandbox.
++  return SBOX_ALL_OK;
++#else
+   MitigationFlags flags = config->GetProcessMitigations();
+   // Check not enabling twice. Should not happen.
+   DCHECK_EQ(0U, flags & MITIGATION_WIN32K_DISABLE);
+@@ -765,6 +774,7 @@ ResultCode SandboxWin::AddWin32kLockdownPolicy(TargetConfig* config) {
+     return config->SetFakeGdiInit();
+   }
+   return SBOX_ALL_OK;
++#endif  // defined(_M_ARM)
+ }
+ 
+ // static

@@ -1,0 +1,92 @@
+--- a/chrome/app/chrome_exe_main_win.cc
++++ b/chrome/app/chrome_exe_main_win.cc
+@@ -6,6 +6,9 @@
+ 
+ #include <tchar.h>
+ #include <windows.h>
++
++#include <aclapi.h>  // Venetium 0038: Get/SetNamedSecurityInfoW, SetEntriesInAclW
++#include <sddl.h>    // Venetium 0038: ConvertStringSidToSidW
+ 
+ #include <malloc.h>
+ #include <stddef.h>
+@@ -80,6 +83,66 @@
+           .DirName());
+ }
+ 
++#if defined(_M_ARM)
++// Venetium 0038 (DEVICE-7-FIX-1, sandbox H1): on Windows 10 15035 ARM32 the renderer runs under a USER_LOCKDOWN restricted
++// token whose restricted-SID set is {RESTRICTED (S-1-5-12), logon SID}. A copy-anywhere portable folder's DACL grants read
++// only to Users/Administrators - none in that set - so the loader's raw read of chrome.dll is ACCESS_DENIED and the renderer
++// dies with 0xC0000135 (dllprobe trip-6 proved H1; the GPU USER_LIMITED token reads fine, so only renderers died). Grant the
++// application directory read+execute to the RESTRICTED SID (S-1-5-12) once at browser startup, before any child launch -
++// idempotent (skips if the ACE is already present), needs no installer, copy-anywhere. All failures are non-fatal; the sandbox
++// still refuses if a further restriction bites, and --no-sandbox remains the fallback.
++void GrantAppDirToRestrictedSid() {
++  wchar_t exe[MAX_PATH];
++  DWORD n = ::GetModuleFileNameW(nullptr, exe, MAX_PATH);
++  if (!n || n >= MAX_PATH)
++    return;
++  wchar_t* slash = wcsrchr(exe, L'\\');
++  if (!slash)
++    return;
++  *slash = L'\0';  // the application directory
++
++  PSID restricted = nullptr;
++  if (!::ConvertStringSidToSidW(L"S-1-5-12", &restricted))
++    return;
++
++  PACL old_dacl = nullptr;
++  PSECURITY_DESCRIPTOR sd = nullptr;
++  if (::GetNamedSecurityInfoW(exe, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
++                              nullptr, nullptr, &old_dacl, nullptr,
++                              &sd) == ERROR_SUCCESS) {
++    bool already = false;  // idempotent: skip if the restricted SID already has an allow ACE
++    for (WORD i = 0; old_dacl && i < old_dacl->AceCount; ++i) {
++      ACCESS_ALLOWED_ACE* ace = nullptr;
++      if (::GetAce(old_dacl, i, reinterpret_cast<void**>(&ace)) &&
++          ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE &&
++          ::EqualSid(restricted, &ace->SidStart)) {
++        already = true;
++        break;
++      }
++    }
++    if (!already) {
++      EXPLICIT_ACCESSW ea = {};
++      ea.grfAccessPermissions = GENERIC_READ | GENERIC_EXECUTE;
++      ea.grfAccessMode = GRANT_ACCESS;
++      ea.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
++      ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
++      ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
++      ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(restricted);
++      PACL new_dacl = nullptr;
++      if (::SetEntriesInAclW(1, &ea, old_dacl, &new_dacl) == ERROR_SUCCESS) {
++        ::SetNamedSecurityInfoW(exe, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
++                                nullptr, nullptr, new_dacl, nullptr);
++        if (new_dacl)
++          ::LocalFree(new_dacl);
++      }
++    }
++  }
++  if (sd)
++    ::LocalFree(sd);
++  ::LocalFree(restricted);
++}
++#endif  // defined(_M_ARM)
++
+ bool IsFastStartSwitch(const std::string& command_line_switch) {
+   return command_line_switch == switches::kProfileDirectory;
+ }
+@@ -237,6 +300,12 @@
+   SignalInitializeCrashReporting();
+   if (IsBrowserProcess())
+     DisableDelayLoadFailureHooksForMainExecutable();
++#if defined(_M_ARM)
++  // Venetium 0038 (DEVICE-7-FIX-1, sandbox H1): before any child launch, grant the app dir read+execute to S-1-5-12 so the
++  // renderer's lockdown token can read chrome.dll on 15035 ARM32 (copy-anywhere; idempotent; non-fatal).
++  if (IsBrowserProcess())
++    GrantAppDirToRestrictedSid();
++#endif
+ #if defined(ARCH_CPU_32_BITS)
+   // Intentionally crash if converting to a fiber failed.
+   CHECK_EQ(fiber_status, FiberStatus::kSuccess);

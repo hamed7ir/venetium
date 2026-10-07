@@ -1,0 +1,15 @@
+# Venetium GN args (BATCH-VENETIUM-4 §2). Not a patch: the build batch merges this file into each output directory's args.gn.
+# #1 Field-trial TESTING config off: non-Chrome-branded builds otherwise apply testing/variations/fieldtrial_testing_config.json at every start.
+disable_fieldtrial_testing_config = true
+# #9 Reporting API and Network Error Logging off (no background report uploads).
+enable_reporting = false
+# #10 On-device model service off (the ML model runtime process and its code).
+use_on_device_model_service = false
+# #15 JPEG XL decoder off.
+enable_jxl_decoder = false
+# D13 (his decision, 2026-10-02: "video and audio should be on"): proprietary codecs (H.264, AAC, ...) in every Venetium build.
+proprietary_codecs = true
+ffmpeg_branding = "Chrome"
+# D15 (his decision, 2026-10-02: "official build, I agree with you"): stay non-official (no ThinLTO/PGO), but use the real
+# build/util/LASTCHANGE (Chromium's revision and year, venetium\deps\release-inputs.tsv) instead of LASTCHANGE.dummy.
+use_dummy_lastchange = false

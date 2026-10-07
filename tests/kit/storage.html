@@ -1,0 +1,142 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Venetium kit — storage</title>
+<script src="lib/configs.js"></script>
+<script src="lib/kit.js"></script>
+<script>
+// localStorage, IndexedDB and a Blob download. On file:// every document is its own opaque origin: localStorage and IndexedDB
+// may be unavailable there (Chromium gives file:// documents storage only when allowed), so a SecurityError is reported, not hidden.
+//
+// WHAT THIS PAGE PROVES, AND WHAT IT DOES NOT. It proves the storage APIs round-trip data inside this page load, byte for byte,
+// including values big enough to reach the storage backend's compressor and (IndexedDB, above ~64 KB) its blob files, and that an
+// IndexedDB database survives closing the connection and being opened again. It does NOT prove that anything reaches the profile on
+// disk (that would need a browser restart between two runs), and it cannot see whether the download arrived: the runner records that
+// (summary.pages.storage.downloads); on the device the file is in the Downloads folder (venetium-kit-download.txt, 1 line).
+//
+// Expected values come from the host: the big values are made by the generator below and their CRC-32 is the one Node's zlib.crc32
+// computes (kit-tools/storage/storage-expect.js, whose --check compares the HOST block below with it), not something measured here.
+// The generator is checked first against that host value, so a failure of the read-back check alone points at the storage, a failure
+// of both at the JS engine.
+//
+// No fetch / XHR / workers: a file:// page reads nothing but its own <script src> files. Every wait has a timeout, and the page
+// reports even when something throws outside a section (it never leaves index.html waiting for its time limit).
+
+// ---- HOST VALUES (Node zlib.crc32 of the bytes payload(seed, len) makes; do not edit by hand: kit-tools/storage/storage-expect.js --check) ----
+const HOST = {
+  ls:  { seed: 20261004, len: 98304, crc: '9cb487ba' },
+  idb: [{ seed: 7, len: 40000, crc: '8ccf673f' }, { seed: 11, len: 300000, crc: '3042c81b' }],
+};
+// ---- END HOST VALUES ----
+
+const within = (p, ms, what) => { let t; return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(what + ': no answer within ' + ms + ' ms')), ms); })]).finally(() => clearTimeout(t)); };
+// deterministic test bytes: 256-byte blocks, alternately a repeating text-like pattern (compressible: reaches the backend's compressor)
+// and pseudo-random bytes (not compressible)
+function payload(seed, len) {
+  const u = new Uint8Array(len); let x = seed >>> 0;
+  for (let i = 0; i < len; i++) {
+    if (((i >> 8) & 1) === 0) u[i] = 33 + ((i * 7) % 90);
+    else { x = (Math.imul(x, 1664525) + 1013904223) >>> 0; u[i] = x >>> 24; }
+  }
+  return u;
+}
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; } return t; })();
+function crc32(u) { let c = 0xFFFFFFFF; for (let i = 0; i < u.length; i++) c = CRC_T[(c ^ u[i]) & 255] ^ (c >>> 8); return ((c ^ 0xFFFFFFFF) >>> 0).toString(16).padStart(8, '0'); }
+const errText = e => (e && e.name ? e.name + ': ' : '') + ((e && e.message) || e);
+
+(async () => {
+  const stamp = 'venetium-' + Date.now();
+  const hardStop = setTimeout(() => { Kit.check('page finished within 40 s', 'finished', 'still running', false); Kit.done(); }, 40000);
+  try {
+    // ---------------------------------------------------------------- the generator against the host
+    const gen = [['localStorage payload', HOST.ls]].concat(HOST.idb.map((h, i) => ['IndexedDB payload ' + (i + 1), h]));
+    const bytesOf = {};
+    for (const [label, h] of gen) {
+      const u = bytesOf[label] = payload(h.seed, h.len), c = crc32(u);
+      Kit.check('test payload generator (JS engine, no storage): ' + label + ' ' + h.len + ' bytes seed ' + h.seed + ' = the host CRC-32', h.crc, c, c === h.crc && u.length === h.len);
+    }
+
+    // ---------------------------------------------------------------- localStorage
+    try {
+      let prev = null; try { prev = localStorage.getItem('kit-storage'); } catch (e) { /* reported below */ }
+      Kit.info('stamp left in localStorage by an earlier load of this page (a restart or an earlier run; null = none, e.g. a fresh profile)', prev);
+      localStorage.setItem('kit-storage', stamp);
+      const want = Kit.want(stamp, stamp + '-WRONG');          // armed: this expectation is planted wrong
+      const got = localStorage.getItem('kit-storage');
+      Kit.check('localStorage set + get', want, got, got === want);
+      // a big value: 98304 chars, every code 0..255 (Latin-1 and the two-byte range both occur)
+      const u = bytesOf['localStorage payload'], parts = [];
+      for (let i = 0; i < u.length; i += 8192) parts.push(String.fromCharCode.apply(null, u.subarray(i, i + 8192)));
+      const big = parts.join('');
+      localStorage.setItem('kit-storage-big', big);
+      const back = localStorage.getItem('kit-storage-big');
+      const bb = new Uint8Array(back ? back.length : 0); for (let i = 0; i < bb.length; i++) bb[i] = back.charCodeAt(i);
+      Kit.check('localStorage: a ' + HOST.ls.len + '-character value read back = the host CRC-32', HOST.ls.crc + ', ' + HOST.ls.len + ' chars', crc32(bb) + ', ' + (back ? back.length : 'null') + ' chars', back !== null && back.length === HOST.ls.len && crc32(bb) === HOST.ls.crc);
+      localStorage.removeItem('kit-storage-big');
+      const gone = localStorage.getItem('kit-storage-big');
+      Kit.check('localStorage: removeItem makes the key read null', 'null', gone, gone === null);
+    } catch (e) { Kit.check('localStorage available', 'available', errText(e), false); }
+
+    // ---------------------------------------------------------------- IndexedDB
+    const openDb = (name) => within(new Promise((res, rej) => { const r = indexedDB.open(name, 1); r.onupgradeneeded = e => { r.result.createObjectStore('s'); r.upgradeInfo = e.oldVersion; }; r.onsuccess = () => res({ db: r.result, oldVersion: r.upgradeInfo }); r.onerror = () => rej(r.error); r.onblocked = () => rej(new Error('open blocked')); }), 10000, 'indexedDB.open ' + name);
+    const putVal = (db, key, v) => within(new Promise((res, rej) => { const tx = db.transaction('s', 'readwrite'); tx.objectStore('s').put(v, key); tx.oncomplete = res; tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error || new Error('transaction aborted')); }), 15000, 'put ' + key);
+    const getVal = (db, key) => within(new Promise((res, rej) => { const g = db.transaction('s').objectStore('s').get(key); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); }), 10000, 'get ' + key);
+    try {
+      let o = await openDb('kit-storage-db');
+      const prevIdb = await getVal(o.db, 'k').catch(e => 'read failed: ' + errText(e));
+      Kit.info('value left in IndexedDB by an earlier load of this page (undefined = none)', prevIdb === undefined ? 'undefined' : JSON.stringify(prevIdb));
+      await putVal(o.db, 'k', { v: stamp, n: [1, 2, 3] });
+      const got = await getVal(o.db, 'k');
+      Kit.check('IndexedDB put + get', JSON.stringify({ v: stamp, n: [1, 2, 3] }), JSON.stringify(got), got && got.v === stamp && got.n.join() === '1,2,3');
+      // the connection is closed and the database opened again: the data is in the database, not in the connection
+      o.db.close();
+      o = await openDb('kit-storage-db');
+      const again = await getVal(o.db, 'k');
+      Kit.check('IndexedDB: after close() and a new open() the value is still there', JSON.stringify({ v: stamp, n: [1, 2, 3] }), JSON.stringify(again), !!again && again.v === stamp && again.n.join() === '1,2,3');
+      o.db.close();
+    } catch (e) { Kit.check('IndexedDB available', 'available', errText(e), false); }
+    try {
+      // big values in a database of their own: 40000 bytes (stays in the key-value store, compressible half) and 300000 bytes (above the
+      // ~64 KB wrap threshold: stored as a blob file next to the database), read back through a new connection
+      let o = await openDb('kit-storage-big');
+      const vals = HOST.idb.map((h, i) => ['IndexedDB payload ' + (i + 1), h, 'big' + i]);
+      for (const [label, h, key] of vals) await putVal(o.db, key, bytesOf[label]);
+      o.db.close();
+      o = await openDb('kit-storage-big');
+      for (const [label, h, key] of vals) {
+        const v = await getVal(o.db, key);
+        const ok = v instanceof Uint8Array && v.length === h.len;
+        const c = ok ? crc32(v) : 'n/a';
+        Kit.check('IndexedDB: a ' + h.len + '-byte Uint8Array stored and read back through a new connection = the host CRC-32', h.crc + ', ' + h.len + ' bytes', c + ', ' + (v && v.length !== undefined ? v.length : typeof v) + ' bytes', ok && c === h.crc);
+      }
+      o.db.close();
+      await within(new Promise((res, rej) => { const r = indexedDB.deleteDatabase('kit-storage-big'); r.onsuccess = () => res(); r.onerror = () => rej(r.error); r.onblocked = () => rej(new Error('delete blocked')); }), 10000, 'deleteDatabase');
+      const fresh = await openDb('kit-storage-big');
+      const left = await getVal(fresh.db, 'big0');
+      Kit.check('IndexedDB: deleteDatabase removes the data (a new open() is a new database, nothing under the old key)', 'oldVersion 0, undefined', 'oldVersion ' + fresh.oldVersion + ', ' + (left === undefined ? 'undefined' : 'a value'), fresh.oldVersion === 0 && left === undefined);
+      fresh.db.close();
+      indexedDB.deleteDatabase('kit-storage-big');
+    } catch (e) { Kit.check('IndexedDB big values', 'work', errText(e), false); }
+
+    // ---------------------------------------------------------------- Blob + blob: URL (no fetch: a script blob run through its blob: URL), then a download
+    const text = 'Venetium kit download ' + stamp + '\n';
+    const blob = new Blob([text], { type: 'text/plain' });
+    const ab = new Uint8Array(await within(blob.arrayBuffer(), 10000, 'blob.arrayBuffer'));
+    Kit.check('Blob: size and bytes read back (arrayBuffer)', text.length + ' bytes, text equal', ab.length + ' bytes', ab.length === text.length && blob.size === text.length && String.fromCharCode.apply(null, ab) === text);
+    try {
+      const probe = new Blob(['window.__kitBlobProbe = ' + JSON.stringify({ stamp, n: 12345 }) + ';'], { type: 'text/javascript' });
+      const purl = URL.createObjectURL(probe);
+      await within(new Promise((res, rej) => { const s = document.createElement('script'); s.src = purl; s.onload = res; s.onerror = () => rej(new Error('the script behind the blob: URL did not load')); document.head.appendChild(s); }), 10000, 'script from blob: URL');
+      URL.revokeObjectURL(purl);
+      const pr = window.__kitBlobProbe;
+      Kit.check('a Blob read back through its blob: URL (loaded and run as a script)', stamp + ', 12345', pr ? pr.stamp + ', ' + pr.n : 'the script did not run', !!pr && pr.stamp === stamp && pr.n === 12345);
+    } catch (e) { Kit.check('a Blob read back through its blob: URL (loaded and run as a script)', stamp + ', 12345', errText(e), false); }
+    const url = URL.createObjectURL(blob);
+    if (document.readyState === 'loading') await new Promise(r => document.addEventListener('DOMContentLoaded', r, { once: true }));
+    const a = document.createElement('a'); a.href = url; a.download = 'venetium-kit-download.txt'; document.body.appendChild(a); a.click(); a.remove();
+    Kit.info('Blob download link clicked (file name)', 'venetium-kit-download.txt: the page cannot see whether it arrived; the runner records it, on the device it is in the Downloads folder');
+    Kit.info('what the checks above prove', 'the storage APIs round-trip data within this page load (and an IndexedDB database survives close + reopen); they do not prove the data reaches the profile on disk, that needs a restart between two runs (see the two "earlier load" rows)');
+  } catch (e) { Kit.check('page: uncaught exception', 'none', errText(e), false); }
+  clearTimeout(hardStop);
+  await Kit.done();
+})();
+</script>

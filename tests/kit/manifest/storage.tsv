@@ -1,0 +1,2 @@
+path	sha256	source
+storage.html	3060ce2acb8c567af45c8758b9c3639bb45f19eddbdbf1e667f904c81b0cb418	original code (this kit): the storage test page (localStorage, IndexedDB, Blob + download); no data files: its HOST VALUES block (CRC-32 of the big test payloads) is computed and checked by venetium/tests/kit-tools/storage/storage-expect.js (Node zlib.crc32); mutation checks in venetium/tests/kit-tools/storage/mutants.js

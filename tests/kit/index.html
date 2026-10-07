@@ -1,0 +1,87 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Venetium test kit</title>
+<style>
+  body { font: 15px/1.4 "Segoe UI", Arial, sans-serif; margin: 14px; }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  #final { font-size: 44px; font-weight: bold; margin: 10px 0; }
+  .PASS { color: #0a7a0a; } .FAIL { color: #b00000; } .RUNNING { color: #555; }
+  table { border-collapse: collapse; margin: 8px 0; }
+  td, th { border: 1px solid #999; padding: 3px 8px; text-align: left; }
+  #frames iframe { width: 1000px; height: 360px; border: 1px solid #ccc; display: block; margin: 6px 0; }
+  button { font-size: 16px; padding: 6px 14px; }
+</style>
+<h1>Venetium test kit</h1>
+<div id="cfg"></div>
+<div id="final" class="RUNNING">running…</div>
+<button id="save" disabled>Save results</button>
+<table id="t"><tr><th>page</th><th>verdict</th><th>checks</th><th>failed</th><th>planted</th><th>time</th><th>tier proof</th></tr></table>
+<div id="frames"></div>
+<script src="lib/configs.js"></script>
+<script>
+// Runs every page of the kit in order, each in an iframe, and collects their results by postMessage (file:// pages are opaque
+// origins: no other channel works). ?config=<name>&armed=1 are passed to every page. A page that does not report within its
+// time limit counts as FAIL. "Save results" downloads kit-results-<config>-<time>.json.
+const q = new URLSearchParams(location.search);
+const config = q.get('config') || 'default', armed = q.get('armed') === '1';
+const cfg = KIT_CONFIGS[config] || {};
+document.getElementById('cfg').textContent = 'configuration: ' + config + (cfg.flags && cfg.flags.length ? ' (js-flags ' + cfg.flags.join(' ') + ')' : '') +
+  (armed ? ' — ARMED: every page must FAIL' : '') + ' — ' + navigator.userAgent;
+const LIMIT = { 'js-f1': 240, 'js-jit': 240, 'wasm': 120, 'images': 120, 'media': 180, 'canvas-webgl': 60, 'webrtc': 90, 'storage': 60, 'fonts': 60 };
+const results = [];
+function waitFor(frame, page, ms) {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { window.removeEventListener('message', on); resolve(null); }, ms);
+    function on(e) { if (e.source === frame.contentWindow && e.data && e.data.kit) { clearTimeout(timer); window.removeEventListener('message', on); resolve(e.data.kit); } }
+    window.addEventListener('message', on);
+  });
+}
+(async () => {
+  const t0 = performance.now();
+  for (const page of KIT_PAGES) {
+    const f = document.createElement('iframe');
+    // every file:// page is its own opaque origin, so the permissions policy needs '*' (the bare form means "this origin only"
+    // and the iframe would get no camera/microphone); and the running page is scrolled into view, because video frame callbacks
+    // do not fire for an iframe below the fold (webrtc.html, 7th in the list, saw 0 frames there)
+    f.setAttribute('allow', 'camera *; microphone *; autoplay *; fullscreen *');
+    f.title = page;
+    document.getElementById('frames').appendChild(f);
+    f.scrollIntoView({ block: 'start' });
+    const p0 = performance.now();
+    const wait = waitFor(f, page, (LIMIT[page] || 120) * 1000);
+    f.src = page + '.html?config=' + encodeURIComponent(config) + (armed ? '&armed=1' : '');
+    const r = await wait;
+    const ms = Math.round(performance.now() - p0);
+    // tier: the page's own tier-proof summary (js-f1, js-jit, wasm report one), e.g. 'proven maglev (callees, 6 functions)' or
+    // 'n/a (…)' — so a PASS with a proven tier and a PASS with a tier that does not apply can be told apart
+    const tier = r && r.tier != null ? String(r.tier) : '';
+    const rec = r ? { page, verdict: r.verdict, checks: r.checks.length, failed: r.checks.filter(c => !c.ok).map(c => c.name), planted: r.planted, ms, tier, result: r }
+                  : { page, verdict: 'FAIL', checks: 0, failed: ['no result within ' + (LIMIT[page] || 120) + ' s'], planted: false, ms, tier, result: null };
+    results.push(rec);
+    const tr = document.createElement('tr');
+    for (const x of [page, rec.verdict, rec.checks, rec.failed.slice(0, 3).join('; ') + (rec.failed.length > 3 ? ' …' : ''), armed ? String(rec.planted) : '-', ms + ' ms', tier || '-']) {
+      const td = document.createElement('td'); td.textContent = x; tr.appendChild(td);
+    }
+    tr.children[1].className = rec.verdict;
+    document.getElementById('t').appendChild(tr);
+  }
+  // normal run: every page PASSes. Armed run: every page FAILs AND planted its wrong expectation.
+  const ok = armed ? results.every(r => r.verdict === 'FAIL' && r.planted) : results.every(r => r.verdict === 'PASS');
+  const verdict = ok ? 'PASS' : 'FAIL';
+  const el = document.getElementById('final');
+  el.textContent = (armed ? 'ARMED RUN: ' : '') + verdict + (armed ? (ok ? ' — every page failed as planted' : ' — some page did not fail as planted') : '');
+  el.className = verdict;
+  document.title = 'KIT INDEX ' + verdict;
+  window.__kitIndexResult = { config, armed, verdict, ms: Math.round(performance.now() - t0), userAgent: navigator.userAgent,
+    pages: results.map(r => ({ page: r.page, verdict: r.verdict, checks: r.checks, failed: r.failed, planted: r.planted, ms: r.ms, tier: r.tier })), results };
+  const save = document.getElementById('save');
+  save.disabled = false;
+  save.onclick = () => {
+    const blob = new Blob([JSON.stringify(window.__kitIndexResult, null, 1)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'kit-results-' + config + (armed ? '-armed' : '') + '-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+    document.body.appendChild(a); a.click(); a.remove();
+  };
+})();
+</script>

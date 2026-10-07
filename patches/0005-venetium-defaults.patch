@@ -1,0 +1,243 @@
+diff --git a/chrome/browser/background/extensions/background_mode_manager.cc b/chrome/browser/background/extensions/background_mode_manager.cc
+index d92f6fa..351896c 100644
+--- a/chrome/browser/background/extensions/background_mode_manager.cc
++++ b/chrome/browser/background/extensions/background_mode_manager.cc
+@@ -348,7 +348,9 @@ BackgroundModeManager::~BackgroundModeManager() {
+ 
+ // static
+ void BackgroundModeManager::RegisterPrefs(PrefRegistrySimple* registry) {
+-  registry->RegisterBooleanPref(prefs::kBackgroundModeEnabled, true);
++  // Venetium: apps do not keep running after the browser is closed unless the
++  // user turns it on.
++  registry->RegisterBooleanPref(prefs::kBackgroundModeEnabled, false);
+ }
+ 
+ void BackgroundModeManager::RegisterProfile(Profile* profile) {
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index d822da0..f38cae9 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -1548,7 +1548,9 @@ void ChromeContentBrowserClient::RegisterLocalStatePrefs(
+ void ChromeContentBrowserClient::RegisterProfilePrefs(
+     user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterBooleanPref(prefs::kDisable3DAPIs, false);
+-  registry->RegisterBooleanPref(prefs::kEnableHyperlinkAuditing, true);
++  // Venetium: no hyperlink-auditing (<a ping>) requests unless the user turns
++  // them on.
++  registry->RegisterBooleanPref(prefs::kEnableHyperlinkAuditing, false);
+   // Register user prefs for mapping SitePerProcess and IsolateOrigins in
+   // user policy in addition to the same named ones in Local State (which are
+   // used for mapping the command-line flags).
+diff --git a/chrome/browser/metrics/chrome_feature_list_creator.cc b/chrome/browser/metrics/chrome_feature_list_creator.cc
+index 6ede500..c7815a2 100644
+--- a/chrome/browser/metrics/chrome_feature_list_creator.cc
++++ b/chrome/browser/metrics/chrome_feature_list_creator.cc
+@@ -4,14 +4,20 @@
+ 
+ #include "chrome/browser/metrics/chrome_feature_list_creator.h"
+ 
++#include <algorithm>
++#include <string>
++#include <string_view>
+ #include <vector>
+ 
++#include "base/base_switches.h"
+ #include "base/command_line.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/path_service.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
+ #include "base/time/default_clock.h"
+ #include "base/time/default_tick_clock.h"
+ #include "base/time/time.h"
+@@ -89,6 +95,129 @@ GetSwitchDependentFeatureOverrides(const base::CommandLine& command_line) {
+   return overrides;
+ }
+ 
++// Venetium: its default features and switches. They are merged into the
++// browser process's command line once, after the chrome://flags choices have
++// been added to it and before the FeatureList is created, and only for a
++// feature or switch the user has not named: whatever the user passes with
++// --enable-features, --disable-features or --renderer-process-limit, or sets
++// in chrome://flags, always wins (a feature named in either list is left
++// alone, because a disabled entry would otherwise beat an enabled one).
++struct VenetiumFeatureDefault {
++  // As written in --enable-features / --disable-features.
++  const char* entry;
++  bool enable;
++};
++
++constexpr VenetiumFeatureDefault kVenetiumFeatureDefaults[] = {
++    // The back/forward cache keeps 2 pages (Chromium: 6).
++    {"BackForwardCacheSize:cache_size/2", true},
++    // Process sharing, the middle path: not a process for every site, but a
++    // site where the user types a password still gets its own process. (Not
++    // --disable-site-isolation-trials: that also stops new password sites
++    // from being isolated, see content::SiteInstance::StartIsolatingSite.)
++    {"SitePerProcess", false},
++    {"site-isolation-for-password-sites", true},
++    // Text recognition of image-only PDF pages: downloads and runs the Screen
++    // AI model as soon as such a PDF is opened.
++    {"ScreenAIOCREnabled", false},
++    // New tab page: no One Google Bar and no promo requests.
++    {"NtpOneGoogleBar", false},
++    {"NtpMiddleSlotPromo", false},
++    // Autofill: no form-type queries or votes sent to Google's server.
++    {"AutofillServerCommunication", false},
++};
++
++// A starting value, to be tuned on the tablet (Surface 2: Tegra 4, 2 GB).
++constexpr char kVenetiumRendererProcessLimit[] = "6";
++
++// Records what was added. A relaunch copies this process's command line, so
++// the next run takes these entries out again before merging afresh; otherwise
++// they would look like the user's own choices (and, for example, keep a
++// feature the user just enabled in chrome://flags disabled).
++constexpr char kVenetiumDefaultsSwitch[] = "venetium-defaults";
++
++// The feature name of an entry such as "*Name<Trial:param/value".
++std::string_view FeatureNameOf(std::string_view entry) {
++  if (!entry.empty() && entry.front() == '*') {
++    entry.remove_prefix(1);
++  }
++  return entry.substr(0, entry.find_first_of("<:"));
++}
++
++std::vector<std::string> SplitList(const std::string& value) {
++  return base::SplitString(value, ",", base::TRIM_WHITESPACE,
++                           base::SPLIT_WANT_NONEMPTY);
++}
++
++void AddVenetiumDefaults(base::CommandLine* command_line) {
++  const std::string enabled_before =
++      command_line->GetSwitchValueASCII(switches::kEnableFeatures);
++  const std::string disabled_before =
++      command_line->GetSwitchValueASCII(switches::kDisableFeatures);
++  std::vector<std::string> enabled = SplitList(enabled_before);
++  std::vector<std::string> disabled = SplitList(disabled_before);
++
++  // Take out what a previous run added (carried over by a relaunch).
++  for (const std::string& item : SplitList(
++           command_line->GetSwitchValueASCII(kVenetiumDefaultsSwitch))) {
++    if (item.size() < 3) {
++      continue;
++    }
++    const std::string value = item.substr(2);
++    if (base::StartsWith(item, "e=")) {
++      std::erase(enabled, value);
++    } else if (base::StartsWith(item, "d=")) {
++      std::erase(disabled, value);
++    } else if (base::StartsWith(item, "s=")) {
++      command_line->RemoveSwitch(value);
++    }
++  }
++  command_line->RemoveSwitch(kVenetiumDefaultsSwitch);
++
++  auto named = [&](std::string_view name) {
++    auto same = [name](const std::string& entry) {
++      return FeatureNameOf(entry) == name;
++    };
++    return std::ranges::any_of(enabled, same) ||
++           std::ranges::any_of(disabled, same);
++  };
++  std::vector<std::string> added;
++  for (const VenetiumFeatureDefault& d : kVenetiumFeatureDefaults) {
++    if (named(FeatureNameOf(d.entry))) {
++      continue;  // The user's choice wins.
++    }
++    (d.enable ? enabled : disabled).emplace_back(d.entry);
++    added.push_back(std::string(d.enable ? "e=" : "d=") + d.entry);
++  }
++  const std::string enabled_after = base::JoinString(enabled, ",");
++  const std::string disabled_after = base::JoinString(disabled, ",");
++  if (enabled_after != enabled_before) {
++    if (enabled.empty()) {
++      command_line->RemoveSwitch(switches::kEnableFeatures);
++    } else {
++      command_line->AppendSwitchASCII(switches::kEnableFeatures, enabled_after);
++    }
++  }
++  if (disabled_after != disabled_before) {
++    if (disabled.empty()) {
++      command_line->RemoveSwitch(switches::kDisableFeatures);
++    } else {
++      command_line->AppendSwitchASCII(switches::kDisableFeatures,
++                                      disabled_after);
++    }
++  }
++
++  if (!command_line->HasSwitch(switches::kRendererProcessLimit)) {
++    command_line->AppendSwitchASCII(switches::kRendererProcessLimit,
++                                    kVenetiumRendererProcessLimit);
++    added.push_back(std::string("s=") + switches::kRendererProcessLimit);
++  }
++  if (!added.empty()) {
++    command_line->AppendSwitchASCII(kVenetiumDefaultsSwitch,
++                                    base::JoinString(added, ","));
++  }
++}
++
+ }  // namespace
+ 
+ // static
+@@ -102,6 +231,10 @@ ChromeFeatureListCreator::~ChromeFeatureListCreator() = default;
+ void ChromeFeatureListCreator::CreateFeatureList() {
+   CreatePrefService();
+   ConvertFlagsToSwitches();
++  // Venetium: its default features and switches, merged with the user's own
++  // (the command line now holds the user's switches and chrome://flags
++  // choices, and no FeatureList exists yet).
++  AddVenetiumDefaults(base::CommandLine::ForCurrentProcess());
+   CreateMetricsServices();
+   SetupInitialPrefs();
+   SetUpFieldTrials();
+diff --git a/chrome/browser/preloading/preloading_prefs.cc b/chrome/browser/preloading/preloading_prefs.cc
+index 69ba78f..bcf1479 100644
+--- a/chrome/browser/preloading/preloading_prefs.cc
++++ b/chrome/browser/preloading/preloading_prefs.cc
+@@ -14,9 +14,10 @@
+ namespace prefetch {
+ void RegisterPredictionOptionsProfilePrefs(
+     user_prefs::PrefRegistrySyncable* registry) {
++  // Venetium: "Preload pages" is off unless the user turns it on.
+   registry->RegisterIntegerPref(
+       prefs::kNetworkPredictionOptions,
+-      static_cast<int>(NetworkPredictionOptions::kDefault),
++      static_cast<int>(NetworkPredictionOptions::kDisabled),
+       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+ }
+ 
+diff --git a/chrome/browser/profiles/profile.cc b/chrome/browser/profiles/profile.cc
+index 8905fcc..28452fa 100644
+--- a/chrome/browser/profiles/profile.cc
++++ b/chrome/browser/profiles/profile.cc
+@@ -335,9 +335,10 @@ const char Profile::kProfileKey[] = "__PROFILE__";
+ 
+ // static
+ void Profile::RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
++  // Venetium: search suggestions are off unless the user turns them on.
+   registry->RegisterBooleanPref(
+       prefs::kSearchSuggestEnabled,
+-      true,
++      false,
+       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+ #if BUILDFLAG(IS_ANDROID)
+   registry->RegisterStringPref(
+diff --git a/components/performance_manager/user_tuning/prefs.cc b/components/performance_manager/user_tuning/prefs.cc
+index 40915dc..b6af0e8 100644
+--- a/components/performance_manager/user_tuning/prefs.cc
++++ b/components/performance_manager/user_tuning/prefs.cc
+@@ -31,8 +31,9 @@ void RegisterLocalStatePrefs(PrefRegistrySimple* registry) {
+   registry->RegisterIntegerPref(
+       kMemorySaverModeTimeBeforeDiscardInMinutes,
+       kDefaultMemorySaverModeTimeBeforeDiscardInMinutes);
++  // Venetium: Memory Saver is on unless the user turns it off.
+   registry->RegisterIntegerPref(
+-      kMemorySaverModeState, static_cast<int>(MemorySaverModeState::kDisabled));
++      kMemorySaverModeState, static_cast<int>(MemorySaverModeState::kEnabled));
+   registry->RegisterIntegerPref(
+       kMemorySaverModeAggressiveness,
+       static_cast<int>(MemorySaverModeAggressiveness::kMedium));

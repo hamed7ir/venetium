@@ -1,0 +1,303 @@
+Venetium 0016 - //build and toolchain for Windows ARM32 (target_cpu = "arm"): make the ARM graph exist.
+
+BATCH-ARM-1 section 2, as refined by ARM-1-PLAN.md (recon of this tree) and his decisions (ARM-1-DECISIONS.md, items 1-2).
+Chromium 150 has no Windows ARM32 toolchain; with target_cpu = "arm" gn gen stops at the first of a chain of asserts. 12 files:
+- build/config/rust.gni: rust_abi_target thumbv7a-pc-windows-msvc for current_cpu "arm" (the std is prebuilt in rustc-rt21);
+  build/rust/known-target-triples.txt: list that triple (rust.gni asserts on unknown triples).
+- build/config/clang/BUILD.gn: clang_lib suffix "-arm" -> clang_rt.builtins-arm.lib (built from rt2.1's compiler-rt, s9/crt-arm).
+- build/config/win/BUILD.gn: --target=arm-windows for current_cpu "arm" (CR109's one wanted hunk of this file).
+- build/toolchain/win/win_toolchain_data.gni, BUILD.gn, toolchain.gni: an "arm" toolchain (win_toolchains("arm"), its data, and the
+  template branch). The asm tool for arm is clang-cl --target=arm-windows -mimplicit-it=always, as arm64 uses clang-cl: the ARM
+  graph's assembly is GAS-syntax .S (libvpx, webrtc, dav1d, ffmpeg), which armasm.exe cannot assemble (A2003); crashpad's one
+  armasm-syntax .asm gets its own armasm step in a later patch. Windows ARM32 is Thumb-2 only, hence implicit IT blocks.
+- build/toolchain/win/midl.gni: environment.arm / idl_target_platform arm32.
+- build/vs_toolchain.py: CopyDlls returns early for arm (static CRT; the SDK has no Debuggers/arm/dbghelp.dll).
+- build/toolchain/win/setup_toolchain.py (D9): headers from SDK 10.0.26100.0, ARM32 import libs (um/arm, ucrt/arm) from
+  10.0.19041.0, the last SDK that ships them; vcvarsall otherwise points LIB at a 26100 um/arm that does not exist.
+- build/config/compiler/BUILD.gn: the -march=$arm_arch ldflag only off Windows (lld-link would warn, /WX makes it an error).
+- build/nocompile.gni: the arm case, so nocompile_source_set does not error for target_cpu "arm".
+None of these files is in the default git index: the git diff anchor does not move; state-0016.sha256 records them.
+
+diff --git a/build/config/clang/BUILD.gn b/build/config/clang/BUILD.gn
+index c38670a..6be946e 100644
+--- a/build/config/clang/BUILD.gn
++++ b/build/config/clang/BUILD.gn
+@@ -180,6 +180,8 @@ template("clang_lib") {
+           _suffix = "-x86_64"
+         } else if (current_cpu == "x86") {
+           _suffix = "-i386"
++        } else if (current_cpu == "arm") {
++          _suffix = "-arm"
+         } else if (current_cpu == "arm64") {
+           _suffix = "-aarch64"
+         } else {
+diff --git a/build/config/compiler/BUILD.gn b/build/config/compiler/BUILD.gn
+index 4d47b15..676b580 100644
+--- a/build/config/compiler/BUILD.gn
++++ b/build/config/compiler/BUILD.gn
+@@ -888,7 +888,7 @@ config("compiler") {
+     # unless the architecture revision in .ARM.attributes is sufficiently new.
+     # TODO(pcc): The contents of .ARM.attributes should be based on the
+     # -march flag passed at compile time (see llvm.org/pr36291).
+-    if (current_cpu == "arm") {
++    if (current_cpu == "arm" && !is_win) {
+       ldflags += [ "-march=$arm_arch" ]
+     }
+   }
+diff --git a/build/config/rust.gni b/build/config/rust.gni
+index 7256586..40ec4ac 100644
+--- a/build/config/rust.gni
++++ b/build/config/rust.gni
+@@ -350,6 +350,8 @@ if (is_linux || is_chromeos) {
+     rust_abi_target = "x86_64-pc-windows-msvc"
+   } else if (current_cpu == "x86") {
+     rust_abi_target = "i686-pc-windows-msvc"
++  } else if (current_cpu == "arm") {
++    rust_abi_target = "thumbv7a-pc-windows-msvc"
+   } else {
+     assert(false, "Architecture not supported")
+   }
+diff --git a/build/config/win/BUILD.gn b/build/config/win/BUILD.gn
+index 101c233..c1bac78 100644
+--- a/build/config/win/BUILD.gn
++++ b/build/config/win/BUILD.gn
+@@ -110,6 +110,8 @@ config("compiler") {
+       } else {
+         cflags += [ "--target=x86_64-windows" ]
+       }
++    } else if (current_cpu == "arm") {
++      cflags += [ "--target=arm-windows" ]
+     } else if (current_cpu == "arm64") {
+       cflags += [ "--target=aarch64-pc-windows" ]
+     } else {
+diff --git a/build/nocompile.gni b/build/nocompile.gni
+index cb65827..410da3d 100644
+--- a/build/nocompile.gni
++++ b/build/nocompile.gni
+@@ -174,6 +174,8 @@ if (enable_nocompile_tests) {
+           win_toolchain_data = win_toolchain_data_x86
+         } else if (target_cpu == "x64") {
+           win_toolchain_data = win_toolchain_data_x64
++        } else if (target_cpu == "arm") {
++          win_toolchain_data = win_toolchain_data_arm
+         } else if (target_cpu == "arm64") {
+           win_toolchain_data = win_toolchain_data_arm64
+         } else {
+diff --git a/build/rust/known-target-triples.txt b/build/rust/known-target-triples.txt
+index fc4780b..64ec405 100644
+--- a/build/rust/known-target-triples.txt
++++ b/build/rust/known-target-triples.txt
+@@ -31,6 +31,7 @@ i686-unknown-linux-gnu
+ loongarch64-unknown-linux-gnu
+ riscv64-linux-android
+ riscv64gc-unknown-linux-gnu
++thumbv7a-pc-windows-msvc
+ thumbv7neon-linux-androideabi
+ thumbv7neon-unknown-linux-gnueabihf
+ x86_64-apple-darwin
+diff --git a/build/toolchain/win/BUILD.gn b/build/toolchain/win/BUILD.gn
+index 1dc7b4c..8f8f0b8 100644
+--- a/build/toolchain/win/BUILD.gn
++++ b/build/toolchain/win/BUILD.gn
+@@ -48,6 +48,16 @@ if (target_cpu == "arm64") {
+   }
+ }
+ 
++# Venetium 0016: Windows ARM32. Host tools use the x64 toolchain (BUILDCONFIG.gn: win_clang_$host_cpu), as for arm64.
++if (target_cpu == "arm") {
++  win_toolchains("arm") {
++    toolchain_arch = "arm"
++  }
++  win_toolchains("x64") {
++    toolchain_arch = "x64"
++  }
++}
++
+ # Venetium 0010: V8's snapshot toolchain for 32-bit ARM targets on an x64 host.
+ # v8/gni/snapshot_toolchain.gni sends an arm V8 built on x64 to
+ # //build/toolchain/win:clang_x86_v8_arm -- a 32-bit x86 host toolchain whose V8
+diff --git a/build/toolchain/win/midl.gni b/build/toolchain/win/midl.gni
+index c906b63..fa475f1 100644
+--- a/build/toolchain/win/midl.gni
++++ b/build/toolchain/win/midl.gni
+@@ -154,6 +154,9 @@ template("midl") {
+     } else if (current_cpu == "x64") {
+       win_tool_arch = "environment.x64"
+       idl_target_platform = "x64"
++    } else if (current_cpu == "arm") {
++      win_tool_arch = "environment.arm"
++      idl_target_platform = "arm32"
+     } else if (current_cpu == "arm64") {
+       win_tool_arch = "environment.arm64"
+       idl_target_platform = "arm64"
+diff --git a/build/toolchain/win/setup_toolchain.py b/build/toolchain/win/setup_toolchain.py
+index e0b7c03..9971b9e 100644
+--- a/build/toolchain/win/setup_toolchain.py
++++ b/build/toolchain/win/setup_toolchain.py
+@@ -22,6 +22,8 @@ import gn_helpers
+ 
+ SCRIPT_DIR = os.path.dirname(__file__)
+ SDK_VERSION = '10.0.26100.0'
++# Venetium 0016 (D9): the last SDK that ships the ARM32 import libs (Lib/<ver>/um/arm, Lib/<ver>/ucrt/arm).
++ARM32_LIB_SDK_VERSION = '10.0.19041.0'
+ MSVC_DIR = re.compile('^.*/VC/Tools/MSVC/[^/]+/include$')
+ WINDOWS_KITS_DIR = re.compile(r'^(.*/Windows Kits/\d+/Include/[^/]+)/.*')
+ 
+@@ -103,6 +105,20 @@ def _LoadEnvFromBat(args):
+   return variables.decode(errors='ignore')
+ 
+ 
++def _FixupArm32SdkDirs(variables):
++  # vcvarsall.bat (amd64_arm, SDK_VERSION) puts Lib/SDK_VERSION/um/arm on LIB (it does not exist: the 26100 SDK ships no
++  # ARM32 import libs) and falls back to ARM32_LIB_SDK_VERSION for the UCRT include and lib directories. Keep the
++  # SDK_VERSION headers (D9); take the ARM32 import libs from ARM32_LIB_SDK_VERSION.
++  sep = '[' + chr(92) * 2 + '/]'  # regex class for a path separator: an escaped backslash, or a slash
++  end = '(?=;|' + chr(13) + '?$)'  # end of a LIB / INCLUDE entry
++  lib_dir = '(?i)(' + sep + 'lib' + sep + '+)' + re.escape(SDK_VERSION) + '(' + sep + '+um' + sep + 'arm)' + end
++  ucrt_include_dir = ('(?i)(' + sep + 'include' + sep + '+)' + re.escape(ARM32_LIB_SDK_VERSION) + '(' + sep + '+ucrt)' +
++                      end)
++  variables = re.sub(lib_dir, lambda m: m.group(1) + ARM32_LIB_SDK_VERSION + m.group(2), variables, flags=re.M)
++  variables = re.sub(ucrt_include_dir, lambda m: m.group(1) + SDK_VERSION + m.group(2), variables, flags=re.M)
++  return variables
++
++
+ def _LoadToolchainEnv(cpu, toolchain_root, sdk_dir, target_store):
+   """Returns a dictionary with environment variables that must be set while
+   running binaries from the toolchain (e.g. INCLUDE and PATH for cl.exe)."""
+@@ -191,6 +207,8 @@ def _LoadToolchainEnv(cpu, toolchain_root, sdk_dir, target_store):
+     # packaged toolchain in build/vs_toolchain.py.
+     args.append(SDK_VERSION)
+     variables = _LoadEnvFromBat(args)
++    if cpu == 'arm':
++      variables = _FixupArm32SdkDirs(variables)
+   return _ExtractImportantEnvironment(variables)
+ 
+ 
+diff --git a/build/toolchain/win/toolchain.gni b/build/toolchain/win/toolchain.gni
+index 5a8e519..dfbc433 100644
+--- a/build/toolchain/win/toolchain.gni
++++ b/build/toolchain/win/toolchain.gni
+@@ -279,9 +279,22 @@ template("msvc_toolchain") {
+     tool("asm") {
+       is_msvc_assembler = true
+ 
+-      if (toolchain_args.current_cpu == "arm64") {
++      if (toolchain_args.current_cpu == "arm64" ||
++          toolchain_args.current_cpu == "arm") {
+         if (toolchain_is_clang) {
+-          ml = "${cl_prefix}${_clang_bin_path}/clang-cl${_exe} --target=aarch64-pc-windows"
++          if (toolchain_args.current_cpu == "arm") {
++            # Venetium 0016: ARM32 GAS-syntax .S (libvpx ads2gas, webrtc, dav1d, ...) goes through clang as on arm64.
++            # MSVC armasm.exe cannot assemble it, and clang-cl cannot assemble armasm-syntax .asm (see crashpad).
++            _asm_target = "arm-windows"
++          } else {
++            _asm_target = "aarch64-pc-windows"
++          }
++          ml = "${cl_prefix}${_clang_bin_path}/clang-cl${_exe} --target=${_asm_target}"
++          if (toolchain_args.current_cpu == "arm") {
++            # Venetium 0016: Windows ARM32 is Thumb-2 only; GAS .S written for ARM mode or without IT blocks
++            # (libvpx ads2gas output, webrtc, dav1d, ffmpeg) assembles with implicit IT blocks.
++            ml += " -mimplicit-it=always"
++          }
+           if (host_os == "win") {
+             # Flip the slashes so that copy/paste of the command works.
+             ml = string_replace(ml, "/", "\\")
+@@ -292,7 +305,11 @@ template("msvc_toolchain") {
+         } else {
+           # Only affects Arm builds with is_clang = false, implemented for
+           # building V8 for Windows on Arm systems with the MSVC toolchain.
+-          ml = "armasm64.exe"
++          if (toolchain_args.current_cpu == "arm") {
++            ml = "armasm.exe"
++          } else {
++            ml = "armasm64.exe"
++          }
+         }
+       } else {
+         if (toolchain_is_clang && !disable_llvm_ml) {
+@@ -317,7 +334,8 @@ template("msvc_toolchain") {
+ 
+         # Suppress final-stage linking on x64/x86 builds. (Armasm64 does not
+         # require /c because it doesn't support linking.)
+-        if (toolchain_args.current_cpu != "arm64") {
++        if (toolchain_args.current_cpu != "arm64" &&
++            toolchain_args.current_cpu != "arm") {
+           ml += " /c"
+         }
+         if (use_lld && (!toolchain_is_clang || disable_llvm_ml)) {
+@@ -328,7 +346,8 @@ template("msvc_toolchain") {
+           ml = "\"$python_path\" $ml_py $ml"
+         }
+ 
+-        if (toolchain_args.current_cpu == "arm64") {
++        if (toolchain_args.current_cpu == "arm64" ||
++            toolchain_args.current_cpu == "arm") {
+           # armasm64.exe does not support definitions passed via the command
+           # line. (Fortunately, they're not needed for compiling the V8
+           # snapshot, which is the only time this assembler is required.)
+@@ -785,6 +804,8 @@ template("win_toolchains") {
+     win_toolchain_data = win_toolchain_data_x86
+   } else if (toolchain_arch == "x64") {
+     win_toolchain_data = win_toolchain_data_x64
++  } else if (toolchain_arch == "arm") {
++    win_toolchain_data = win_toolchain_data_arm
+   } else if (toolchain_arch == "arm64") {
+     win_toolchain_data = win_toolchain_data_arm64
+   } else {
+diff --git a/build/toolchain/win/win_toolchain_data.gni b/build/toolchain/win/win_toolchain_data.gni
+index bcd7a5f..cca67f9 100644
+--- a/build/toolchain/win/win_toolchain_data.gni
++++ b/build/toolchain/win/win_toolchain_data.gni
+@@ -41,12 +41,27 @@ declare_args() {
+                     ],
+                     "scope")
+   }
++  if (target_cpu == "arm") {
++    win_toolchain_data_arm =
++        exec_script("//build/toolchain/win/setup_toolchain.py",
++                    [
++                      visual_studio_path,
++                      windows_sdk_path,
++                      visual_studio_runtime_dirs,
++                      "win",
++                      "arm",
++                      "environment.arm",
++                    ],
++                    "scope")
++  }
+ }
+ 
+ if (current_cpu == "x86") {
+   current_win_toolchain_data = win_toolchain_data_x86
+ } else if (current_cpu == "x64") {
+   current_win_toolchain_data = win_toolchain_data_x64
++} else if (current_cpu == "arm") {
++  current_win_toolchain_data = win_toolchain_data_arm
+ } else if (current_cpu == "arm64") {
+   current_win_toolchain_data = win_toolchain_data_arm64
+ } else {
+diff --git a/build/vs_toolchain.py b/build/vs_toolchain.py
+index 7c62254..9bae0bb 100644
+--- a/build/vs_toolchain.py
++++ b/build/vs_toolchain.py
+@@ -409,7 +409,7 @@ def CopyDlls(target_dir, configuration, target_cpu):
+   """Copy the VS runtime DLLs into the requested directory as needed.
+ 
+   configuration is one of 'Debug' or 'Release'.
+-  target_cpu is one of 'x86', 'x64' or 'arm64'.
++  target_cpu is one of 'x86', 'x64', 'arm' or 'arm64'.
+ 
+   The debug configuration gets both the debug and release DLLs; the
+   release config only the latter.
+@@ -418,6 +418,11 @@ def CopyDlls(target_dir, configuration, target_cpu):
+   if not vs_runtime_dll_dirs:
+     return
+ 
++  if target_cpu == 'arm':
++    # Venetium 0016: nothing to copy for ARM32 -- the build links the static CRT, and the SDK has no
++    # Debuggers/arm/dbghelp.dll for _CopyDebugger below.
++    return
++
+   x64_runtime, x86_runtime, arm64_runtime = vs_runtime_dll_dirs
+   if target_cpu == 'x64':
+     runtime_dir = x64_runtime

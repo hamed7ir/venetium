@@ -1,0 +1,51 @@
+Venetium 0013 - X86-1: two diagnostics that only the rt2.1 toolchain raises, fixed at the narrowest source point.
+
+The first full x86 build with rt2.1 (BATCH-X86-1 section 2) failed on two files that compile with the toolchains Chromium 150 pins.
+Both are new, intended diagnostics in the newer compilers, not toolchain bugs.
+
+A. third_party/webrtc/modules/audio_processing/agc2/rnn_vad/rnn_fc.cc - GetActivationFunction() returns a bare function name, so
+   webrtc::FunctionView's constructor deduces F = float(&)(float) and tests a function reference for null (api/function_view.h:80).
+   Clang 23.1 (llvm-project PR #204944, "warn on a function reference compared/converted to null", fb1de34e, 2026-07-06) diagnoses
+   that: -Wpointer-bool-conversion, an error under /WX. Chromium's pinned clang (llvmorg-23-init-10931-g20b6ec66) predates it.
+   Fix: return the functions' addresses, so F is a function pointer - same behaviour, no diagnostic. Only rnn_fc.obj recompiles.
+   Upstream fixed the header instead (WebRTC CL 488020, api/function_view.h); that would recompile the 367 objects that include it,
+   so it is left for the next WebRTC roll. rnn_fc.cc is the only place in chrome's graph that builds a FunctionView from a function.
+
+B. third_party/rust/chromium_crates_io/vendor/qr_code-v2/src/structured.rs - u8::max_value() is fully deprecated since Rust 1.99
+   (rust-lang/rust#146882: warn-by-default `deprecated`, previously allow-by-default `deprecated_in_future`); the crate's own
+   #![deny(warnings)] turns it into an error, which Chromium's -Awarnings / allow_all_warnings.rsp cannot override. rt2.1's rustc is
+   1.100.0-nightly (bba531001, 2026-09-20); Chromium 150 pins an older rustc. Fix: u8::MAX (the same value). Only qr_code rebuilds.
+   It is the only vendored crate in chrome's graph that combines a deny(warnings) with a newly deprecated API.
+
+Research and two adversarial checks per issue: F:\cr\x86-1\toolchain-research\ (clang.md, rust.md). His decision (2026-10-02):
+patch the source for both, as 0013; if that does not help, hand the toolchain issue to rt2.1. Made after section 2's first pass.
+
+diff --git a/third_party/rust/chromium_crates_io/vendor/qr_code-v2/src/structured.rs b/third_party/rust/chromium_crates_io/vendor/qr_code-v2/src/structured.rs
+index aa69208..926f206 100644
+--- a/third_party/rust/chromium_crates_io/vendor/qr_code-v2/src/structured.rs
++++ b/third_party/rust/chromium_crates_io/vendor/qr_code-v2/src/structured.rs
+@@ -130,7 +130,7 @@ impl TryFrom<Vec<u8>> for StructuredQr {
+             return Err(Structured(StructuredWrongEnc));
+         }
+ 
+-        let (length, from) = if value.len() < u8::max_value() as usize + 4 {
++        let (length, from) = if value.len() < u8::MAX as usize + 4 {
+             // 4 is header size, TODO recheck boundary
+             (value[3] as u16, 4usize)
+         } else {
+diff --git a/third_party/webrtc/modules/audio_processing/agc2/rnn_vad/rnn_fc.cc b/third_party/webrtc/modules/audio_processing/agc2/rnn_vad/rnn_fc.cc
+index 011c773..79e2c4d 100644
+--- a/third_party/webrtc/modules/audio_processing/agc2/rnn_vad/rnn_fc.cc
++++ b/third_party/webrtc/modules/audio_processing/agc2/rnn_vad/rnn_fc.cc
+@@ -61,9 +61,9 @@ FunctionView<float(float)> GetActivationFunction(
+     ActivationFunction activation_function) {
+   switch (activation_function) {
+     case ActivationFunction::kTansigApproximated:
+-      return ::rnnoise::TansigApproximated;
++      return &::rnnoise::TansigApproximated;
+     case ActivationFunction::kSigmoidApproximated:
+-      return ::rnnoise::SigmoidApproximated;
++      return &::rnnoise::SigmoidApproximated;
+   }
+ }
+ 

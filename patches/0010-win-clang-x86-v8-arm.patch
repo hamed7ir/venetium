@@ -1,0 +1,30 @@
+diff --git a/build/toolchain/win/BUILD.gn b/build/toolchain/win/BUILD.gn
+index 87d1e4a..1dc7b4c 100644
+--- a/build/toolchain/win/BUILD.gn
++++ b/build/toolchain/win/BUILD.gn
+@@ -48,6 +48,25 @@ if (target_cpu == "arm64") {
+   }
+ }
+ 
++# Venetium 0010: V8's snapshot toolchain for 32-bit ARM targets on an x64 host.
++# v8/gni/snapshot_toolchain.gni sends an arm V8 built on x64 to
++# //build/toolchain/win:clang_x86_v8_arm -- a 32-bit x86 host toolchain whose V8
++# generates ARM code and runs it in V8's own simulator (mksnapshot, torque and
++# the other generators). The Windows counterpart of Linux's
++# clang_v8_toolchain("clang_x86_v8_arm") in build/toolchain/linux/BUILD.gn:
++# win_toolchains() defines it with the same three companion toolchains that
++# Linux's gcc_toolchain() adds (_for_rust_host_build_tools,
++# _host_with_system_allocator, _with_system_allocator).
++if (host_cpu == "x64") {
++  win_toolchains("x86_v8_arm") {
++    toolchain_arch = "x86"
++    clang_toolchain_prefix = "clang_"
++    toolchain_args = {
++      v8_current_cpu = "arm"
++    }
++  }
++}
++
+ # WinUWP toolchains. Only define these when targeting them.
+ 
+ if (target_os == "winuwp") {

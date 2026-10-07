@@ -1,0 +1,1044 @@
+Venetium 0019 - sandbox interception for Windows ARM32 (Thumb-2): resolvers, interceptors and the wiring around them.
+
+BATCH-ARM-1 section 3C (plan group sandbox-arm32-0019, decision 5). Chromium 150 has no ARM32 sandbox interception: sandbox/win has
+x86 (stdcall, injected first argument), x64 and arm64 (g_originals table) back ends and nothing for current_cpu "arm". Written from 150's
+own siblings (resolver_64.cc / service_resolver_64.cc / interceptors_64.*), not from CR109. 13 files: 4 new, 9 edited.
+
+New:
+- sandbox/win/src/resolver_arm.cc: ResolverThunk's internal thunk, 8 bytes of Thumb-2: ldr.w pc, [pc, #0] (DF F8 00 F0) + a 4-byte literal
+  (the interceptor; bit 0 forced to 1). It fits exactly in an ntdll system call stub and only modifies pc.
+- sandbox/win/src/service_resolver_arm.cc: ServiceResolverThunk for the ARM32 ntdll Nt* stubs. MEASURED on the Surface 2's ntdll.dll
+  (10.0.15035): 456 of 457 Nt* exports are mov.w r12,#id (356) or movw r12,#id16 (100), svc #1, bx lr (8 bytes), 16-byte stride, 8 zero
+  bytes of padding after, every export RVA has bit 0 set (NtGetTickCount is the one that is not a stub). The resolver verifies exactly that
+  shape (both mov forms; Rd = r12, S = 0), requires a 4-byte aligned site (the literal load aligns pc down), strips the Thumb bit from the
+  resolved address before Read/WriteProcessMemory, and saves the 8 original bytes (callable: mov, svc, bx lr are position independent).
+  No Wow64/Win8 classes (native ARM32). No instruction-cache flush: marked in PerformPatch where one would go (deferred to the device run).
+- sandbox/win/src/interceptors_arm.h / interceptors_arm.cc: the 19 interceptors with the "Arm" suffix, mechanically derived from
+  interceptors_64.* (the AAPCS cannot receive the x86 injected first argument; the original comes from g_originals by InterceptorId).
+
+Edited:
+- sandbox/win/BUILD.gn: current_cpu "arm" sources for :service_resolver and :sandbox.
+- sandbox/win/src/interceptors.h, interception.h (MAKE_SERVICE_NAME suffix Arm).
+- sandbox/win/src/interception.cc: Supermium's x86-only resolver selection (Win8ResolverThunk, Wow64*ResolverThunk: x86 byte patterns,
+  IsFunctionAService defined only in service_resolver_32.cc) is not taken on ARM32 (a plain ServiceResolverThunk, as on _WIN64); the
+  g_originals entry of the parent is stored with bit 0 set (the thunk is Thumb code called through a pointer).
+- sandbox/win/src/interception_agent.cc: the same bit 0 for the child's (EAT) g_originals entries.
+- sandbox/win/src/eat_resolver.cc: the two-thunk form (return path + forward path) as on x64/arm64, and bit 0 on the patched export RVA.
+- sandbox/win/src/sandbox_nt_util.h: the _InterlockedCompareExchange[Pointer] intrinsics for _M_ARM (was #error Architecture not supported).
+- sandbox/win/src/process_mitigations.cc: #error This platform is not supported -> _M_ARM allowed in ConvertProcessMitigationsToPolicy;
+  and DEP/SEHOP treated as on 64-bit (always on / not applicable on ARM: NX is mandatory, SEH is table based): no SetProcessDEPPolicy call
+  and no PROCESS_CREATION_MITIGATION_POLICY_DEP/SEHOP flags on ARM32. (Judgment call: the two hunks at the DEP/SEHOP #if lines can be
+  dropped to compile them in instead; see the results.)
+- chrome/chrome_elf/third_party_dlls/hook.cc: the second consumer of ServiceResolverThunk uses the table-style wrapper
+  (NewNtMapViewOfSection64) on ARM32, with bit 0 on the original thunk address.
+
+Checked (STRUCTURAL/RUNTIME, see the results): all 49 :sandbox/:service_resolver sources + the 3 new + chrome_elf hook.cc compile for
+ARMNT (/WX) with the patch (before it: 30 of 49 fail on the two #errors); the symbol closure of the 52 objects is complete for the
+interception symbols; the stub recognition and patch logic of the real new files run against the real Surface 2 stub bytes (927 checks).
+Device-only: the patch actually running, instruction-cache behaviour, CFG on the thunks, SEH under a real fault, _HEAP_32 / kShimDataOffset.
+Lead check in the real arm-rt21 graph (RUNTIME, after gn gen): the sandbox targets and chrome_elf hook.obj build as ARMNT objects.
+
+diff --git a/chrome/chrome_elf/third_party_dlls/hook.cc b/chrome/chrome_elf/third_party_dlls/hook.cc
+index 0f9b6da..5604eea 100644
+--- a/chrome/chrome_elf/third_party_dlls/hook.cc
++++ b/chrome/chrome_elf/third_party_dlls/hook.cc
+@@ -353,8 +353,8 @@ NewNtMapViewOfSection(NtMapViewOfSectionFunction orig_MapViewOfSection,
+   return ret;
+ }
+ 
+-#if defined(_WIN64)
+-// x64 has an extra layer of indirection.  This just wraps the above
++#if defined(_WIN64) || defined(_M_ARM)
++// x64 (and ARM32) has an extra layer of indirection.  This just wraps the above
+ // interceptor function that x86 hits directly.
+ NTSTATUS WINAPI NewNtMapViewOfSection64(HANDLE section,
+                                         HANDLE process,
+@@ -366,10 +366,19 @@ NTSTATUS WINAPI NewNtMapViewOfSection64(HANDLE section,
+                                         SECTION_INHERIT inherit,
+                                         ULONG allocation_type,
+                                         ULONG protect) {
+-  return NewNtMapViewOfSection(
+-      reinterpret_cast<NtMapViewOfSectionFunction>(g_thunk_storage), section,
+-      process, base, zero_bits, commit_size, offset, view_size, inherit,
+-      allocation_type, protect);
++#if defined(_M_ARM)
++  // The original system service (copied to g_thunk_storage) is Thumb-2 code
++  // that is called through a pointer: bit 0 of the address has to be set.
++  NtMapViewOfSectionFunction orig_fn =
++      reinterpret_cast<NtMapViewOfSectionFunction>(
++          reinterpret_cast<uintptr_t>(g_thunk_storage) | 1);
++#else
++  NtMapViewOfSectionFunction orig_fn =
++      reinterpret_cast<NtMapViewOfSectionFunction>(g_thunk_storage);
++#endif
++  return NewNtMapViewOfSection(orig_fn, section, process, base, zero_bits,
++                               commit_size, offset, view_size, inherit,
++                               allocation_type, protect);
+ }
+ #endif
+ 
+@@ -396,11 +405,11 @@ ThirdPartyStatus ApplyHook() {
+ 
+   // Replace the default NtMapViewOfSection system service with our patched
+   // version.
+-#if defined(_WIN64)
++#if defined(_WIN64) || defined(_M_ARM)
+   void* entry_point = reinterpret_cast<void*>(&NewNtMapViewOfSection64);
+ #else
+   void* entry_point = reinterpret_cast<void*>(&NewNtMapViewOfSection);
+-#endif  // defined(_WIN64)
++#endif  // defined(_WIN64) || defined(_M_ARM)
+ 
+   // Setup() applies the system-service patch, and stores a copy of the original
+   // system service coded in |g_thunk_storage|.
+diff --git a/sandbox/win/BUILD.gn b/sandbox/win/BUILD.gn
+index 38f7ebe..fd21aab 100644
+--- a/sandbox/win/BUILD.gn
++++ b/sandbox/win/BUILD.gn
+@@ -23,6 +23,11 @@ source_set("service_resolver") {
+       "src/resolver_32.cc",
+       "src/service_resolver_32.cc",
+     ]
++  } else if (current_cpu == "arm") {
++    sources += [
++      "src/resolver_arm.cc",
++      "src/service_resolver_arm.cc",
++    ]
+   }
+ 
+   public_deps = [
+@@ -150,6 +155,11 @@ static_library("sandbox") {
+       "src/interceptors_64.cc",
+       "src/interceptors_64.h",
+     ]
++  } else if (current_cpu == "arm") {
++    sources += [
++      "src/interceptors_arm.cc",
++      "src/interceptors_arm.h",
++    ]
+   }
+ 
+   # Disable sanitizer coverage in the sandbox code. The sandbox code runs before
+diff --git a/sandbox/win/src/eat_resolver.cc b/sandbox/win/src/eat_resolver.cc
+index dc4d4ee..7d57eee 100644
+--- a/sandbox/win/src/eat_resolver.cc
++++ b/sandbox/win/src/eat_resolver.cc
+@@ -28,7 +28,7 @@ NTSTATUS EatResolverThunk::Setup(const void* target_module,
+   if (!eat_entry_)
+     return STATUS_INVALID_PARAMETER;
+ 
+-#if defined(_WIN64)
++#if defined(_WIN64) || defined(_M_ARM)
+   // We have two thunks, in order: the return path and the forward path.
+   if (!SetInternalThunk(thunk_storage, storage_bytes, nullptr, target_))
+     return STATUS_BUFFER_TOO_SMALL;
+@@ -50,6 +50,12 @@ NTSTATUS EatResolverThunk::Setup(const void* target_module,
+   // Perform the patch.
+   *eat_entry_ = static_cast<DWORD>(reinterpret_cast<uintptr_t>(thunk_storage)) -
+                 static_cast<DWORD>(reinterpret_cast<uintptr_t>(target_module));
++#if defined(_M_ARM)
++  // The export table lists a Thumb function with bit 0 set (and the loader
++  // hands that value out as the function's address), so the forward thunk has
++  // to be listed the same way.
++  *eat_entry_ |= 1;
++#endif
+ 
+   if (storage_used)
+     *storage_used = GetThunkSize();
+@@ -79,7 +85,7 @@ NTSTATUS EatResolverThunk::ResolveTarget(const void* module,
+ }
+ 
+ size_t EatResolverThunk::GetThunkSize() const {
+-#if defined(_WIN64)
++#if defined(_WIN64) || defined(_M_ARM)
+   return GetInternalThunkSize() * 2;
+ #else
+   return GetInternalThunkSize();
+diff --git a/sandbox/win/src/interception.cc b/sandbox/win/src/interception.cc
+index 23d2526..e45a140 100644
+--- a/sandbox/win/src/interception.cc
++++ b/sandbox/win/src/interception.cc
+@@ -396,7 +396,7 @@ InterceptionManager::PatchClientFunctions(DllInterceptionData* thunks,
+   patch.dll_data.used_bytes = offsetof(DllInterceptionData, thunks);
+ 
+   std::unique_ptr<ServiceResolverThunk> thunk;
+-#if defined(_WIN64)
++#if defined(_WIN64) || defined(_M_ARM)
+   thunk = std::make_unique<ServiceResolverThunk>(child_->Process(), true);
+ #else
+   DWORD base_code = 0;
+@@ -449,8 +449,18 @@ InterceptionManager::PatchClientFunctions(DllInterceptionData* thunks,
+     }
+ 
+     DCHECK(!UNSAFE_TODO(patch.originals.functions[interception.id]));
++#if defined(_M_ARM)
++    // The thunk holds Thumb-2 code and is called through this pointer: set
++    // bit 0, or the call (BLX) to the even address would enter ARM state.
++    UNSAFE_TODO(patch.originals.functions[interception.id]) =
++        reinterpret_cast<void*>(
++            reinterpret_cast<uintptr_t>(
++                &UNSAFE_TODO(thunks->thunks[patch.dll_data.num_thunks])) |
++            1);
++#else
+     UNSAFE_TODO(patch.originals.functions[interception.id]) =
+         &UNSAFE_TODO(thunks->thunks[patch.dll_data.num_thunks]);
++#endif
+ 
+     patch.dll_data.num_thunks++;
+     patch.dll_data.used_bytes += sizeof(ThunkData);
+diff --git a/sandbox/win/src/interception.h b/sandbox/win/src/interception.h
+index 25ed87c..9333a3d 100644
+--- a/sandbox/win/src/interception.h
++++ b/sandbox/win/src/interception.h
+@@ -210,6 +210,8 @@ class InterceptionManager {
+ // (WINAPI = with the "C" underscore).
+ #if defined(_WIN64)
+ #define MAKE_SERVICE_NAME(service) &Target##service##64
++#elif defined(_M_ARM)
++#define MAKE_SERVICE_NAME(service) &Target##service##Arm
+ #else
+ #define MAKE_SERVICE_NAME(service) &Target##service
+ #endif
+diff --git a/sandbox/win/src/interception_agent.cc b/sandbox/win/src/interception_agent.cc
+index b41f2d1..71f20f5 100644
+--- a/sandbox/win/src/interception_agent.cc
++++ b/sandbox/win/src/interception_agent.cc
+@@ -172,11 +172,17 @@ bool InterceptionAgent::PatchDll(const DllPatchInfo* dll_info,
+       return false;
+     }
+ 
++#if defined(_M_ARM)
++    // The thunk holds Thumb-2 code and is called through this pointer: bit 0
++    // is set, as for the parent's table (InterceptionManager).
++    void* original = reinterpret_cast<void*>(
++        reinterpret_cast<uintptr_t>(UNSAFE_TODO(&thunks->thunks[i])) | 1);
++#else
++    void* original = UNSAFE_TODO(&thunks->thunks[i]);
++#endif
+     DCHECK_NT(!UNSAFE_TODO(g_originals.functions[function->id]) ||
+-              UNSAFE_TODO(g_originals.functions[function->id]) ==
+-                  UNSAFE_TODO(&thunks->thunks[i]));
+-    UNSAFE_TODO(g_originals.functions[function->id]) =
+-        UNSAFE_TODO(&thunks->thunks[i]);
++              UNSAFE_TODO(g_originals.functions[function->id]) == original);
++    UNSAFE_TODO(g_originals.functions[function->id]) = original;
+ 
+     thunks->num_thunks++;
+     thunks->used_bytes += sizeof(ThunkData);
+diff --git a/sandbox/win/src/interceptors.h b/sandbox/win/src/interceptors.h
+index 7a16416..ada5a0c 100644
+--- a/sandbox/win/src/interceptors.h
++++ b/sandbox/win/src/interceptors.h
+@@ -7,6 +7,8 @@
+ 
+ #if defined(_WIN64)
+ #include "sandbox/win/src/interceptors_64.h"
++#elif defined(_M_ARM)
++#include "sandbox/win/src/interceptors_arm.h"
+ #endif
+ 
+ namespace sandbox {
+diff --git a/sandbox/win/src/interceptors_arm.cc b/sandbox/win/src/interceptors_arm.cc
+new file mode 100644
+index 0000000..be56ce7
+--- /dev/null
++++ b/sandbox/win/src/interceptors_arm.cc
+@@ -0,0 +1,250 @@
++// Copyright 2011 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "sandbox/win/src/interceptors_arm.h"
++
++#include "sandbox/win/src/filesystem_interception.h"
++#include "sandbox/win/src/interceptors.h"
++#include "sandbox/win/src/policy_target.h"
++#include "sandbox/win/src/process_mitigations_win32k_interception.h"
++#include "sandbox/win/src/process_thread_interception.h"
++#include "sandbox/win/src/sandbox_nt_types.h"
++#include "sandbox/win/src/sandbox_types.h"
++#include "sandbox/win/src/signed_interception.h"
++#include "sandbox/win/src/target_interceptions.h"
++
++namespace sandbox {
++
++SANDBOX_INTERCEPT OriginalFunctions g_originals;
++
++NTSTATUS WINAPI TargetNtMapViewOfSectionArm(HANDLE section,
++                                            HANDLE process,
++                                            PVOID* base,
++                                            ULONG_PTR zero_bits,
++                                            SIZE_T commit_size,
++                                            PLARGE_INTEGER offset,
++                                            PSIZE_T view_size,
++                                            SECTION_INHERIT inherit,
++                                            ULONG allocation_type,
++                                            ULONG protect) {
++  NtMapViewOfSectionFunction orig_fn =
++      reinterpret_cast<NtMapViewOfSectionFunction>(
++          g_originals.functions[MAP_VIEW_OF_SECTION_ID]);
++
++  return TargetNtMapViewOfSection(orig_fn, section, process, base, zero_bits,
++                                  commit_size, offset, view_size, inherit,
++                                  allocation_type, protect);
++}
++
++NTSTATUS WINAPI TargetNtUnmapViewOfSectionArm(HANDLE process, PVOID base) {
++  NtUnmapViewOfSectionFunction orig_fn =
++      reinterpret_cast<NtUnmapViewOfSectionFunction>(
++          g_originals.functions[UNMAP_VIEW_OF_SECTION_ID]);
++  return TargetNtUnmapViewOfSection(orig_fn, process, base);
++}
++
++// -----------------------------------------------------------------------
++
++NTSTATUS WINAPI
++TargetNtSetInformationThreadArm(HANDLE thread,
++                                THREADINFOCLASS thread_info_class,
++                                PVOID thread_information,
++                                ULONG thread_information_bytes) {
++  NtSetInformationThreadFunction orig_fn =
++      reinterpret_cast<NtSetInformationThreadFunction>(
++          g_originals.functions[SET_INFORMATION_THREAD_ID]);
++  return TargetNtSetInformationThread(orig_fn, thread, thread_info_class,
++                                      thread_information,
++                                      thread_information_bytes);
++}
++
++NTSTATUS WINAPI TargetNtOpenThreadTokenArm(HANDLE thread,
++                                           ACCESS_MASK desired_access,
++                                           BOOLEAN open_as_self,
++                                           PHANDLE token) {
++  NtOpenThreadTokenFunction orig_fn =
++      reinterpret_cast<NtOpenThreadTokenFunction>(
++          g_originals.functions[OPEN_THREAD_TOKEN_ID]);
++  return TargetNtOpenThreadToken(orig_fn, thread, desired_access, open_as_self,
++                                 token);
++}
++
++NTSTATUS WINAPI TargetNtOpenThreadTokenExArm(HANDLE thread,
++                                             ACCESS_MASK desired_access,
++                                             BOOLEAN open_as_self,
++                                             ULONG handle_attributes,
++                                             PHANDLE token) {
++  NtOpenThreadTokenExFunction orig_fn =
++      reinterpret_cast<NtOpenThreadTokenExFunction>(
++          g_originals.functions[OPEN_THREAD_TOKEN_EX_ID]);
++  return TargetNtOpenThreadTokenEx(orig_fn, thread, desired_access,
++                                   open_as_self, handle_attributes, token);
++}
++
++// -----------------------------------------------------------------------
++
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtCreateFileArm(PHANDLE file,
++                      ACCESS_MASK desired_access,
++                      POBJECT_ATTRIBUTES object_attributes,
++                      PIO_STATUS_BLOCK io_status,
++                      PLARGE_INTEGER allocation_size,
++                      ULONG file_attributes,
++                      ULONG sharing,
++                      ULONG disposition,
++                      ULONG options,
++                      PVOID ea_buffer,
++                      ULONG ea_length) {
++  NtCreateFileFunction orig_fn = reinterpret_cast<NtCreateFileFunction>(
++      g_originals.functions[CREATE_FILE_ID]);
++  return TargetNtCreateFile(orig_fn, file, desired_access, object_attributes,
++                            io_status, allocation_size, file_attributes,
++                            sharing, disposition, options, ea_buffer,
++                            ea_length);
++}
++
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtOpenFileArm(PHANDLE file,
++                    ACCESS_MASK desired_access,
++                    POBJECT_ATTRIBUTES object_attributes,
++                    PIO_STATUS_BLOCK io_status,
++                    ULONG sharing,
++                    ULONG options) {
++  NtOpenFileFunction orig_fn =
++      reinterpret_cast<NtOpenFileFunction>(g_originals.functions[OPEN_FILE_ID]);
++  return TargetNtOpenFile(orig_fn, file, desired_access, object_attributes,
++                          io_status, sharing, options);
++}
++
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtQueryAttributesFileArm(POBJECT_ATTRIBUTES object_attributes,
++                               PFILE_BASIC_INFORMATION file_attributes) {
++  NtQueryAttributesFileFunction orig_fn =
++      reinterpret_cast<NtQueryAttributesFileFunction>(
++          g_originals.functions[QUERY_ATTRIB_FILE_ID]);
++  return TargetNtQueryAttributesFile(orig_fn, object_attributes,
++                                     file_attributes);
++}
++
++SANDBOX_INTERCEPT NTSTATUS WINAPI TargetNtQueryFullAttributesFileArm(
++    POBJECT_ATTRIBUTES object_attributes,
++    PFILE_NETWORK_OPEN_INFORMATION file_attributes) {
++  NtQueryFullAttributesFileFunction orig_fn =
++      reinterpret_cast<NtQueryFullAttributesFileFunction>(
++          g_originals.functions[QUERY_FULL_ATTRIB_FILE_ID]);
++  return TargetNtQueryFullAttributesFile(orig_fn, object_attributes,
++                                         file_attributes);
++}
++
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtSetInformationFileArm(HANDLE file,
++                              PIO_STATUS_BLOCK io_status,
++                              PVOID file_information,
++                              ULONG length,
++                              FILE_INFORMATION_CLASS file_information_class) {
++  NtSetInformationFileFunction orig_fn =
++      reinterpret_cast<NtSetInformationFileFunction>(
++          g_originals.functions[SET_INFO_FILE_ID]);
++  return TargetNtSetInformationFile(orig_fn, file, io_status, file_information,
++                                    length, file_information_class);
++}
++
++// -----------------------------------------------------------------------
++
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtOpenThreadArm(PHANDLE thread,
++                      ACCESS_MASK desired_access,
++                      POBJECT_ATTRIBUTES object_attributes,
++                      PCLIENT_ID client_id) {
++  NtOpenThreadFunction orig_fn = reinterpret_cast<NtOpenThreadFunction>(
++      g_originals.functions[OPEN_THREAD_ID]);
++  return TargetNtOpenThread(orig_fn, thread, desired_access, object_attributes,
++                            client_id);
++}
++
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtOpenProcessArm(PHANDLE process,
++                       ACCESS_MASK desired_access,
++                       POBJECT_ATTRIBUTES object_attributes,
++                       PCLIENT_ID client_id) {
++  NtOpenProcessFunction orig_fn = reinterpret_cast<NtOpenProcessFunction>(
++      g_originals.functions[OPEN_PROCESS_ID]);
++  return TargetNtOpenProcess(orig_fn, process, desired_access,
++                             object_attributes, client_id);
++}
++
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtOpenProcessTokenArm(HANDLE process,
++                            ACCESS_MASK desired_access,
++                            PHANDLE token) {
++  NtOpenProcessTokenFunction orig_fn =
++      reinterpret_cast<NtOpenProcessTokenFunction>(
++          g_originals.functions[OPEN_PROCESS_TOKEN_ID]);
++  return TargetNtOpenProcessToken(orig_fn, process, desired_access, token);
++}
++
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtOpenProcessTokenExArm(HANDLE process,
++                              ACCESS_MASK desired_access,
++                              ULONG handle_attributes,
++                              PHANDLE token) {
++  NtOpenProcessTokenExFunction orig_fn =
++      reinterpret_cast<NtOpenProcessTokenExFunction>(
++          g_originals.functions[OPEN_PROCESS_TOKEN_EX_ID]);
++  return TargetNtOpenProcessTokenEx(orig_fn, process, desired_access,
++                                    handle_attributes, token);
++}
++
++SANDBOX_INTERCEPT HANDLE WINAPI
++TargetCreateThreadArm(LPSECURITY_ATTRIBUTES thread_attributes,
++                      SIZE_T stack_size,
++                      LPTHREAD_START_ROUTINE start_address,
++                      PVOID parameter,
++                      DWORD creation_flags,
++                      LPDWORD thread_id) {
++  CreateThreadFunction orig_fn = reinterpret_cast<CreateThreadFunction>(
++      g_originals.functions[CREATE_THREAD_ID]);
++  return TargetCreateThread(orig_fn, thread_attributes, stack_size,
++                            start_address, parameter, creation_flags,
++                            thread_id);
++}
++
++// -----------------------------------------------------------------------
++
++SANDBOX_INTERCEPT BOOL WINAPI TargetGdiDllInitializeArm(HANDLE dll,
++                                                        DWORD reason) {
++  GdiDllInitializeFunction orig_fn = reinterpret_cast<GdiDllInitializeFunction>(
++      g_originals.functions[GDIINITIALIZE_ID]);
++  return TargetGdiDllInitialize(orig_fn, dll, reason);
++}
++
++SANDBOX_INTERCEPT HGDIOBJ WINAPI TargetGetStockObjectArm(int object) {
++  GetStockObjectFunction orig_fn = reinterpret_cast<GetStockObjectFunction>(
++      g_originals.functions[GETSTOCKOBJECT_ID]);
++  return TargetGetStockObject(orig_fn, object);
++}
++
++SANDBOX_INTERCEPT ATOM WINAPI
++TargetRegisterClassWArm(const WNDCLASS* wnd_class) {
++  RegisterClassWFunction orig_fn = reinterpret_cast<RegisterClassWFunction>(
++      g_originals.functions[REGISTERCLASSW_ID]);
++  return TargetRegisterClassW(orig_fn, wnd_class);
++}
++
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtCreateSectionArm(PHANDLE section_handle,
++                         ACCESS_MASK desired_access,
++                         POBJECT_ATTRIBUTES object_attributes,
++                         PLARGE_INTEGER maximum_size,
++                         ULONG section_page_protection,
++                         ULONG allocation_attributes,
++                         HANDLE file_handle) {
++  NtCreateSectionFunction orig_fn = reinterpret_cast<NtCreateSectionFunction>(
++      g_originals.functions[CREATE_SECTION_ID]);
++  return TargetNtCreateSection(
++      orig_fn, section_handle, desired_access, object_attributes, maximum_size,
++      section_page_protection, allocation_attributes, file_handle);
++}
++
++}  // namespace sandbox
+diff --git a/sandbox/win/src/interceptors_arm.h b/sandbox/win/src/interceptors_arm.h
+new file mode 100644
+index 0000000..116ef0a
+--- /dev/null
++++ b/sandbox/win/src/interceptors_arm.h
+@@ -0,0 +1,182 @@
++// Copyright 2011 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef SANDBOX_WIN_SRC_INTERCEPTORS_ARM_H_
++#define SANDBOX_WIN_SRC_INTERCEPTORS_ARM_H_
++
++#include "sandbox/win/src/nt_internals.h"
++#include "sandbox/win/src/sandbox_types.h"
++
++// ARM32 (Thumb-2) interceptors. Like the x64 / arm64 ones, these take exactly
++// the arguments of the function they replace: the AAPCS passes arguments in
++// r0-r3 and on the stack, so unlike x86 there is no room in the 8-byte patch
++// to inject the extra first argument (the original function). The original is
++// instead looked up in g_originals by InterceptorId; see interceptors_arm.cc.
++// The symbols carry the suffix "Arm" (MAKE_SERVICE_NAME in interception.h).
++
++namespace sandbox {
++
++extern "C" {
++
++// Interception of NtMapViewOfSection on the child process.
++// It should never be called directly. This function provides the means to
++// detect dlls being loaded, so we can patch them if needed.
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtMapViewOfSectionArm(HANDLE section,
++                            HANDLE process,
++                            PVOID* base,
++                            ULONG_PTR zero_bits,
++                            SIZE_T commit_size,
++                            PLARGE_INTEGER offset,
++                            PSIZE_T view_size,
++                            SECTION_INHERIT inherit,
++                            ULONG allocation_type,
++                            ULONG protect);
++
++// Interception of NtUnmapViewOfSection on the child process.
++// It should never be called directly. This function provides the means to
++// detect dlls being unloaded, so we can clean up our interceptions.
++SANDBOX_INTERCEPT NTSTATUS WINAPI TargetNtUnmapViewOfSectionArm(HANDLE process,
++                                                                PVOID base);
++
++// -----------------------------------------------------------------------
++// Interceptors without IPC.
++
++// Interception of NtSetInformationThread on the child process.
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtSetInformationThreadArm(HANDLE thread,
++                                THREADINFOCLASS thread_info_class,
++                                PVOID thread_information,
++                                ULONG thread_information_bytes);
++
++// Interception of NtOpenThreadToken on the child process.
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtOpenThreadTokenArm(HANDLE thread,
++                           ACCESS_MASK desired_access,
++                           BOOLEAN open_as_self,
++                           PHANDLE token);
++
++// Interception of NtOpenThreadTokenEx on the child process.
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtOpenThreadTokenExArm(HANDLE thread,
++                             ACCESS_MASK desired_access,
++                             BOOLEAN open_as_self,
++                             ULONG handle_attributes,
++                             PHANDLE token);
++
++// -----------------------------------------------------------------------
++// Interceptors handled by the file system dispatcher.
++
++// Interception of NtCreateFile on the child process.
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtCreateFileArm(PHANDLE file,
++                      ACCESS_MASK desired_access,
++                      POBJECT_ATTRIBUTES object_attributes,
++                      PIO_STATUS_BLOCK io_status,
++                      PLARGE_INTEGER allocation_size,
++                      ULONG file_attributes,
++                      ULONG sharing,
++                      ULONG disposition,
++                      ULONG options,
++                      PVOID ea_buffer,
++                      ULONG ea_length);
++
++// Interception of NtOpenFile on the child process.
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtOpenFileArm(PHANDLE file,
++                    ACCESS_MASK desired_access,
++                    POBJECT_ATTRIBUTES object_attributes,
++                    PIO_STATUS_BLOCK io_status,
++                    ULONG sharing,
++                    ULONG options);
++
++// Interception of NtQueryAtttributesFile on the child process.
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtQueryAttributesFileArm(POBJECT_ATTRIBUTES object_attributes,
++                               PFILE_BASIC_INFORMATION file_attributes);
++
++// Interception of NtQueryFullAtttributesFile on the child process.
++SANDBOX_INTERCEPT NTSTATUS WINAPI TargetNtQueryFullAttributesFileArm(
++    POBJECT_ATTRIBUTES object_attributes,
++    PFILE_NETWORK_OPEN_INFORMATION file_attributes);
++
++// Interception of NtSetInformationFile on the child process.
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtSetInformationFileArm(HANDLE file,
++                              PIO_STATUS_BLOCK io_status,
++                              PVOID file_information,
++                              ULONG length,
++                              FILE_INFORMATION_CLASS file_information_class);
++
++// -----------------------------------------------------------------------
++// Interceptors handled by the process-thread dispatcher.
++
++// Interception of NtOpenThread on the child process.
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtOpenThreadArm(PHANDLE thread,
++                      ACCESS_MASK desired_access,
++                      POBJECT_ATTRIBUTES object_attributes,
++                      PCLIENT_ID client_id);
++
++// Interception of NtOpenProcess on the child process.
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtOpenProcessArm(PHANDLE process,
++                       ACCESS_MASK desired_access,
++                       POBJECT_ATTRIBUTES object_attributes,
++                       PCLIENT_ID client_id);
++
++// Interception of NtOpenProcessToken on the child process.
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtOpenProcessTokenArm(HANDLE process,
++                            ACCESS_MASK desired_access,
++                            PHANDLE token);
++
++// Interception of NtOpenProcessTokenEx on the child process.
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtOpenProcessTokenExArm(HANDLE process,
++                              ACCESS_MASK desired_access,
++                              ULONG handle_attributes,
++                              PHANDLE token);
++
++// Interception of CreateThread in kernel32.dll.
++SANDBOX_INTERCEPT HANDLE WINAPI
++TargetCreateThreadArm(LPSECURITY_ATTRIBUTES thread_attributes,
++                      SIZE_T stack_size,
++                      LPTHREAD_START_ROUTINE start_address,
++                      PVOID parameter,
++                      DWORD creation_flags,
++                      LPDWORD thread_id);
++
++// -----------------------------------------------------------------------
++// Interceptors handled by the process mitigations win32k lockdown code.
++
++// Interceptor for the GdiDllInitialize function.
++SANDBOX_INTERCEPT BOOL WINAPI TargetGdiDllInitializeArm(HANDLE dll,
++                                                        DWORD reason);
++
++// Interceptor for the GetStockObject function.
++SANDBOX_INTERCEPT HGDIOBJ WINAPI TargetGetStockObjectArm(int object);
++
++// Interceptor for the RegisterClassW function.
++SANDBOX_INTERCEPT ATOM WINAPI
++TargetRegisterClassWArm(const WNDCLASS* wnd_class);
++
++// -----------------------------------------------------------------------
++// Interceptors handled by the signed process code.
++
++// Interception of NtCreateSection on the child process.
++SANDBOX_INTERCEPT NTSTATUS WINAPI
++TargetNtCreateSectionArm(PHANDLE section_handle,
++                         ACCESS_MASK desired_access,
++                         POBJECT_ATTRIBUTES object_attributes,
++                         PLARGE_INTEGER maximum_size,
++                         ULONG section_page_protection,
++                         ULONG allocation_attributes,
++                         HANDLE file_handle);
++
++}  // extern "C"
++
++}  // namespace sandbox
++
++#endif  // SANDBOX_WIN_SRC_INTERCEPTORS_ARM_H_
+diff --git a/sandbox/win/src/process_mitigations.cc b/sandbox/win/src/process_mitigations.cc
+index 12a58a9..dc70a7a 100644
+--- a/sandbox/win/src/process_mitigations.cc
++++ b/sandbox/win/src/process_mitigations.cc
+@@ -144,7 +144,8 @@ bool ApplyProcessMitigationsToCurrentProcess(MitigationFlags starting_flags,
+     applied_flags |= MITIGATION_HARDEN_TOKEN_IL_POLICY;
+   }
+ 
+-#if !defined(_WIN64)  // DEP is always enabled on 64-bit.
++// DEP is always enabled on 64-bit and on ARM.
++#if !defined(_WIN64) && !defined(_M_ARM)
+   if (flags & MITIGATION_DEP) {
+     DWORD dep_flags = PROCESS_DEP_ENABLE;
+ 
+@@ -387,14 +388,15 @@ void ConvertProcessMitigationsToPolicy(MitigationFlags flags,
+   *policy_value_1 = 0;
+   *policy_value_2 = 0;
+ 
+-#if defined(_WIN64) || defined(_M_IX86)
++#if defined(_WIN64) || defined(_M_IX86) || defined(_M_ARM)
+   *size = sizeof(*policy_flags);
+ #else
+ #error This platform is not supported.
+ #endif
+ 
+-// DEP and SEHOP are not valid for 64-bit Windows
+-#if !defined(_WIN64)
++// DEP and SEHOP are not valid for 64-bit Windows, and neither for ARM32: DEP is
++// always on there and SEH is table based.
++#if !defined(_WIN64) && !defined(_M_ARM)
+   if (flags & MITIGATION_DEP) {
+     *policy_value_1 |= PROCESS_CREATION_MITIGATION_POLICY_DEP_ENABLE;
+     if (!(flags & MITIGATION_DEP_NO_ATL_THUNK))
+diff --git a/sandbox/win/src/resolver_arm.cc b/sandbox/win/src/resolver_arm.cc
+new file mode 100644
+index 0000000..c0ce01b
+--- /dev/null
++++ b/sandbox/win/src/resolver_arm.cc
+@@ -0,0 +1,81 @@
++// Copyright 2006-2010 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "sandbox/win/src/resolver.h"
++
++#include <windows.h>
++
++#include <ntstatus.h>
++#include <stddef.h>
++
++// For placement new. This file must not depend on the CRT at runtime, but
++// placement operator new is inline.
++#include <new>
++
++namespace {
++
++// ldr.w pc, [pc, #0]: the two Thumb-2 halfwords F8DF F000, stored in memory
++// (little endian) as DF F8 00 F0.
++const ULONG kLdrPcPc0 = 0xF000F8DF;
++
++#pragma pack(push, 4)
++struct InternalThunk {
++  // This struct contains the following Thumb-2 code:
++  // 00 f8df f000   ldr.w   pc, [pc, #0]
++  // 04 <interceptor>  .word interceptor_function  (bit 0 set)
++  //
++  // pc reads as the address of the instruction plus 4 and `ldr` (literal)
++  // aligns it down to a multiple of 4, so the thunk has to start at a 4-byte
++  // aligned address for the literal to be the word that follows the
++  // instruction. Loading pc from memory is an interworking branch: bit 0 of the
++  // loaded value selects the instruction set, so the literal must have bit 0
++  // set (Windows on ARM32 only runs Thumb-2 code).
++  //
++  // The code only modifies pc. Registers r0-r3, r12, sp and lr are untouched,
++  // so the interceptor receives the arguments and the return address of the
++  // call that was patched.
++  //
++  // NOTE: the thunk is written either into a local buffer that is then copied
++  // to the patched function (ServiceResolverThunk) or in place, in memory that
++  // will execute (EatResolverThunk). Nothing here flushes the instruction
++  // cache; if the device shows stale code, the flush belongs after the writes
++  // of those two callers (see service_resolver_arm.cc and eat_resolver.cc).
++
++  InternalThunk() {
++    ldr_pc_pc0 = kLdrPcPc0;
++    interceptor_function = 0;
++  }
++  ULONG ldr_pc_pc0;  // = DF F8 00 F0
++  ULONG_PTR interceptor_function;
++};
++#pragma pack(pop)
++
++static_assert(sizeof(InternalThunk) == 8,
++              "the thunk has to fit in an 8 byte ntdll system call stub");
++
++}  // namespace.
++
++namespace sandbox {
++
++size_t ResolverThunk::GetInternalThunkSize() const {
++  return sizeof(InternalThunk);
++}
++
++bool ResolverThunk::SetInternalThunk(void* storage,
++                                     size_t storage_bytes,
++                                     const void* original_function,
++                                     const void* interceptor) {
++  if (storage_bytes < sizeof(InternalThunk))
++    return false;
++
++  InternalThunk* thunk = new (storage) InternalThunk;
++  // Every function on Windows ARM32 is Thumb-2 code, so every code address has
++  // bit 0 set. Make sure of it: a jump to an even address would switch the
++  // processor to ARM state.
++  thunk->interceptor_function = reinterpret_cast<ULONG_PTR>(interceptor) | 1;
++
++  return true;
++}
++
++}  // namespace sandbox
+diff --git a/sandbox/win/src/sandbox_nt_util.h b/sandbox/win/src/sandbox_nt_util.h
+index 55bae72..6a0cf42 100644
+--- a/sandbox/win/src/sandbox_nt_util.h
++++ b/sandbox/win/src/sandbox_nt_util.h
+@@ -65,7 +65,7 @@ void __cdecl operator delete(void* memory,
+ 
+ namespace sandbox {
+ 
+-#if defined(_M_X64) || defined(_M_ARM64)
++#if defined(_M_X64) || defined(_M_ARM64) || defined(_M_ARM)
+ #pragma intrinsic(_InterlockedCompareExchange)
+ #pragma intrinsic(_InterlockedCompareExchangePointer)
+ 
+diff --git a/sandbox/win/src/service_resolver_arm.cc b/sandbox/win/src/service_resolver_arm.cc
+new file mode 100644
+index 0000000..be48cb6
+--- /dev/null
++++ b/sandbox/win/src/service_resolver_arm.cc
+@@ -0,0 +1,221 @@
++// Copyright 2012 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "sandbox/win/src/service_resolver.h"
++
++#include <windows.h>
++#include <winternl.h>
++
++#include <ntstatus.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include <memory>
++
++#include "base/compiler_specific.h"
++#include "base/containers/heap_array.h"
++
++namespace {
++#pragma pack(push, 4)
++
++// mov.w r12, #imm: the Thumb-2 halfwords F04F|i<<10 and 0|imm3<<12|C<<8|imm8,
++// as one little endian ULONG. The mask leaves out the bits that hold the
++// immediate (the service id) and requires everything else, including Rd = r12
++// and S = 0.
++const ULONG kMovWR12 = 0x0C00F04F;
++const ULONG kMovWR12Mask = 0x8F00FBFF;
++
++// movw r12, #imm16: the Thumb-2 halfwords F240|i<<10|imm4 and
++// 0|imm3<<12|C<<8|imm8. Used when the id is not a "modified immediate".
++const ULONG kMovwR12 = 0x0C00F240;
++const ULONG kMovwR12Mask = 0x8F00FBF0;
++
++const USHORT kSvc1 = 0xDF01;
++const USHORT kBxLr = 0x4770;
++
++// Service code for ARM32 (Thumb-2) Windows.
++struct ServiceEntry {
++  // This struct contains one of the following two versions of code:
++  // 00 f04f 0c2a   mov.w   r12, #0x2a
++  // 04 df01        svc     #1
++  // 06 4770        bx      lr
++  //
++  // 00 f240 1ca5   movw    r12, #0x1a5
++  // 04 df01        svc     #1
++  // 06 4770        bx      lr
++  //
++  // ntdll lays these stubs out 16 bytes apart; the 8 bytes that follow each one
++  // are zero padding. That padding is not looked at and not modified: the patch
++  // (the ResolverThunk's `ldr.w pc, [pc, #0]` and its literal) is also 8 bytes.
++
++  ULONG mov_r12;  // = mov.w or movw r12, #service id
++  USHORT svc;     // = DF 01
++  USHORT bx_lr;   // = 70 47
++};
++
++// We don't have an internal thunk for ARM32 either: the original code is
++// copied as it is, and the patch is built in a ServiceEntry.
++struct ServiceFullThunk {
++  ServiceEntry original;
++};
++
++#pragma pack(pop)
++
++static_assert(sizeof(ServiceEntry) == 8,
++              "an ARM32 system call stub is 8 bytes long");
++
++bool IsService(const void* source) {
++  const ServiceEntry* service = reinterpret_cast<const ServiceEntry*>(source);
++
++  return ((kMovWR12 == (service->mov_r12 & kMovWR12Mask) ||
++           kMovwR12 == (service->mov_r12 & kMovwR12Mask)) &&
++          kSvc1 == service->svc && kBxLr == service->bx_lr);
++}
++
++bool IsAnyService(const void* source) {
++  return IsService(source);
++}
++
++// The address of a Thumb function has bit 0 set: that bit selects the
++// instruction set, it is not part of the address of the code. Everything that
++// reads or writes the code (and not just branches to it) needs it cleared.
++void* ClearThumbBit(void* address) {
++  return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(address) &
++                                 ~static_cast<uintptr_t>(1));
++}
++
++}  // namespace
++
++namespace sandbox {
++
++NTSTATUS ServiceResolverThunk::Setup(const void* target_module,
++                                     const char* target_name,
++                                     const void* interceptor_entry_point,
++                                     void* thunk_storage,
++                                     size_t storage_bytes,
++                                     size_t* storage_used) {
++  NTSTATUS ret = Init(target_module, target_name, interceptor_entry_point,
++                      thunk_storage, storage_bytes);
++  if (!NT_SUCCESS(ret))
++    return ret;
++
++  // The export table gives the address of the Thumb function, with bit 0 set.
++  target_ = ClearThumbBit(target_);
++
++  size_t thunk_bytes = GetThunkSize();
++  auto thunk_buffer = base::HeapArray<char>::Uninit(thunk_bytes);
++  ServiceFullThunk* thunk =
++      reinterpret_cast<ServiceFullThunk*>(thunk_buffer.data());
++
++  if (!IsFunctionAService(&thunk->original))
++    return STATUS_OBJECT_NAME_COLLISION;
++
++  ret = PerformPatch(thunk, thunk_storage);
++
++  if (storage_used)
++    *storage_used = thunk_bytes;
++
++  return ret;
++}
++
++size_t ServiceResolverThunk::GetThunkSize() const {
++  return sizeof(ServiceFullThunk);
++}
++
++NTSTATUS ServiceResolverThunk::CopyThunk(const void* target_module,
++                                         const char* target_name,
++                                         BYTE* thunk_storage,
++                                         size_t storage_bytes,
++                                         size_t* storage_used) {
++  NTSTATUS ret = ResolveTarget(target_module, target_name, &target_);
++  if (!NT_SUCCESS(ret))
++    return ret;
++
++  target_ = ClearThumbBit(target_);
++
++  size_t thunk_bytes = GetThunkSize();
++  if (storage_bytes < thunk_bytes)
++    return STATUS_UNSUCCESSFUL;
++
++  ServiceFullThunk* thunk = reinterpret_cast<ServiceFullThunk*>(thunk_storage);
++
++  if (!IsFunctionAService(&thunk->original))
++    return STATUS_OBJECT_NAME_COLLISION;
++
++  if (storage_used)
++    *storage_used = thunk_bytes;
++
++  return ret;
++}
++
++bool ServiceResolverThunk::IsFunctionAService(void* local_thunk) const {
++  // The patch is `ldr.w pc, [pc, #0]` followed by its literal, which only works
++  // at an address that is a multiple of 4. ntdll's stubs all are (they are 16
++  // bytes apart); refuse anything else instead of writing a jump that goes to
++  // the wrong place.
++  if (reinterpret_cast<uintptr_t>(target_) & 3)
++    return false;
++
++  ServiceFullThunk function_code;
++  SIZE_T read;
++  if (!::ReadProcessMemory(process_, target_, &function_code,
++                           sizeof(function_code), &read))
++    return false;
++
++  if (sizeof(function_code) != read)
++    return false;
++
++  if (!IsAnyService(&function_code))
++    return false;
++
++  // Save the verified code.
++  UNSAFE_TODO(memcpy(local_thunk, &function_code, sizeof(function_code)));
++
++  return true;
++}
++
++NTSTATUS ServiceResolverThunk::PerformPatch(void* local_thunk,
++                                            void* remote_thunk) {
++  // Patch the original code.
++  ServiceEntry local_service;
++  if (!SetInternalThunk(&local_service, sizeof(local_service), nullptr,
++                        interceptor_))
++    return STATUS_UNSUCCESSFUL;
++
++  // Copy the local thunk buffer to the child. The copy is the original system
++  // call, which the interceptor calls through g_originals; it is called as a
++  // Thumb function (see InterceptionManager::PatchClientFunctions).
++  SIZE_T actual;
++  if (!::WriteProcessMemory(process_, remote_thunk, local_thunk,
++                            sizeof(ServiceFullThunk), &actual))
++    return STATUS_UNSUCCESSFUL;
++
++  if (sizeof(ServiceFullThunk) != actual)
++    return STATUS_UNSUCCESSFUL;
++
++  // And now change the function to intercept, on the child.
++  if (ntdll_base_) {
++    // Running a unit test, or a local patch (chrome_elf).
++    if (!::WriteProcessMemory(process_, target_, &local_service,
++                              sizeof(local_service), &actual))
++      return STATUS_UNSUCCESSFUL;
++  } else {
++    if (!WriteProtectedChildMemory(process_, target_, &local_service,
++                                   sizeof(local_service)))
++      return STATUS_UNSUCCESSFUL;
++  }
++
++  // NOTE: no ::FlushInstructionCache(process_, ...) after the two writes above
++  // (neither for remote_thunk nor for target_). WriteProcessMemory is expected
++  // to do it for what it writes; if a device run shows stale code, this is
++  // where the explicit calls go.
++
++  return STATUS_SUCCESS;
++}
++
++bool ServiceResolverThunk::VerifyJumpTargetForTesting(void*) const {
++  return true;
++}
++
++}  // namespace sandbox

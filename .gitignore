@@ -1,0 +1,8 @@
+# Build and probe binaries - rebuilt from source, not tracked
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+__pycache__/
