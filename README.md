@@ -14,14 +14,14 @@ my own work.
 
 - surface rt (tegra 3) and surface 2 (tegra 4), arm32
 - windows 10 build 15035 (the arm build that boots on these tablets)
-- graphics go through d3d9 / angle (gl es2) — these gpus have no d3d11
+- graphics go through d3d9 / angle (gl es2), these gpus have no d3d11
 
 ## what works
 
 - hardware h.264 video decode on the gpu over d3d9 (dxva / media foundation), so
   720p plays smooth on youtube and aparat
 - gpu rasterization on tegra 4
-- the renderer sandbox is on — on arm32 it uses a USER_LIMITED token so windows 10's
+- the renderer sandbox is on, on arm32 it uses a USER_LIMITED token so windows 10's
   parallel loader can still load the dlls
 - vp9 / av1 still decode in software (the tegra chips have no hardware for them)
 
@@ -40,6 +40,7 @@ testing and tuning. next i want to add windows 8 / 8.1 (rt) support, jitless.
 
 built on [supermium](https://github.com/win32ss/supermium) and ungoogled chromium. thanks to Jaybee form openRT community for porting CR77 and Sharing it, Thanks to osmium for the first try port of chromium for these devices.
 And special thanks to kristibek, jimkoutso2008, Max RM, albert,guilherme,fraae, Peter and others who i may forget, all the community. 
+
 it was possible with help of claude Ai.
 
 <!-- add your own thanks here -->
