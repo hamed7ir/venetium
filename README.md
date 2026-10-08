@@ -7,6 +7,8 @@ on them anymore.
 it is built on top of supermium (which brings modern chromium back to old
 windows), but supermium is x86/x64 only, so the whole arm32 (armnt) port here is
 my own work.
+<img width="1280" height="720" alt="photo_2026-10-07_17-07-03" src="https://github.com/user-attachments/assets/22b96f5f-2fb0-4d95-b1eb-4c093b60b692" />
+
 
 ## what it runs on
 
