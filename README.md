@@ -36,6 +36,10 @@ are in `RECIPE.md`, and `VENETIUM-IDS.md` says what each patch does.
 it works on a real device: pages load, the sandbox is on, video plays. i am still
 testing and tuning. next i want to add windows 8 / 8.1 (rt) support, jitless.
 
+## license 
+
+GPLv3 covers the Venetium patches/tooling, and Chromium + the other upstreams keep their own licenses (see chrome://credits / NOTICES.md
+
 ## credits
 
 built on [supermium](https://github.com/win32ss/supermium) and ungoogled chromium. thanks to Jaybee form openRT community for porting CR77 and Sharing it, Thanks to osmium for the first try port of chromium for these devices.
