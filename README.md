@@ -39,7 +39,7 @@ testing and tuning. next i want to add windows 8 / 8.1 (rt) support, jitless.
 ## credits
 
 built on [supermium](https://github.com/win32ss/supermium) and ungoogled chromium. thanks to Jaybee form openRT community for porting CR77 and Sharing it, Thanks to osmium for the first try port of chromium for these devices.
-And special thanks to kristibek, jimkoutso2008, Max RM, albert,guilherme,fraae, Peter and others who i may forget, all the community. 
+And special thanks to kristibek, jimkoutso2008, Max RM, albert,guilherme,fraae, Peter, jwa4 and others who i may forget, all the community. 
 
 it was possible with help of claude Ai.
 
