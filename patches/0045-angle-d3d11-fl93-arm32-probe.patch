@@ -1,0 +1,155 @@
+Venetium 0045 - pick the ANGLE backend on ARM32 by the GPU's real Direct3D feature level (fixes Adreno rendering glitches).
+0021 built ANGLE D3D9-only on ARM32 because the Tegra is FL 9_1; the Adreno (Lumia) is FL 9_3, where D3D9 compositing paints
+garbage but D3D11 is clean. Re-enables ANGLE's D3D11 backend on ARM32 (angle.gni; the superseded 0034's base) with the 9_3
+append in Renderer11, and adds a ONE-SHOT feature-level probe (VenetiumArm32PrefersD3D11, gl_features): a HARDWARE
+D3D11CreateDevice at FL>=9_3 -> the D3D11 display, else D3D9 - chosen once, not ANGLE's try-D3D11-then-fallback that churned
+on the Tegra. Tegra (FL 9_1) stays on D3D9 with no regression; Adreno (FL 9_3) gets D3D11. --use-angle=d3d9/d3d11 overrides.
+
+diff --git a/third_party/angle/gni/angle.gni b/third_party/angle/gni/angle.gni
+--- a/third_party/angle/gni/angle.gni
++++ b/third_party/angle/gni/angle.gni
+@@ -217,9 +217,11 @@
+ 
+   angle_enable_d3d9 = is_win && !angle_is_winuwp
+ 
+-  # Venetium 0021: Windows ARM32 (Surface 2 / Tegra 4) renders through ANGLE's
+-  # D3D9 backend (and GL); the D3D11 and Vulkan backends are not built there.
+-  angle_enable_d3d11 = is_win && current_cpu != "arm"
++  # Venetium 0021/0045: Windows ARM32 renders through ANGLE's D3D9 backend (and GL). 0045 brings the D3D11 backend back
++  # on ARM32 too, so Adreno GPUs (Direct3D feature level 9_3) can use it; a one-shot feature-level probe selects D3D11
++  # only at FL>=9_3 (ui/gl: gl_display_initializer.cc + gl_features.cc), so the Tegra (FL 9_1) stays on D3D9 with no
++  # churn. The Vulkan backend is still not built on ARM32.
++  angle_enable_d3d11 = is_win
+   angle_enable_gl =
+       (ozone_platform_drm || ozone_platform_wayland || !is_linux ||
+        ((angle_use_x11 && !is_chromeos) || angle_use_wayland || is_castos)) &&
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp
+@@ -494,6 +494,22 @@
+             }
+         }
+ 
++        // Venetium 0045: Direct3D feature level 9_3 on Windows ARM32. ANGLE's default available levels start at 10_0, so
++        // an Adreno (max FL 9_3) would create no D3D11 device; append 9_3 on _M_ARM (requestedMajorVersion unset) so the
++        // D3D11 backend can run there. An explicit 9_3 request also adds it on any target. 9_1/9_2 are never requested -
++        // ANGLE has no shader-model mapping for them - so a 9_1-only device (the Tegra) still creates no D3D11 device and
++        // keeps the D3D9 path (and 0045's probe never selects D3D11 there anyway).
++        if (requestedMajorVersion == 9 && requestedMinorVersion == 3)
++        {
++            mAvailableFeatureLevels.push_back(D3D_FEATURE_LEVEL_9_3);
++        }
++#if defined(_M_ARM)
++        else if (requestedMajorVersion == EGL_DONT_CARE)
++        {
++            mAvailableFeatureLevels.push_back(D3D_FEATURE_LEVEL_9_3);
++        }
++#endif
++
+         EGLint requestedDeviceType = static_cast<EGLint>(attributes.get(
+             EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_DEVICE_TYPE_HARDWARE_ANGLE));
+         switch (requestedDeviceType)
+diff --git a/ui/gl/gl_features.h b/ui/gl/gl_features.h
+--- a/ui/gl/gl_features.h
++++ b/ui/gl/gl_features.h
+@@ -67,6 +67,13 @@
+ #if BUILDFLAG(IS_WIN)
+ GL_EXPORT BASE_DECLARE_FEATURE(kAllowD3D11WarpFallback);
+ 
++#if defined(ARCH_CPU_ARMEL)
++// Venetium 0045: true iff this machine's hardware GPU reaches Direct3D feature level 9_3, probed
++// once at first call. Chooses the ANGLE backend on Windows ARM32: true (Adreno) -> D3D11, false
++// (Tegra, FL 9_1) -> D3D9. See gl_display_initializer.cc.
++GL_EXPORT bool VenetiumArm32PrefersD3D11();
++#endif
++
+ GL_EXPORT BASE_DECLARE_FEATURE(kDCompOnD3D12);
+ #endif
+ 
+diff --git a/ui/gl/gl_features.cc b/ui/gl/gl_features.cc
+--- a/ui/gl/gl_features.cc
++++ b/ui/gl/gl_features.cc
+@@ -14,6 +14,9 @@
+ 
+ #if BUILDFLAG(IS_WIN)
+ #include "base/win/windows_version.h"
++#if defined(ARCH_CPU_ARMEL)
++#include <d3d11.h>  // Venetium 0045: one-shot GPU feature-level probe (d3d11.dll loaded dynamically).
++#endif
+ #endif
+ 
+ #if BUILDFLAG(IS_MAC)
+@@ -378,6 +381,43 @@
+   return base::FeatureList::IsEnabled(kAllowANGLED3D9Fallback);
+ }
+ 
++#if BUILDFLAG(IS_WIN) && defined(ARCH_CPU_ARMEL)
++// Venetium 0045: one-shot probe of the real hardware GPU's Direct3D feature level, so the ANGLE
++// backend is CHOSEN on Windows ARM32 rather than tried-D3D11-then-fallen-back-to-D3D9 (that churned
++// on the Tegra - DEVICE-7's ~18 s stall - because it created a low-FL D3D11 device it couldn't use).
++// Returns true iff a HARDWARE D3D11 device reaches feature level 9_3: the Adreno (Lumia) does and
++// takes the clean D3D11 path; the Tegra tops out at 9_1, returns false, and stays on D3D9. d3d11.dll
++// is loaded dynamically, so ui/gl keeps no link-time dependency on it.
++bool VenetiumArm32PrefersD3D11() {
++  static const bool prefers = [] {
++    HMODULE d3d11 = ::LoadLibraryW(L"d3d11.dll");
++    if (!d3d11) {
++      return false;
++    }
++    auto create = reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(
++        ::GetProcAddress(d3d11, "D3D11CreateDevice"));
++    if (!create) {
++      ::FreeLibrary(d3d11);
++      return false;
++    }
++    const D3D_FEATURE_LEVEL levels[] = {
++        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
++        D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3};
++    D3D_FEATURE_LEVEL got = D3D_FEATURE_LEVEL_9_1;
++    ID3D11Device* device = nullptr;
++    HRESULT hr = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels,
++                        sizeof(levels) / sizeof(levels[0]), D3D11_SDK_VERSION,
++                        &device, &got, nullptr);
++    if (device) {
++      device->Release();
++    }
++    ::FreeLibrary(d3d11);
++    return SUCCEEDED(hr) && got >= D3D_FEATURE_LEVEL_9_3;
++  }();
++  return prefers;
++}
++#endif  // BUILDFLAG(IS_WIN) && defined(ARCH_CPU_ARMEL)
++
+ #if BUILDFLAG(IS_ANDROID)
+ BASE_FEATURE(kAndroidLimitRgb565DisplayToApi32,
+              base::FEATURE_ENABLED_BY_DEFAULT);
+diff --git a/ui/gl/init/gl_display_initializer.cc b/ui/gl/init/gl_display_initializer.cc
+--- a/ui/gl/init/gl_display_initializer.cc
++++ b/ui/gl/init/gl_display_initializer.cc
+@@ -86,6 +86,18 @@
+ 
+   if (supports_angle_d3d) {
+     if (use_angle_default) {
++#if defined(ARCH_CPU_ARMEL)
++      // Venetium 0045: on Windows ARM32 choose the backend from a one-shot feature-level probe
++      // instead of trying D3D11 then falling back to D3D9 (which churned on the Tegra). A HARDWARE
++      // D3D11 device at FL>=9_3 (Adreno) -> D3D11 only; otherwise (Tegra, FL 9_1) -> D3D9 only, so
++      // neither device tries a backend it cannot use. --use-angle=d3d9/d3d11 still overrides via the
++      // explicit branch below.
++      if (!GetGlWorkarounds().disable_d3d11 && features::VenetiumArm32PrefersD3D11()) {
++        AddInitDisplay(init_displays, ANGLE_D3D11);
++      } else if (features::IsANGLED3D9FallbackAllowed()) {
++        AddInitDisplay(init_displays, ANGLE_D3D9);
++      }
++#else
+       // Default mode for ANGLE - try D3D11, else try D3D9
+       if (!GetGlWorkarounds().disable_d3d11) {
+         AddInitDisplay(init_displays, ANGLE_D3D11);
+@@ -93,6 +105,7 @@
+       if (features::IsANGLED3D9FallbackAllowed()) {
+         AddInitDisplay(init_displays, ANGLE_D3D9);
+       }
++#endif  // defined(ARCH_CPU_ARMEL)
+     } else {
+       if (requested_renderer == kANGLEImplementationD3D11Name) {
+         AddInitDisplay(init_displays, ANGLE_D3D11);

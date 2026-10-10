@@ -28,7 +28,7 @@ my own work.
 ## how it is built
 
 this repo is a patch series on top of chromium 150, plus the build tooling and a
-device test kit. the patches are in `patches/` (0001–0043), the full build steps
+device test kit. the patches are in `patches/` (0001–0047), the full build steps
 are in `RECIPE.md`, and `VENETIUM-IDS.md` says what each patch does.
 
 ## status

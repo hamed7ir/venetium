@@ -1,0 +1,98 @@
+Venetium 0046 - a renderer-sandbox status line on chrome://version. Since 0043 runs ARM32 renderers at USER_LIMITED (a real
+sandbox, weaker than the usual USER_LOCKDOWN), a reporter could not tell the sandbox was on. Adds a 'Renderer sandbox' row:
+'on - ARM32 USER_LIMITED' / 'off (--no-sandbox)' / 'on - USER_LOCKDOWN' (x86). Not the Google bad-flags banner (which only
+appears when the user opts OUT). Wired through the version-UI data source + the grdp string + the about_version template.
+
+diff --git a/components/webui/version/version_ui_constants.h b/components/webui/version/version_ui_constants.h
+--- a/components/webui/version/version_ui_constants.h
++++ b/components/webui/version/version_ui_constants.h
+@@ -95,6 +95,9 @@
+ extern const char kVersionSuffix[];
+ extern const char kVersionModifier[];
+ extern const char kVersionProcessorVariation[];
++// Venetium 0046: renderer sandbox status row on chrome://version.
++extern const char kSandboxStatus[];
++extern const char kSandboxStatusName[];
+ 
+ }  // namespace version_ui
+ 
+diff --git a/components/webui/version/version_ui_constants.cc b/components/webui/version/version_ui_constants.cc
+--- a/components/webui/version/version_ui_constants.cc
++++ b/components/webui/version/version_ui_constants.cc
+@@ -91,5 +91,8 @@
+ const char kVersionSuffix[] = "version_suffix";
+ const char kVersionModifier[] = "version_modifier";
+ const char kVersionProcessorVariation[] = "version_processor_variation";
++// Venetium 0046: renderer sandbox status row on chrome://version.
++const char kSandboxStatus[] = "sandbox_status";
++const char kSandboxStatusName[] = "sandbox_status_name";
+ 
+ }  // namespace version_ui
+diff --git a/chrome/browser/ui/webui/version/version_ui.cc b/chrome/browser/ui/webui/version/version_ui.cc
+--- a/chrome/browser/ui/webui/version/version_ui.cc
++++ b/chrome/browser/ui/webui/version/version_ui.cc
+@@ -19,6 +19,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/time/time.h"
+ #include "build/build_config.h"
++#include "sandbox/policy/switches.h"
+ #include "chrome/browser/browser_process_impl.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/webui/version/version_handler.h"
+@@ -304,6 +305,30 @@
+   html_source->AddString(version_ui::kCommandLine, command_line);
+ #endif
+ 
++  // Venetium 0046: show whether the renderer sandbox is on and at what token level. 0043 runs
++  // ARM32 renderers at USER_LIMITED (a real restricted-token sandbox, weaker than the usual
++  // USER_LOCKDOWN), so the reporter can't otherwise tell the sandbox is on. This is the honest
++  // status line, not the Google bad-flags banner (which only appears when the user opts OUT with
++  // --no-sandbox, the opposite of what was asked).
++  html_source->AddLocalizedString(version_ui::kSandboxStatusName,
++                                  IDS_VERSION_UI_SANDBOX);
++  {
++    std::string sandbox_status;
++    if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++            sandbox::policy::switches::kNoSandbox)) {
++      sandbox_status = "off (--no-sandbox)";
++    } else {
++#if BUILDFLAG(IS_WIN) && defined(ARCH_CPU_ARMEL)
++      sandbox_status = "on - ARM32 USER_LIMITED";
++#elif BUILDFLAG(IS_WIN)
++      sandbox_status = "on - USER_LOCKDOWN";
++#else
++      sandbox_status = "on";
++#endif
++    }
++    html_source->AddString(version_ui::kSandboxStatus, sandbox_status);
++  }
++
+ #if BUILDFLAG(IS_MAC)
+   html_source->AddString("linker", CHROMIUM_LINKER_NAME);
+ #endif  // BUILDFLAG(IS_MAC)
+diff --git a/components/webui/version/resources/about_version.html b/components/webui/version/resources/about_version.html
+--- a/components/webui/version/resources/about_version.html
++++ b/components/webui/version/resources/about_version.html
+@@ -151,6 +151,9 @@
+         <tr><td class="label">$i18n{command_line_name}</td>
+           <td class="version" id="command_line">$i18n{command_line}</td>
+         </tr>
++        <tr><td class="label">$i18n{sandbox_status_name}</td>
++          <td class="version" id="sandbox_status">$i18n{sandbox_status}</td>
++        </tr>
+ <if expr="not is_ios">
+         <tr><td class="label">$i18n{executable_path_name}</td>
+           <td class="version" id="executable_path">$i18n{executable_path}</td>
+diff --git a/components/version_ui_strings.grdp b/components/version_ui_strings.grdp
+--- a/components/version_ui_strings.grdp
++++ b/components/version_ui_strings.grdp
+@@ -8,6 +8,9 @@
+   </message>
+   <message name="IDS_VERSION_UI_UNOFFICIAL" desc="unofficial build on the about:version page">
+     Developer Build
++  </message>
++  <message name="IDS_VERSION_UI_SANDBOX" desc="Renderer sandbox status label on the about:version page">
++    Renderer sandbox
+   </message>
+   <message name="IDS_VERSION_UI_32BIT" desc="32-bit on the chrome://version page">
+     (32-bit)

@@ -1,0 +1,47 @@
+Venetium 0044 - ARM32 sandboxed utility processes run at USER_LIMITED, not USER_LOCKDOWN (fixes 'cannot unzip crx').
+The utility analogue of 0043: on Win10 ARM32/15035 a child created with the USER_LOCKDOWN primary token dies because the
+parallel loader's worker threads open DLLs under the primary token, not the main-thread impersonation. The CRX unpacker's
+data_decoder/unzip utilities (kService/kUtility) still got USER_LOCKDOWN. Before PreSpawnChild, under ARCH_CPU_ARMEL,
+raise any utility whose lockdown token is USER_LOCKDOWN to USER_LIMITED (catches the generic lockdown types + IconReader/
+ScreenAI; leaves network/audio/CDM/proxy and the already-USER_LIMITED types untouched). Still a real restricted-token
+sandbox. x86 keeps USER_LOCKDOWN.
+
+diff --git a/content/browser/service_host/utility_sandbox_delegate_win.cc b/content/browser/service_host/utility_sandbox_delegate_win.cc
+--- a/content/browser/service_host/utility_sandbox_delegate_win.cc
++++ b/content/browser/service_host/utility_sandbox_delegate_win.cc
+@@ -12,6 +12,7 @@
+ #include "base/synchronization/waitable_event.h"
+ #include "base/win/scoped_handle.h"
+ #include "base/win/windows_handle_util.h"
++#include "build/build_config.h"
+ #include "content/public/browser/content_browser_client.h"
+ #include "content/public/browser/sandboxed_process_launcher_delegate.h"
+ #include "content/public/common/content_client.h"
+@@ -440,6 +441,27 @@
+     }
+   }
+ 
++#if defined(ARCH_CPU_ARMEL)
++  // Venetium 0044: Windows 10 ARM32 (Tegra, build 15035) maps a process's DLLs on parallel
++  // loader worker threads that run under the process PRIMARY token. A sandboxed utility created
++  // with the USER_LOCKDOWN primary token (its only restricting SID is the NULL SID) therefore
++  // cannot open its DLLs and dies before it runs -- the same mechanism Venetium 0043 fixed for
++  // the renderer, one process type over. It surfaced as "cannot unzip crx": the Web Store CRX
++  // unpacker's data_decoder / unzip utilities (kService / kUtility) run at USER_LOCKDOWN. Raise
++  // any lockdown utility to USER_LIMITED -- the token the GPU process already runs with on this
++  // hardware -- so the loader worker threads can read the DLLs, while keeping a real
++  // restricted-token sandbox. Looser types (network/audio/CDM/proxy at USER_UNPROTECTED, and the
++  // speech/model/print utilities already at USER_LIMITED) are not USER_LOCKDOWN and stay as they
++  // are. x86 keeps USER_LOCKDOWN (this is guarded to ARM32).
++  if (config->GetLockdownTokenLevel() == sandbox::USER_LOCKDOWN) {
++    auto result = config->SetTokenLevel(sandbox::USER_RESTRICTED_SAME_ACCESS,
++                                        sandbox::USER_LIMITED);
++    if (result != sandbox::SBOX_ALL_OK) {
++      return false;
++    }
++  }
++#endif  // defined(ARCH_CPU_ARMEL)
++
+   return GetContentClient()->browser()->PreSpawnChild(
+       config, sandbox_type_,
+       ContentBrowserClient::ChildSpawnFlags::kChildSpawnFlagNone);

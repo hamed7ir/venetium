@@ -41,7 +41,7 @@ tarball and apply the .222 -> .226 delta. confirm you are on it: `chrome/VERSION
 
 ## apply the patches
 
-apply `patches/0001` through `patches/0043` in order. they are plain `git apply` patches. apply them with
+apply `patches/0001` through `patches/0047` in order. they are plain `git apply` patches. apply them with
 `core.autocrlf=false` so the files stay byte-for-byte - arm32 is sensitive and i hash every file. the missing
 numbers (0009, 0024, 0031, 0034, 0038) are patches i dropped or replaced along the way; the old versions are kept
 under `patches/superseded/` for history, you do not apply those.
@@ -114,3 +114,12 @@ gpu for software-decoded vp9/av1, so software video is lighter on the cpu.
 (its worker threads can't open the dlls under that token), so the renderer dies before it loads a page. 0043 gives
 the arm32 renderer the same token the gpu process already runs with - still a real sandbox, but the loader works.
 (0031 and 0038 were earlier attempts at this and at the cfg crash; they are dropped, under `patches/superseded/`.)
+
+**the issues-1 batch (0044-0047)** - fixes for the first round of reports on the public repo. 0044 is the sandbox fix
+again but for utility processes: the crx unpacker (data_decoder / unzip) was dying under the same lockdown token 0043
+fixed for the renderer, so extensions wouldn't install - 0044 gives those utilities the user_limited token too, still a
+real sandbox. 0046 adds a "renderer sandbox" row to chrome://version so you can actually see the sandbox is on (it reads
+"on - arm32 user_limited"). 0045 and 0047 are for adreno gpus (lumia phones and the like) that expose d3d11 at feature
+level 9_3: 0045 brings angle's d3d11 backend back on arm32 with a one-shot probe that only picks d3d11 at fl 9_3 (tegra
+stays on d3d9, no change), and 0047 bridges the hardware h.264 decoder's output into that d3d11 device. tegra is
+untouched by both.

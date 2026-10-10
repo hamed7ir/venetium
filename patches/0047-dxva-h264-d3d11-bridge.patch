@@ -1,0 +1,264 @@
+Venetium 0047 - hardware H.264 (DXVA/MFT) on the ANGLE-D3D11 render path, not only D3D9 (generalizes 0041 for the Adreno).
+0041 gave HW H.264 only when ANGLE had no D3D11 device and borrowed ANGLE's D3D9 device. With 0045 an Adreno renders via
+D3D11, so H.264 would fall to software. The decode device (DXVA2 is D3D9) is independent of the render device: give the
+decoder its own IDirect3DDevice9Ex when ANGLE has no D3D9 (CreateOwnD3D9DeviceEx, dynamic Direct3DCreate9Ex), keep the D3D9
+output path as-is, and for the D3D11 path open the D3D9 render target's shared surface as a D3D11 texture on ANGLE's device
+(OpenSharedResource) wrapped via CreateSharedImageForD3D11Video (zero-copy, same adapter). Drop the 'no D3D11 device' gate
+in GpuMojoMediaClientWin on ARM32 so DXVA is offered whenever its per-device DXVA2 probe succeeds; software fallback on
+failure. x86/x64 D3D11VideoDecoder unchanged; the Tegra's HW decode (ANGLE's D3D9 device) is untouched. NOT MEASURED - needs
+an Adreno that exposes a DXVA2 H.264 decoder (the extended d3dprobe measures that).
+
+diff --git a/media/gpu/windows/dxva_video_decoder.h b/media/gpu/windows/dxva_video_decoder.h
+--- a/media/gpu/windows/dxva_video_decoder.h
++++ b/media/gpu/windows/dxva_video_decoder.h
+@@ -15,6 +15,7 @@
+ #define MEDIA_GPU_WINDOWS_DXVA_VIDEO_DECODER_H_
+ 
+ #include <d3d9.h>
++#include <d3d11.h>  // Venetium 0047: bridge the decode output into ANGLE's D3D11 device.
+ #include <dxva2api.h>
+ #include <mfobjects.h>
+ #include <mftransform.h>
+@@ -148,7 +149,10 @@
+   // output surfaces, so at most one is held and input is paused meanwhile.
+   Microsoft::WRL::ComPtr<IMFSample> pending_output_;
+ 
+-  Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> device_;  // ANGLE's device.
++  Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> device_;  // ANGLE's D3D9, or our own (0047).
++  // Venetium 0047: ANGLE's D3D11 device when ANGLE renders on D3D11 (Adreno, via 0045); null when
++  // ANGLE is on D3D9 (Tegra). Non-null selects the OpenSharedResource output bridge over the EGL one.
++  Microsoft::WRL::ComPtr<ID3D11Device> angle_d3d11_device_;
+   Microsoft::WRL::ComPtr<IDirect3DDeviceManager9> device_manager_;
+   UINT device_manager_reset_token_ = 0;
+   Microsoft::WRL::ComPtr<IMFTransform> decoder_;
+diff --git a/media/gpu/windows/dxva_video_decoder.cc b/media/gpu/windows/dxva_video_decoder.cc
+--- a/media/gpu/windows/dxva_video_decoder.cc
++++ b/media/gpu/windows/dxva_video_decoder.cc
+@@ -166,6 +166,50 @@
+   return device_ex;
+ }
+ 
++// Venetium 0047: a standalone IDirect3DDevice9Ex for decoding when ANGLE has no D3D9 device (ANGLE
++// on D3D11 - e.g. an Adreno at FL 9_3, via 0045). DXVA2 is a D3D9 component, but the decode device
++// is independent of the render device; the output is bridged into ANGLE's D3D11 device. d3d9.dll is
++// loaded dynamically so media/gpu keeps no link-time dependency on Direct3DCreate9Ex.
++Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> CreateOwnD3D9DeviceEx() {
++  using Create9ExFn = HRESULT(WINAPI*)(UINT, IDirect3D9Ex**);
++  HMODULE d3d9 = ::GetModuleHandleW(L"d3d9.dll");
++  if (!d3d9) {
++    d3d9 = ::LoadLibraryW(L"d3d9.dll");
++  }
++  if (!d3d9) {
++    return nullptr;
++  }
++  auto create =
++      reinterpret_cast<Create9ExFn>(::GetProcAddress(d3d9, "Direct3DCreate9Ex"));
++  if (!create) {
++    return nullptr;
++  }
++  Microsoft::WRL::ComPtr<IDirect3D9Ex> d3d9ex;
++  if (FAILED(create(D3D_SDK_VERSION, &d3d9ex)) || !d3d9ex) {
++    return nullptr;
++  }
++  D3DPRESENT_PARAMETERS pp = {};
++  pp.BackBufferWidth = 1;
++  pp.BackBufferHeight = 1;
++  pp.BackBufferFormat = D3DFMT_UNKNOWN;
++  pp.BackBufferCount = 1;
++  pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
++  pp.hDeviceWindow = ::GetShellWindow();
++  pp.Windowed = TRUE;
++  pp.Flags = D3DPRESENTFLAG_VIDEO;
++  pp.PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
++  Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> device;
++  HRESULT hr = d3d9ex->CreateDeviceEx(
++      D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, pp.hDeviceWindow,
++      D3DCREATE_FPU_PRESERVE | D3DCREATE_HARDWARE_VERTEXPROCESSING |
++          D3DCREATE_MULTITHREADED,
++      &pp, nullptr, &device);
++  if (FAILED(hr) || !device) {
++    return nullptr;
++  }
++  return device;
++}
++
+ // Probes this GPU process's ANGLE D3D9 device once: msmpeg2vdec.dll preloaded,
+ // NV12 -> X8R8G8B8 StretchRect supported, a DXVA2 H.264 VLD mode with NV12
+ // render targets, and the largest of 1920x1088 / 1280x720 the driver offers a
+@@ -321,6 +365,7 @@
+ 
+   bool Init(CommandBufferHelper* helper,
+             IDirect3DDevice9Ex* device,
++            ID3D11Device* angle_d3d11_device,  // Venetium 0047: non-null = D3D11 output bridge.
+             EGLConfig egl_config,
+             bool use_rgb_texture,
+             const gfx::Size& size) {
+@@ -344,6 +389,38 @@
+     hr = texture_->GetSurfaceLevel(0, &surface_);
+     if (FAILED(hr)) {
+       return false;
++    }
++
++    if (angle_d3d11_device) {
++      // Venetium 0047: ANGLE renders on D3D11 - open this D3D9 render target's shared surface as a
++      // D3D11 texture on ANGLE's device and wrap that as the SharedImage ANGLE-D3D11 samples. The
++      // decoder StretchRects into surface_, which is the same GPU surface, so this is zero-copy; both
++      // devices are on the default adapter.
++      Microsoft::WRL::ComPtr<ID3D11Texture2D> d3d11_texture;
++      hr = angle_d3d11_device->OpenSharedResource(share_handle,
++                                                  IID_PPV_ARGS(&d3d11_texture));
++      if (FAILED(hr) || !d3d11_texture) {
++        LOG(ERROR) << "DXVAVideoDecoder: OpenSharedResource failed, hr=0x"
++                   << std::hex << hr;
++        return false;
++      }
++      gpu::SharedImageInfo si_info(
++          viz::SinglePlaneFormat::kBGRA_8888, size,
++          gfx::ColorSpace::CreateSRGB(),
++          gpu::SHARED_IMAGE_USAGE_GLES2_READ |
++              gpu::SHARED_IMAGE_USAGE_RASTER_READ |
++              gpu::SHARED_IMAGE_USAGE_DISPLAY_READ,
++          "DXVAVideoDecoderPicture");
++      shared_image_ =
++          stub->shared_image_interface()->CreateSharedImageForD3D11Video(
++              si_info, d3d11_texture, /*dxgi_shared_handle_state=*/nullptr,
++              /*array_slice=*/0, /*is_thread_safe=*/false);
++      if (!shared_image_) {
++        LOG(ERROR) << "DXVAVideoDecoder: CreateSharedImageForD3D11Video failed";
++        return false;
++      }
++      d3d11_texture_ = std::move(d3d11_texture);
++      return true;
+     }
+ 
+     EGLDisplay display = gl::GLSurfaceEGL::GetGLDisplayEGL()->GetDisplay();
+@@ -421,6 +498,7 @@
+   gfx::Size size_;
+   Microsoft::WRL::ComPtr<IDirect3DTexture9> texture_;
+   Microsoft::WRL::ComPtr<IDirect3DSurface9> surface_;
++  Microsoft::WRL::ComPtr<ID3D11Texture2D> d3d11_texture_;  // Venetium 0047: D3D11 bridge, keeps it alive.
+   scoped_refptr<gpu::ClientSharedImage> shared_image_;
+   bool in_client_use_ = false;
+ };
+@@ -581,25 +659,41 @@
+ 
+   device_ = GetAngleD3D9DeviceEx();
+   if (!device_) {
+-    return fail("no ANGLE D3D9Ex device");
+-  }
+-
+-  gl::GLDisplayEGL* display = gl::GLSurfaceEGL::GetGLDisplayEGL();
+-  if (!display || !display->ext->b_EGL_ANGLE_surface_d3d_texture_2d_share_handle) {
+-    return fail("EGL_ANGLE_surface_d3d_texture_2d_share_handle unavailable");
+-  }
+-  if (!egl_config_) {
+-    EGLConfig egl_config = nullptr;
+-    bool use_rgb = true;
+-    if (!ChooseEglConfig(display->GetDisplay(), &egl_config, &use_rgb)) {
+-      return fail("no suitable pbuffer EGLConfig");
+-    }
+-    egl_config_ = egl_config;
+-    use_rgb_texture_ = use_rgb;
+-    MEDIA_LOG(INFO, media_log_)
+-        << "DXVAVideoDecoder: pictures are "
+-        << (use_rgb ? "X8R8G8B8 / EGL_TEXTURE_RGB"
+-                    : "A8R8G8B8 / EGL_TEXTURE_RGBA");
++    // Venetium 0047: ANGLE has no D3D9 device - it renders on D3D11 (e.g. an Adreno at FL 9_3, via
++    // 0045). Decode on our own D3D9Ex device and bridge the output into ANGLE's D3D11 device.
++    device_ = CreateOwnD3D9DeviceEx();
++    if (!device_) {
++      return fail("no D3D9Ex device (neither ANGLE's nor our own)");
++    }
++    angle_d3d11_device_ = gl::QueryD3D11DeviceObjectFromANGLE();
++    if (!angle_d3d11_device_) {
++      return fail("ANGLE exposes neither a D3D9 nor a D3D11 device");
++    }
++    use_rgb_texture_ = true;  // X8R8G8B8 opaque RGB; alpha is irrelevant for video.
++  }
++
++  // Venetium 0047: the EGL pbuffer output path is only for the D3D9 render path. On the D3D11 bridge
++  // the output goes through ID3D11Device::OpenSharedResource (PictureBuffer::Init), so skip the EGL
++  // share-handle requirement and the pbuffer EGLConfig here.
++  if (!angle_d3d11_device_) {
++    gl::GLDisplayEGL* display = gl::GLSurfaceEGL::GetGLDisplayEGL();
++    if (!display ||
++        !display->ext->b_EGL_ANGLE_surface_d3d_texture_2d_share_handle) {
++      return fail("EGL_ANGLE_surface_d3d_texture_2d_share_handle unavailable");
++    }
++    if (!egl_config_) {
++      EGLConfig egl_config = nullptr;
++      bool use_rgb = true;
++      if (!ChooseEglConfig(display->GetDisplay(), &egl_config, &use_rgb)) {
++        return fail("no suitable pbuffer EGLConfig");
++      }
++      egl_config_ = egl_config;
++      use_rgb_texture_ = use_rgb;
++      MEDIA_LOG(INFO, media_log_)
++          << "DXVAVideoDecoder: pictures are "
++          << (use_rgb ? "X8R8G8B8 / EGL_TEXTURE_RGB"
++                      : "A8R8G8B8 / EGL_TEXTURE_RGBA");
++    }
+   }
+ 
+   // The decoder MFT comes from msmpeg2vdec.dll, preloaded before the sandbox
+@@ -1011,6 +1105,7 @@
+   for (size_t i = 0; i < kNumPictureBuffers; ++i) {
+     auto picture_buffer = base::MakeRefCounted<PictureBuffer>();
+     if (!picture_buffer->Init(helper.get(), device_.Get(),
++                              angle_d3d11_device_.Get(),
+                               static_cast<EGLConfig>(egl_config_),
+                               use_rgb_texture_, size)) {
+       picture_buffers_.clear();
+diff --git a/media/mojo/services/gpu_mojo_media_client_win.cc b/media/mojo/services/gpu_mojo_media_client_win.cc
+--- a/media/mojo/services/gpu_mojo_media_client_win.cc
++++ b/media/mojo/services/gpu_mojo_media_client_win.cc
+@@ -7,6 +7,8 @@
+ #include <d3d11.h>
+ #include <d3d12.h>
+ #include <wrl.h>
++
++#include "build/build_config.h"  // Venetium 0047: ARCH_CPU_ARMEL.
+ 
+ #include "base/files/file_util.h"
+ #include "base/path_service.h"
+@@ -49,6 +51,21 @@
+  protected:
+   std::unique_ptr<VideoDecoder> CreatePlatformVideoDecoder(
+       VideoDecoderTraits& traits) final {
++#if defined(ARCH_CPU_ARMEL)
++    // Venetium 0047: on ARM32 offer the D3D9 + Media Foundation H.264 decoder whenever its own
++    // per-device DXVA2 probe finds a hardware decoder - whether ANGLE is on D3D9 (Tegra, no d3d11
++    // device) or D3D11 (Adreno, via 0045). It bridges its output to whichever ANGLE backend is live.
++    // When the probe finds nothing, fall through (D3D11VideoDecoder can't init on these low feature
++    // levels either, so the pipeline uses software). x86/x64 is unchanged (this block is ARM-only).
++    if (!DXVAVideoDecoder::GetSupportedVideoDecoderConfigs(gpu_preferences_,
++                                                           gpu_workarounds_)
++             .empty()) {
++      return DXVAVideoDecoder::Create(
++          gpu_task_runner_, traits.media_log->Clone(), gpu_preferences_,
++          gpu_workarounds_, traits.get_command_buffer_stub_cb);
++    }
++#endif  // defined(ARCH_CPU_ARMEL)
++
+     // Venetium 0041: without a D3D11 device from ANGLE (ANGLE on D3D9, e.g.
+     // Windows ARM32 / Tegra) D3D11VideoDecoder can never initialize; use the
+     // D3D9 + Media Foundation decoder instead. It probes the device itself and
+@@ -126,6 +143,18 @@
+     if (gpu_preferences_.disable_accelerated_video_decode) {
+       return supported_configs;
+     }
++#if defined(ARCH_CPU_ARMEL)
++    // Venetium 0047: on ARM32 report the D3D9 DXVA decoder's configs whenever its probe finds them
++    // (either ANGLE backend). Matches CreatePlatformVideoDecoder above; x86/x64 unchanged.
++    {
++      auto dxva_configs = DXVAVideoDecoder::GetSupportedVideoDecoderConfigs(
++          gpu_preferences_, gpu_workarounds_);
++      if (!dxva_configs.empty()) {
++        return dxva_configs;
++      }
++    }
++#endif  // defined(ARCH_CPU_ARMEL)
++
+     // Venetium 0041: no D3D11 device (ANGLE on D3D9) -> the D3D9 decoder's
+     // per-device probe decides what, if anything, is hardware-decoded.
+     if (!d3d11_device_) {
