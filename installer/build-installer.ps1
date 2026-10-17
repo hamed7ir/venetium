@@ -134,8 +134,29 @@ $rspFile = Join-Path $setupDir 'csc.rsp'
 if ($LASTEXITCODE -ne 0) { throw "Setup build failed ($LASTEXITCODE)" }
 
 # ── 5. verify it is MSIL and references only 4.0.0.0 assemblies ───────────────────────────────────────────────
-$sarch = [System.Reflection.AssemblyName]::GetAssemblyName($setupExe).ProcessorArchitecture
-$srefs = ([System.Reflection.Assembly]::ReflectionOnlyLoadFrom($setupExe).GetReferencedAssemblies() | ForEach-Object { $_.Name + ' ' + $_.Version }) -join ', '
+# Read the facts in a CHILD Windows PowerShell: ReflectionOnlyLoadFrom in-process keeps $setupExe mapped until this
+# powershell.exe exits, so a second build in the same console could not overwrite it (CS-Ray installer review, B1).
+function AsmFacts([string]$path) {
+    $helper = Join-Path ([System.IO.Path]::GetTempPath()) ('venetium-asmfacts-' + $PID + '.ps1')
+    $code = @'
+param([string]$p)
+$a = [System.Reflection.Assembly]::ReflectionOnlyLoadFrom($p)
+$r = ($a.GetReferencedAssemblies() | ForEach-Object { $_.Name + ' ' + $_.Version }) -join ', '
+'A=' + [System.Reflection.AssemblyName]::GetAssemblyName($p).ProcessorArchitecture
+'R=' + $r
+'@
+    [System.IO.File]::WriteAllText($helper, $code, (New-Object System.Text.UTF8Encoding($false)))
+    try {
+        $ps  = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $out = & $ps -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $helper $path
+        if ($LASTEXITCODE -ne 0) { throw "could not read assembly facts of $path" }
+    } finally { Remove-Item $helper -ErrorAction SilentlyContinue }
+    $f = @{}
+    foreach ($line in $out) { if ($line -match '^([AR])=(.*)$') { $f[$Matches[1]] = $Matches[2] } }
+    return $f
+}
+$facts = AsmFacts $setupExe
+$sarch = $facts['A']; $srefs = $facts['R']
 "Setup arch = $sarch   refs = $srefs"
 if ("$sarch" -ne 'MSIL') { throw "Setup: expected MSIL, got $sarch" }
 if ($srefs -match ' [1-9][0-9]*\.[1-9]' -or $srefs -notmatch 'mscorlib 4\.0\.0\.0') { throw "Setup must reference only 4.0.0.0 assemblies: $srefs" }

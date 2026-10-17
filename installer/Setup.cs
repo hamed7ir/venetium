@@ -52,20 +52,29 @@ namespace VenetiumSetup
         internal const string ShortcutDesc = "Venetium - Chromium for ARM32 Windows";
         internal const string Publisher = "Hamed Ghorbani";
         internal const string ExeName = "venetium.exe";
+        internal const string ProcessName = "venetium";   // Process.GetProcessesByName (no .exe)
         internal const string DataFolderNote = @"%LocalAppData%\Venetium\User Data";
 
         [STAThread]
         private static int Main(string[] args)
         {
+            bool quiet = Array.Exists(args, a => Eq(a, "--silent"));
             try
             {
                 string a0 = args.Length >= 1 ? args[0] : "";
                 if (Eq(a0, "--uninstall"))
                 {
-                    string dir = args.Length >= 2 ? args[1] : Path.GetDirectoryName(Application.ExecutablePath);
-                    string busy = InUse.Release(dir);
-                    if (busy != null) return 4;
-                    return Uninstaller.Run(dir) ? 0 : 1;
+                    // Entries written by any build quote the folder; tolerate a stray quote or trailing backslash.
+                    string dir = args.Length >= 2 && !args[1].StartsWith("--") ? args[1].Trim().Trim('"') : Path.GetDirectoryName(Application.ExecutablePath);
+                    if (quiet)
+                    {
+                        if (InUse.Check(dir) != null) return 4;
+                        if (!SafeTarget.IsInstalledCopy(dir)) return 5;   // never touch a folder that is not an installed Venetium
+                        return Uninstaller.Run(dir) ? 0 : 1;
+                    }
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    return UninstallWithUi(dir, false);   // Apps & features has already asked "are you sure"
                 }
                 if (Eq(a0, "--check"))
                 {
@@ -82,9 +91,11 @@ namespace VenetiumSetup
                     for (int i = 1; i < args.Length; i++)
                     {
                         if (Eq(args[i], "--no-desktop")) desktop = false;
+                        else if (args[i].StartsWith("-") || args[i].StartsWith("/")) return 2;   // e.g. /S: an unknown switch, not a folder
                         else dir = args[i];
                     }
-                    if (InUse.Release(dir) != null) return 4;
+                    if (SafeTarget.Problem(dir) != null) return 5;
+                    if (InUse.Check(dir) != null) return 4;
                     Installer.Install(dir, desktop, null);
                     return 0;
                 }
@@ -94,26 +105,38 @@ namespace VenetiumSetup
 
                 // Double-clicking the dropped uninstall.exe (no args) -> confirm + uninstall its own folder.
                 if (Eq(Path.GetFileNameWithoutExtension(Application.ExecutablePath), "uninstall"))
-                {
-                    string dir = Path.GetDirectoryName(Application.ExecutablePath);
-                    if (MessageBox.Show("Remove " + AppName + " from this computer?\n\n(Your profile and data in " + DataFolderNote + " are kept.)",
-                        "Uninstall " + AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return 0;
-                    string busy;
-                    while ((busy = InUse.Release(dir)) != null)
-                        if (MessageBox.Show(busy + "\n\nClose it, then press Retry.", "Uninstall " + AppName,
-                            MessageBoxButtons.RetryCancel, MessageBoxIcon.Warning) != DialogResult.Retry) return 4;
-                    Uninstaller.Run(dir);
-                    return 0;
-                }
+                    return UninstallWithUi(Path.GetDirectoryName(Application.ExecutablePath), true);
 
                 Application.Run(new InstallForm());
                 return 0;
             }
             catch (Exception ex)
             {
+                if (quiet) { try { Console.Error.WriteLine(ex.ToString()); } catch { } return 1; }   // unattended: never block on a dialog
                 try { MessageBox.Show(ex.ToString(), AppName + " Setup - error", MessageBoxButtons.OK, MessageBoxIcon.Error); } catch { }
                 return 1;
             }
+        }
+
+        /// <summary>Interactive uninstall (the registered --uninstall, and a double-clicked uninstall.exe): a Retry loop
+        /// while Venetium runs, a refusal message when the folder is not an installed copy, then remove it. Only --silent
+        /// returns bare exit codes.</summary>
+        private static int UninstallWithUi(string dir, bool confirm)
+        {
+            if (confirm && MessageBox.Show("Remove " + AppName + " from this computer?\n\n(Your profile and data in " + DataFolderNote + " are kept.)",
+                    "Uninstall " + AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return 0;
+            string busy;
+            while ((busy = InUse.Check(dir)) != null)
+                if (MessageBox.Show(busy + "\n\nClose all its windows, then press Retry.", "Uninstall " + AppName,
+                    MessageBoxButtons.RetryCancel, MessageBoxIcon.Warning) != DialogResult.Retry) return 4;
+            if (!SafeTarget.IsInstalledCopy(dir))
+            {
+                MessageBox.Show(dir + "\n\ndoesn't look like an installed " + AppName + " (no " + ExeName + " and uninstall.exe in it), so nothing was removed.",
+                    "Uninstall " + AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return 5;
+            }
+            Uninstaller.Run(dir);
+            return 0;
         }
 
         internal static bool Eq(string a, string b) { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
@@ -507,29 +530,106 @@ namespace VenetiumSetup
             finally { if (h != IntPtr.Zero) CloseHandle(h); }
         }
 
-        private static List<string> RunningFrom(string dir, params string[] names)
-        {
-            var hits = new List<string>();
-            string full;
-            try { full = Path.GetFullPath(dir).TrimEnd('\\') + "\\"; } catch { return hits; }
-            foreach (var n in names)
-                foreach (var p in Process.GetProcessesByName(n))
-                {
-                    string img = ImagePath(p);
-                    if (img != null && img.StartsWith(full, StringComparison.OrdinalIgnoreCase)) hits.Add(n + ".exe");
-                    p.Dispose();
-                }
-            return hits;
-        }
-
-        /// <summary>Null when nothing is running from <paramref name="dir"/>, else a sentence to show the user.
-        /// A Venetium (browser, renderer or GPU process) running from the install folder locks its files on an
-        /// upgrade or uninstall and is the user's to close.</summary>
-        internal static string Release(string dir)
+        /// <summary>Null when no Venetium runs from <paramref name="dir"/>, else a sentence saying one does. A Venetium
+        /// (browser, renderer or GPU process) running from the install folder locks its files on an upgrade or uninstall
+        /// and is the user's to close; it is never killed. A process whose path cannot be read, or one started through a
+        /// junction / subst / mapped drive (whose reported path doesn't start with <paramref name="dir"/>), still counts:
+        /// the main exe cannot be opened for writing while any copy runs from the folder.</summary>
+        internal static string Check(string dir)
         {
             if (!Directory.Exists(dir)) return null;
-            if (RunningFrom(dir, "venetium").Count == 0) return null;
-            return "Venetium is running from " + dir + ". Close all its windows first.";
+            string full;
+            try { full = Path.GetFullPath(dir).TrimEnd('\\') + "\\"; } catch { return null; }
+            // A running image cannot be opened for writing. This also catches a Venetium reached through a junction,
+            // subst or mapped drive, whose reported path doesn't start with `dir`.
+            string exe = Path.Combine(full, Program.ExeName);
+            if (File.Exists(exe))
+            {
+                try { using (new FileStream(exe, FileMode.Open, FileAccess.ReadWrite, FileShare.Read)) { } }
+                catch (IOException ex) when (!(ex is FileNotFoundException) && !(ex is DirectoryNotFoundException))
+                { return Program.AppName + " is running from " + dir + "."; }
+                catch { }
+            }
+            bool unknown = false;
+            foreach (var p in Process.GetProcessesByName(Program.ProcessName))
+            {
+                try
+                {
+                    if (p.Id == Process.GetCurrentProcess().Id) continue;
+                    string img = ImagePath(p);
+                    if (img == null) unknown = true;
+                    else if (img.StartsWith(full, StringComparison.OrdinalIgnoreCase))
+                        return Program.AppName + " is running from " + dir + ".";
+                }
+                finally { p.Dispose(); }
+            }
+            return unknown ? Program.AppName + " is running (possibly from " + dir + ")." : null;
+        }
+    }
+
+    /// <summary>
+    /// Where Setup may write and what it may delete. The install folder is replaced on every (re)install and removed on
+    /// uninstall, so a folder of the user's — typed into the path box, or given on the command line — must never be one:
+    /// drive roots and the well-known shell folders are refused outright, and an existing non-empty folder is only
+    /// replaced when it is an installed Venetium (uninstall.exe + venetium.exe in it). Guards findings #1/#2 (data loss).
+    /// </summary>
+    internal static class SafeTarget
+    {
+        /// <summary>Null when <paramref name="dir"/> is safe to install into, else a sentence saying why not.</summary>
+        internal static string Problem(string dir)
+        {
+            string full;
+            try { full = Path.GetFullPath((dir ?? "").Trim()).TrimEnd('\\'); }
+            catch (Exception ex) { return "Not a usable folder: " + ex.Message; }
+            if (full.Length == 0) return "Choose an install folder.";
+            if (full.IndexOfAny(new[] { '%', '^' }) >= 0) return "The folder name can't contain % or ^.";   // uninstall's cmd would expand them
+            string root = (Path.GetPathRoot(full) ?? "").TrimEnd('\\');
+            if (root.Length == 0 || root.Equals(full, StringComparison.OrdinalIgnoreCase)) return "Choose a folder for " + Program.AppName + ", not a whole drive.";
+            foreach (var f in Protected())
+                if (f.Equals(full, StringComparison.OrdinalIgnoreCase))
+                    return full + " is a system or personal folder. Choose a folder of its own, e.g. " + Path.Combine(full, Program.InstallFolderName) + ".";
+            if (!Directory.Exists(full) || IsEmpty(full) || IsInstalledCopy(full)) return null;
+            return full + " already holds other files. Choose an empty folder, or the folder " + Program.AppName + " is installed in.";
+        }
+
+        /// <summary>The folder holds an installed Venetium: the program and the uninstall.exe Setup drops next to it.</summary>
+        internal static bool IsInstalledCopy(string dir)
+        {
+            try { return File.Exists(Path.Combine(dir, "uninstall.exe")) && File.Exists(Path.Combine(dir, Program.ExeName)); }
+            catch { return false; }
+        }
+
+        private static bool IsEmpty(string dir)
+        {
+            try { using (var e = Directory.EnumerateFileSystemEntries(dir).GetEnumerator()) return !e.MoveNext(); }
+            catch { return false; }
+        }
+
+        private static IEnumerable<string> Protected()
+        {
+            var sf = new[]
+            {
+                Environment.SpecialFolder.Windows, Environment.SpecialFolder.System, Environment.SpecialFolder.ProgramFiles,
+                Environment.SpecialFolder.ProgramFilesX86, Environment.SpecialFolder.UserProfile, Environment.SpecialFolder.DesktopDirectory,
+                Environment.SpecialFolder.MyDocuments, Environment.SpecialFolder.MyMusic, Environment.SpecialFolder.MyPictures,
+                Environment.SpecialFolder.MyVideos, Environment.SpecialFolder.ApplicationData, Environment.SpecialFolder.LocalApplicationData,
+                Environment.SpecialFolder.CommonApplicationData, Environment.SpecialFolder.Programs, Environment.SpecialFolder.StartMenu,
+                Environment.SpecialFolder.Startup, Environment.SpecialFolder.Favorites,
+            };
+            var list = new List<string>();
+            foreach (var f in sf)
+            {
+                try { string p = Environment.GetFolderPath(f); if (!string.IsNullOrEmpty(p)) list.Add(Path.GetFullPath(p).TrimEnd('\\')); } catch { }
+            }
+            try
+            {
+                string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                if (!string.IsNullOrEmpty(profile)) list.Add(Path.Combine(profile, "Downloads"));   // no SpecialFolder for it on .NET 4.0
+                string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                if (!string.IsNullOrEmpty(local)) list.Add(Path.Combine(local, "Programs"));
+            }
+            catch { }
+            return list;
         }
     }
 
@@ -538,35 +638,64 @@ namespace VenetiumSetup
         internal static void Install(string targetDir, bool desktopShortcut, Action<string> progress)
         {
             Report(progress, "Preparing...");
+            string refused = SafeTarget.Problem(targetDir);
+            if (refused != null) throw new InvalidOperationException(refused);
+            targetDir = Path.GetFullPath(targetDir.Trim()).TrimEnd('\\');   // one spelling for the files, shortcuts and uninstall entry
             var files = Payload.List();
+            if (!files.Exists(f => Program.Eq(f.Name, Program.ExeName))) throw new InvalidDataException("This Setup carries no " + Program.ExeName + ".");
 
-            // Binaries only: user data lives in %LocalAppData%\Venetium\User Data, never in the install dir, so wiping the
-            // target dir is safe (and it is how a re-install upgrades in place).
-            if (Directory.Exists(targetDir)) { Report(progress, "Removing previous version..."); TryDeleteDir(targetDir); }
-            Directory.CreateDirectory(targetDir);
-
+            // PASS 1 - verify the WHOLE package before touching the folder, so a damaged Setup cannot take a working
+            // install down. Each gzip resource is streamed through SHA-256 and discarded - nothing is retained, because
+            // the payload is ~200 MB (chrome.dll) and this Setup runs 32-bit on a 2 GB RT device: it must not be held in
+            // memory. (So the payload is read twice - verify here, extract below - which is fine on these devices.)
+            Report(progress, "Checking the package...");
             using (var sha = SHA256.Create())
-            {
-                int i = 0;
                 foreach (var f in files)
                 {
-                    Report(progress, "Extracting " + (++i) + " of " + files.Count + ": " + f.Name);
+                    byte[] h;
+                    using (var src = Payload.Open(f)) h = sha.ComputeHash(src);   // ComputeHash(Stream) reads in blocks
+                    if (!string.Equals(Payload.Hex(h), f.Sha256, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidDataException(f.Name + " in this Setup is damaged (SHA-256 " + Payload.Hex(h) + ", expected " + f.Sha256 + "). Download Setup again.");
+                }
+
+            // PASS 2 - the folder is new, empty or an installed Venetium (SafeTarget). Each file is written beside the old
+            // one as <name>.new, verified, then swapped in, so an interrupted install leaves whole files and a working
+            // uninstall.exe; nothing else in the folder (a file the user keeps there) is touched. User data lives in
+            // %LocalAppData%\Venetium\User Data, never here.
+            Directory.CreateDirectory(targetDir);
+            int i = 0;
+            using (var sha = SHA256.Create())
+                foreach (var f in files)
+                {
+                    Report(progress, "Installing " + (++i) + " of " + files.Count + ": " + f.Name);
                     string dest = Path.Combine(targetDir, f.Name);
                     string d = Path.GetDirectoryName(dest);
                     if (!string.IsNullOrEmpty(d)) Directory.CreateDirectory(d);
-                    using (var src = Payload.Open(f))
-                    using (var os = new FileStream(dest, FileMode.Create, FileAccess.Write, FileShare.None))
-                    using (var cs = new CryptoStream(os, sha, CryptoStreamMode.Write))
+                    string tmp = dest + ".new";
+                    try
                     {
-                        Payload.Copy(src, cs);
-                        cs.FlushFinalBlock();
-                        string got = Payload.Hex(sha.Hash);
-                        if (!string.Equals(got, f.Sha256, StringComparison.OrdinalIgnoreCase))
-                            throw new InvalidDataException(f.Name + " did not extract intact (SHA-256 " + got + ", expected " + f.Sha256 + ").");
+                        byte[] h;
+                        using (var src = Payload.Open(f))
+                        using (var os = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+                        using (var cs = new CryptoStream(os, sha, CryptoStreamMode.Write))
+                        {
+                            Payload.Copy(src, cs);
+                            cs.FlushFinalBlock();
+                            h = sha.Hash;
+                        }
+                        sha.Initialize();
+                        if (!string.Equals(Payload.Hex(h), f.Sha256, StringComparison.OrdinalIgnoreCase))
+                            throw new InvalidDataException(f.Name + " did not extract intact (SHA-256 " + Payload.Hex(h) + ", expected " + f.Sha256 + ").");
+                        if (File.Exists(dest)) File.Delete(dest);
+                        File.Move(tmp, dest);
                     }
-                    sha.Initialize();
+                    catch
+                    {
+                        try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }   // don't leave a half step behind
+                        throw;
+                    }
                 }
-            }
+            Owned.RemoveRetired(targetDir, files);   // files only older versions shipped
 
             string exe = Path.Combine(targetDir, Program.ExeName);
             string uninst = Path.Combine(targetDir, "uninstall.exe");
@@ -600,6 +729,7 @@ namespace VenetiumSetup
                     k.SetValue("DisplayIcon", exe);
                     k.SetValue("InstallLocation", dir);
                     k.SetValue("UninstallString", "\"" + uninst + "\" --uninstall \"" + dir + "\"");
+                    k.SetValue("QuietUninstallString", "\"" + uninst + "\" --uninstall \"" + dir + "\" --silent");
                     k.SetValue("NoModify", 1, RegistryValueKind.DWord);
                     k.SetValue("NoRepair", 1, RegistryValueKind.DWord);
                     try { k.SetValue("EstimatedSize", (int)DirSizeKB(dir), RegistryValueKind.DWord); } catch { }
@@ -616,22 +746,71 @@ namespace VenetiumSetup
             return total / 1024;
         }
 
-        internal static void TryDeleteDir(string dir) { try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { } }
         private static void Report(Action<string> p, string s) { if (p != null) p(s); }
+    }
+
+    /// <summary>The files Setup owns in an install folder: this package's (payload.list, which uninstall.exe carries too),
+    /// uninstall.exe, and any name older versions shipped and this one doesn't. Upgrade and uninstall remove only these,
+    /// so anything else in the folder — a file the user put beside the exe — stays. Guards finding #2.</summary>
+    internal static class Owned
+    {
+        // Names an earlier Venetium installer shipped and this one doesn't. Nothing retired yet; add a name here if a
+        // future build drops a file, so an upgrade cleans it up.
+        private static readonly string[] Retired = { };
+
+        internal static void RemoveRetired(string dir, List<PayloadFile> files)   // after an upgrade
+        {
+            foreach (var name in Retired)
+                if (!files.Exists(f => Program.Eq(f.Name, name))) Del(Path.Combine(dir, name));
+        }
+
+        internal static void RemoveAll(string dir, List<PayloadFile> files)       // uninstall
+        {
+            foreach (var f in files) { Del(Path.Combine(dir, f.Name)); Del(Path.Combine(dir, f.Name + ".new")); }   // .new: an install cut off mid-swap
+            foreach (var name in Retired) Del(Path.Combine(dir, name));
+            RemoveEmptySubdirs(dir, files);
+        }
+
+        /// <summary>Remove the payload's subdirectories (locales, IwaKeyDistribution, ...), but only when empty and deepest
+        /// first, so a subfolder with foreign files in it survives and rmdir-without-/s can then take the install folder.</summary>
+        private static void RemoveEmptySubdirs(string dir, List<PayloadFile> files)
+        {
+            string root;
+            try { root = Path.GetFullPath(dir).TrimEnd('\\'); } catch { return; }
+            var subs = new List<string>();
+            foreach (var f in files)
+            {
+                string d;
+                try { d = Path.GetFullPath(Path.GetDirectoryName(Path.Combine(root, f.Name))).TrimEnd('\\'); } catch { continue; }
+                while (!string.IsNullOrEmpty(d) && !d.Equals(root, StringComparison.OrdinalIgnoreCase) &&
+                       d.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase))
+                {
+                    bool seen = false;
+                    foreach (var s in subs) if (s.Equals(d, StringComparison.OrdinalIgnoreCase)) { seen = true; break; }
+                    if (!seen) subs.Add(d);
+                    try { d = Path.GetDirectoryName(d).TrimEnd('\\'); } catch { break; }
+                }
+            }
+            subs.Sort((a, b) => b.Length.CompareTo(a.Length));   // deepest (longest path) first
+            foreach (var sub in subs) { try { Directory.Delete(sub, false); } catch { } }   // only if empty now
+        }
+
+        private static void Del(string f) { try { if (File.Exists(f)) File.Delete(f); } catch { } }
     }
 
     internal static class Uninstaller
     {
         internal static bool Run(string dir)
         {
+            if (!SafeTarget.IsInstalledCopy(dir)) return false;   // never touch a folder that is not an installed Venetium
             // OWNERSHIP: the shortcut names and the uninstall key are fixed, so another install of this app (a copy in
             // another folder, or the one a later install moved them to) may own them. Remove only what points INTO
-            // the folder being removed — Finestra's OwnedByThisInstall rule for its Run value, applied to all three.
-            // Removing them blind once deleted a real install's shortcuts and uninstall entry during a test.
+            // the folder being removed. Removing them blind once deleted a real install's shortcuts and uninstall entry.
             RemoveShortcutIfOurs(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), Program.AppName + ".lnk"), dir);
             RemoveShortcutIfOurs(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), Program.AppName + ".lnk"), dir);
             RemoveUninstallKeyIfOurs(dir);
-            SelfDeleteDir(dir);   // remove the install dir last (uninstall.exe runs from inside it)
+            Owned.RemoveAll(dir, Payload.List());   // delete only the files Setup wrote, and empty the payload subdirs
+            SelfDeleteDir(dir);   // uninstall.exe and the then-empty folder last (uninstall.exe runs from inside it)
             return true;
         }
 
@@ -672,9 +851,14 @@ namespace VenetiumSetup
         {
             try
             {
-                // uninstall.exe lives inside `dir` and is running -> it can't delete itself. A detached cmd waits ~2s
-                // for this process to exit, then removes the whole dir (incl. uninstall.exe).
-                var psi = new ProcessStartInfo("cmd.exe", "/c ping 127.0.0.1 -n 3 >nul & rmdir /s /q \"" + dir + "\"");
+                // uninstall.exe may be running from inside `dir`, so a detached cmd waits for it to exit (with a second
+                // try for a slow device), deletes it, and removes the folder only if it is empty now: rmdir WITHOUT /s
+                // never deletes what isn't ours (Owned.RemoveAll already took our files and emptied the payload subdirs).
+                // Its working folder is System32, never `dir` (a process's current folder cannot be removed).
+                string u = Path.Combine(dir, "uninstall.exe");
+                var psi = new ProcessStartInfo("cmd.exe",
+                    "/c ping 127.0.0.1 -n 4 >nul & del /f /q \"" + u + "\" & ping 127.0.0.1 -n 4 >nul & del /f /q \"" + u + "\" & rmdir \"" + dir + "\"");
+                psi.WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.System);
                 psi.CreateNoWindow = true; psi.UseShellExecute = false; psi.WindowStyle = ProcessWindowStyle.Hidden;
                 Process.Start(psi);
             }
@@ -804,7 +988,11 @@ namespace VenetiumSetup
             Controls.Add(rl); Controls.Add(_reqs); Controls.Add(_links);
             Controls.Add(_status); Controls.Add(_bar); Controls.Add(_check); Controls.Add(_install); Controls.Add(_cancel);
             AcceptButton = _install; CancelButton = _cancel;
+            // Closing the window mid-install would kill the extraction thread between files (finding #7).
+            FormClosing += (s, e) => { if (_busy && e.CloseReason == CloseReason.UserClosing) e.Cancel = true; };
         }
+
+        private bool _busy;
 
         private void RunCheck()
         {
@@ -820,8 +1008,7 @@ namespace VenetiumSetup
                 {
                     BeginInvoke((Action)(() =>
                     {
-                        _bar.Visible = false;
-                        _check.Enabled = true;
+                        if (!_busy) { _bar.Visible = false; _check.Enabled = true; }   // an install started meanwhile owns them
                         if (err != null) { _reqs.Text = "The check failed: " + err.Message; _status.Text = ""; return; }
                         ShowReport(rep);
                     }));
@@ -854,9 +1041,11 @@ namespace VenetiumSetup
         {
             string dir = (_path.Text ?? "").Trim();
             if (string.IsNullOrEmpty(dir)) { MessageBox.Show(this, "Choose an install location."); return; }
+            string refused = SafeTarget.Problem(dir);
+            if (refused != null) { MessageBox.Show(this, refused, "Setup", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
             string busy;
-            while ((busy = InUse.Release(dir)) != null)
-                if (MessageBox.Show(this, busy + "\n\nClose it, then press Retry.", "Setup", MessageBoxButtons.RetryCancel, MessageBoxIcon.Warning) != DialogResult.Retry) return;
+            while ((busy = InUse.Check(dir)) != null)
+                if (MessageBox.Show(this, busy + "\n\nClose all its windows, then press Retry.", "Setup", MessageBoxButtons.RetryCancel, MessageBoxIcon.Warning) != DialogResult.Retry) return;
 
             bool desktop = _desktop.Checked;
             SetBusy(true);
@@ -872,11 +1061,12 @@ namespace VenetiumSetup
 
         private void Finished(string dir, Exception err)
         {
-            _bar.Visible = false;
+            // First thing: the install is over, so the close guard must stop blocking. (If it stayed on, it would cancel
+            // the Close() below and every click on the window's X after it — finding #7.)
+            SetBusy(false);
             if (err != null)
             {
                 MessageBox.Show(this, "Install failed:\n\n" + err.Message, "Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                SetBusy(false);
                 return;
             }
             if (MessageBox.Show(this, Program.AppName + " was installed.\n\nLaunch it now?", "Setup",
@@ -887,6 +1077,7 @@ namespace VenetiumSetup
 
         private void SetBusy(bool busy)
         {
+            _busy = busy;
             _install.Enabled = _cancel.Enabled = _browse.Enabled = _path.Enabled = _desktop.Enabled = _check.Enabled = !busy;
             _bar.Visible = busy;
         }
