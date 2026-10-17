@@ -1,0 +1,20 @@
+--- a/extensions/browser/extension_util.cc
++++ b/extensions/browser/extension_util.cc
+@@ -592,7 +592,16 @@
+   if (download_item.GetMimeType() == Extension::kMimeType ||
+       UserScript::IsURLUserScript(download_item.GetURL(),
+                                   download_item.GetMimeType())) {
+-    return ShouldDownloadAsRegularFile();
++    // Venetium 0050: a valid extension / user-script download IS an extension
++    // download. The ungoogled change here returned ShouldDownloadAsRegularFile()
++    // directly, which is false unless --extension-mime-request-handling=
++    // download-as-regular-file is passed, so WebstoreInstaller rejected EVERY Web
++    // Store .crx with "Download was not a valid extension or user script" and no
++    // extension could be installed. Negate it to match download_target_determiner.cc,
++    // which gates the install branch on !ShouldDownloadAsRegularFile(): install by
++    // default; download the .crx as a plain file only when the user opts in via the
++    // flag. (The CRX unzip utility itself is already handled by Venetium 0044.)
++    return !ShouldDownloadAsRegularFile();
+   }
+   return false;
+ }

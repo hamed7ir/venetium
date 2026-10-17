@@ -1,0 +1,1551 @@
+Venetium 0052 - webcam on Windows ARM32: a WinRT MediaCapture capture backend (MediaFrameReader, ~30 fps on the probe).
+On the ARM32 cameras (Tegra's NVIDIA Unified AvStream, the Lumias) the desktop Media Foundation capture path enumerates and
+opens the camera but can never start streaming it: ReadSample fails with MF_E_HW_MFT_FAILED_START_STREAMING (0xC00D3704)
+for every native, NV12 and RGB32 type, unsandboxed, with EnableFrameServerMode=0 too (mediaprobe v1/v2, his device,
+2026-10-14). getUserMedia therefore failed with "NotReadableError: Could not start video source". WinRT MediaCapture
+drives the same camera (TelegArm works on the device), so on ARM32 VideoCaptureDeviceFactoryWin::CreateDevice returns a
+new VideoCaptureDeviceWinRT; enumeration (GetDevicesInfo) stays on Media Foundation, which works there.
+
+VideoCaptureDeviceWinRT (media/capture/video/win/video_capture_device_winrt.{h,cc}) runs its own MTA thread:
+- picks the camera (DeviceInformation.FindAllAsync(VideoCapture), matching the descriptor's device id), initializes
+  MediaCapture with StreamingCaptureMode=Video (then AudioAndVideo), PhotoCaptureSource=Auto and NO MemoryPreference -
+  forcing MemoryPreference=Cpu is what makes this camera's hardware MFT refuse to start;
+- streams with a MediaFrameReader on the VideoPreview Color source (winrtcamprobe v4 on the Tegra, 2026-10-15: 30 fps on
+  both cameras; the VideoRecord source only gives NVIDIA's opaque '420O' surfaces, and a headless StartPreviewAsync fails
+  with 0xC00D36BB). SelectSourceFormat picks the closest uncompressed YUY2/NV12 format to the request (default 640x480@30,
+  capped at 1280x720, fps not above the request), trying the best 3; the reader is created NV12 first, then native;
+- frames arrive as Direct3D surfaces: SoftwareBitmap.CreateCopyFromSurfaceAsync, then LockBuffer +
+  IMemoryBufferByteAccess, delivered in place when the planes are already tightly packed, else repacked (bounds-checked,
+  even dimensions) as NV12 / YUY2 / ARGB to OnIncomingCapturedData, with one monotonic clock for the timestamps;
+- if the reader delivers nothing it falls back to MediaCapture photo capture (LowLagPhotoCapture, else
+  CapturePhotoToStreamAsync, MJPEG, ~2 fps) so the camera still works; a stream that stalls (4 s before the first
+  frame, 5 s after) or MediaCapture.Failed reports OnError instead of freezing; OnStarted is sent on the first real frame.
+WRL + HRESULT only (no C++/WinRT, no exceptions - the ARM32 toolchain has none). Every async operation is awaited on a
+shared event together with the device's stop event and a timeout, and cancelled on stop. ARM32 only: BUILD.gn adds the
+files and runtimeobject.lib under current_cpu == "arm"; x86/x64 capture is unchanged.
+Device: the stream itself is device-measured (probe v4); this Chromium build of the backend is NOT yet device-tested.
+
+diff --git a/media/capture/video/win/BUILD.gn b/media/capture/video/win/BUILD.gn
+index 1dc07c3..8b1e04e 100644
+--- a/media/capture/video/win/BUILD.gn
++++ b/media/capture/video/win/BUILD.gn
+@@ -69,6 +69,18 @@ source_set("win") {
+     "/DELAYLOAD:mfplat.dll",
+     "/DELAYLOAD:mfreadwrite.dll",
+   ]
++
++  # Venetium: WinRT MediaCapture camera backend, ARM32 only. On the Tegra/AvStream (and Lumia/Adreno) cameras the
++  # desktop Media Foundation capture path cannot start streaming (MF_E_HW_MFT_FAILED_START_STREAMING), so on ARM32 the
++  # factory routes capture through MediaCapture (a MediaFrameReader, with photo capture as the fallback). Not built on
++  # x86/x64, where the Media Foundation path works.
++  if (current_cpu == "arm") {
++    sources += [
++      "video_capture_device_winrt.cc",
++      "video_capture_device_winrt.h",
++    ]
++    libs += [ "runtimeobject.lib" ]
++  }
+ }
+ 
+ source_set("win_unittests") {
+diff --git a/media/capture/video/win/video_capture_device_factory_win.cc b/media/capture/video/win/video_capture_device_factory_win.cc
+index 70bbb9a..62e8d63 100644
+--- a/media/capture/video/win/video_capture_device_factory_win.cc
++++ b/media/capture/video/win/video_capture_device_factory_win.cc
+@@ -50,8 +50,12 @@
+ #include "media/capture/capture_switches.h"
+ #include "media/capture/video/video_capture_device_descriptor.h"
+ #include "media/capture/video/win/metrics.h"
++#include "build/build_config.h"
+ #include "media/capture/video/win/video_capture_device_mf_win.h"
+ #include "media/capture/video/win/video_capture_device_win.h"
++#if defined(ARCH_CPU_ARMEL)
++#include "media/capture/video/win/video_capture_device_winrt.h"
++#endif
+ #include "third_party/abseil-cpp/absl/container/flat_hash_set.h"
+ 
+ using DevicesInfo = std::vector<media::VideoCaptureDeviceInfo>;
+@@ -598,6 +602,15 @@ VideoCaptureErrorOrDevice VideoCaptureDeviceFactoryWin::CreateDevice(
+   UMA_HISTOGRAM_ENUMERATION("Media.VideoCapture.Win.DeviceFactory.CaptureApi",
+                             device_descriptor.capture_api);
+ 
++#if defined(ARCH_CPU_ARMEL)
++  // Venetium: on Windows ARM32 (Tegra/AvStream, Lumia/Adreno) the desktop Media Foundation capture path enumerates
++  // and opens the camera but cannot start streaming it (MF_E_HW_MFT_FAILED_START_STREAMING). Capture goes through
++  // WinRT MediaCapture instead: a MediaFrameReader on the VideoPreview color source, with MediaCapture photo capture
++  // as the fallback (see video_capture_device_winrt.cc). Enumeration (GetDevicesInfo) stays on Media Foundation,
++  // which works on this hardware and populates the |device_descriptor|.
++  auto winrt_device = std::make_unique<VideoCaptureDeviceWinRT>(device_descriptor);
++  return VideoCaptureErrorOrDevice(std::move(winrt_device));
++#else
+   switch (device_descriptor.capture_api) {
+     case VideoCaptureApi::WIN_MEDIA_FOUNDATION:
+     case VideoCaptureApi::WIN_MEDIA_FOUNDATION_SENSOR: {
+@@ -652,6 +665,7 @@ VideoCaptureErrorOrDevice VideoCaptureDeviceFactoryWin::CreateDevice(
+     default:
+       NOTREACHED();
+   }
++#endif  // defined(ARCH_CPU_ARMEL)
+ }
+ 
+ bool VideoCaptureDeviceFactoryWin::CreateDeviceEnumMonikerDirectShow(
+diff --git a/media/capture/video/win/video_capture_device_winrt.cc b/media/capture/video/win/video_capture_device_winrt.cc
+new file mode 100644
+index 0000000..2cb11ca
+--- /dev/null
++++ b/media/capture/video/win/video_capture_device_winrt.cc
+@@ -0,0 +1,1381 @@
++// Copyright 2024 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifdef UNSAFE_BUFFERS_BUILD
++// Row-by-row plane copies out of WinRT bitmap buffers (bounds-checked by hand).
++#pragma allow_unsafe_buffers
++#endif
++
++#include "media/capture/video/win/video_capture_device_winrt.h"
++
++#include <windows.h>
++#include <wrl/client.h>
++#include <wrl/event.h>
++#include <wrl/wrappers/corewrappers.h>
++
++#include <MemoryBuffer.h>
++#include <windows.devices.enumeration.h>
++#include <windows.foundation.collections.h>
++#include <windows.foundation.h>
++#include <windows.graphics.directx.direct3d11.h>
++#include <windows.graphics.imaging.h>
++#include <windows.media.capture.frames.h>
++#include <windows.media.capture.h>
++#include <windows.media.devices.h>
++#include <windows.media.mediaproperties.h>
++#include <windows.storage.streams.h>
++
++#include <algorithm>
++#include <cstring>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/logging.h"
++#include "base/memory/ref_counted.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/time/time.h"
++#include "media/base/video_types.h"
++#include "ui/gfx/color_space.h"
++#include "ui/gfx/geometry/size.h"
++
++namespace media {
++
++namespace {
++
++using Microsoft::WRL::Callback;
++using Microsoft::WRL::ComPtr;
++using Microsoft::WRL::Wrappers::HString;
++using Microsoft::WRL::Wrappers::HStringReference;
++
++namespace wf = ABI::Windows::Foundation;
++namespace wfc = ABI::Windows::Foundation::Collections;
++namespace wde = ABI::Windows::Devices::Enumeration;
++namespace wgd = ABI::Windows::Graphics::DirectX::Direct3D11;
++namespace wgi = ABI::Windows::Graphics::Imaging;
++namespace wmc = ABI::Windows::Media::Capture;
++namespace wmcf = ABI::Windows::Media::Capture::Frames;
++namespace wmd = ABI::Windows::Media::Devices;
++namespace wmp = ABI::Windows::Media::MediaProperties;
++namespace wss = ABI::Windows::Storage::Streams;
++
++// A Win32 event shared with WinRT completion/event handlers. Each handler holds a reference, so a callback that fires
++// late (after a timeout, or during teardown) still signals a live handle rather than a closed - possibly recycled -
++// one. Also carries the code of the last MediaCapture.Failed event.
++class SharedEvent : public base::RefCountedThreadSafe<SharedEvent> {
++ public:
++  explicit SharedEvent(bool manual_reset)
++      : handle_(::CreateEventW(nullptr, manual_reset ? TRUE : FALSE, FALSE, nullptr)) {}
++  SharedEvent(const SharedEvent&) = delete;
++  SharedEvent& operator=(const SharedEvent&) = delete;
++
++  HANDLE handle() const { return handle_; }
++  void Signal() {
++    if (handle_) {
++      ::SetEvent(handle_);
++    }
++  }
++
++  std::atomic<uint32_t> failure_code{0};
++
++ private:
++  friend class base::RefCountedThreadSafe<SharedEvent>;
++  ~SharedEvent() {
++    if (handle_) {
++      ::CloseHandle(handle_);
++    }
++  }
++
++  const HANDLE handle_;
++};
++
++// The final status of a completed WinRT async operation as an HRESULT (S_OK only if it Completed).
++HRESULT AsyncResult(IUnknown* op) {
++  ComPtr<wf::IAsyncInfo> info;
++  if (FAILED(op->QueryInterface(IID_PPV_ARGS(&info))) || !info) {
++    return E_NOINTERFACE;
++  }
++  wf::AsyncStatus status = wf::AsyncStatus::Started;
++  info->get_Status(&status);
++  if (status == wf::AsyncStatus::Completed) {
++    return S_OK;
++  }
++  HRESULT error = S_OK;
++  info->get_ErrorCode(&error);
++  if (status == wf::AsyncStatus::Canceled) {
++    return FAILED(error) ? error : E_ABORT;
++  }
++  return FAILED(error) ? error : E_FAIL;
++}
++
++// Waits for |done| (the completion handler) or |stop| (may be null). On stop or timeout the operation is cancelled
++// and given a moment to settle, so a retry doesn't race a half-finished call on the same camera.
++HRESULT WaitForCompletion(IUnknown* op, SharedEvent* done, HANDLE stop, DWORD timeout_ms) {
++  HANDLE handles[2] = {done->handle(), stop};
++  const DWORD count = stop ? 2 : 1;
++  const DWORD result = ::WaitForMultipleObjects(count, handles, FALSE, timeout_ms);
++  if (result == WAIT_OBJECT_0) {
++    return AsyncResult(op);
++  }
++  ComPtr<wf::IAsyncInfo> info;
++  if (SUCCEEDED(op->QueryInterface(IID_PPV_ARGS(&info))) && info) {
++    info->Cancel();
++  }
++  ::WaitForSingleObject(done->handle(), 1000);
++  return result == WAIT_OBJECT_0 + 1 ? E_ABORT : HRESULT_FROM_WIN32(ERROR_TIMEOUT);
++}
++
++// Block on a WinRT IAsyncAction; returns its result (S_OK on success, E_ABORT if |stop| was signalled).
++HRESULT AwaitAction(wf::IAsyncAction* op, HANDLE stop, DWORD timeout_ms = 10000) {
++  if (!op) {
++    return E_POINTER;
++  }
++  auto done = base::MakeRefCounted<SharedEvent>(/*manual_reset=*/true);
++  if (!done->handle()) {
++    return HRESULT_FROM_WIN32(::GetLastError());
++  }
++  auto cb = Callback<wf::IAsyncActionCompletedHandler>(
++      [done](wf::IAsyncAction*, wf::AsyncStatus) -> HRESULT {
++        done->Signal();
++        return S_OK;
++      });
++  HRESULT hr = op->put_Completed(cb.Get());
++  if (FAILED(hr)) {
++    return hr;
++  }
++  return WaitForCompletion(op, done.get(), stop, timeout_ms);
++}
++
++// Block on a WinRT IAsyncOperation<T>; returns its result (S_OK on success, E_ABORT if |stop| was signalled).
++template <typename T>
++HRESULT AwaitOp(wf::IAsyncOperation<T>* op, HANDLE stop, DWORD timeout_ms = 10000) {
++  if (!op) {
++    return E_POINTER;
++  }
++  auto done = base::MakeRefCounted<SharedEvent>(/*manual_reset=*/true);
++  if (!done->handle()) {
++    return HRESULT_FROM_WIN32(::GetLastError());
++  }
++  auto cb = Callback<wf::IAsyncOperationCompletedHandler<T>>(
++      [done](wf::IAsyncOperation<T>*, wf::AsyncStatus) -> HRESULT {
++        done->Signal();
++        return S_OK;
++      });
++  HRESULT hr = op->put_Completed(cb.Get());
++  if (FAILED(hr)) {
++    return hr;
++  }
++  return WaitForCompletion(op, done.get(), stop, timeout_ms);
++}
++
++template <typename T>
++void CloseIfClosable(T* object) {
++  if (!object) {
++    return;
++  }
++  ComPtr<wf::IClosable> closable;
++  if (SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&closable))) && closable) {
++    closable->Close();
++  }
++}
++
++std::string HexHr(HRESULT hr) {
++  return base::StringPrintf("0x%08lX", static_cast<unsigned long>(hr));
++}
++
++std::string HStr8(HSTRING h) {
++  UINT32 n = 0;
++  const wchar_t* w = ::WindowsGetStringRawBuffer(h, &n);
++  if (!w || n == 0) {
++    return std::string();
++  }
++  return base::WideToUTF8(std::wstring(w, n));
++}
++
++void ReportError(VideoCaptureDevice::Client* client, const std::string& why) {
++  LOG(ERROR) << "VideoCaptureDeviceWinRT: " << why;
++  if (client) {
++    client->OnError(VideoCaptureError::kWinMediaFoundationDeviceInitializationFailed, FROM_HERE,
++                    "WinRT camera: " + why);
++  }
++}
++
++// Enumerate WinRT video cameras and return the DeviceInformation.Id best matching |wanted_id| (the descriptor's
++// device id, which comes from Media Foundation enumeration). Falls back to the first camera. Empty if none.
++HString PickCameraId(const std::string& wanted_id, HANDLE stop) {
++  HString chosen;
++  ComPtr<wde::IDeviceInformationStatics> statics;
++  if (FAILED(::RoGetActivationFactory(
++          HStringReference(RuntimeClass_Windows_Devices_Enumeration_DeviceInformation).Get(),
++          IID_PPV_ARGS(&statics)))) {
++    return chosen;
++  }
++  ComPtr<wf::IAsyncOperation<wde::DeviceInformationCollection*>> op;
++  if (FAILED(statics->FindAllAsyncDeviceClass(wde::DeviceClass_VideoCapture, &op)) ||
++      FAILED(AwaitOp(op.Get(), stop))) {
++    return chosen;
++  }
++  ComPtr<wfc::IVectorView<wde::DeviceInformation*>> devs;
++  if (FAILED(op->GetResults(&devs)) || !devs) {
++    return chosen;
++  }
++  UINT32 n = 0;
++  devs->get_Size(&n);
++  std::string wanted_lc = base::ToLowerASCII(wanted_id);
++  HString first;
++  for (UINT32 i = 0; i < n; ++i) {
++    ComPtr<wde::IDeviceInformation> di;
++    if (FAILED(devs->GetAt(i, &di)) || !di) {
++      continue;
++    }
++    HString id;
++    di->get_Id(id.GetAddressOf());
++    std::string id8 = HStr8(id.Get());
++    std::string id_lc = base::ToLowerASCII(id8);
++    VLOG(1) << "VideoCaptureDeviceWinRT: WinRT camera[" << i << "] id=" << id8;
++    if (i == 0) {
++      di->get_Id(first.GetAddressOf());
++    }
++    if (!wanted_lc.empty() &&
++        (id_lc == wanted_lc || id_lc.find(wanted_lc) != std::string::npos ||
++         wanted_lc.find(id_lc) != std::string::npos)) {
++      di->get_Id(chosen.GetAddressOf());
++      VLOG(1) << "VideoCaptureDeviceWinRT: matched requested camera at index " << i;
++      return chosen;
++    }
++  }
++  VLOG(1) << "VideoCaptureDeviceWinRT: no id match; using the first camera";
++  return first;
++}
++
++// Initialize a MediaCapture for camera |id| the way TelegArm does (proven on this hardware): StreamingCaptureMode =
++// |mode|, PhotoCaptureSource = Auto, and NO MemoryPreference (forcing CPU memory makes the hardware MFT fail to start
++// here). |out| is set on success; a failed MediaCapture is closed so a retry gets the camera back.
++HRESULT InitCapture(HSTRING id,
++                    wmc::StreamingCaptureMode mode,
++                    HANDLE stop,
++                    ComPtr<wmc::IMediaCapture>* out) {
++  ComPtr<IInspectable> settings_insp;
++  HRESULT hr = ::RoActivateInstance(
++      HStringReference(RuntimeClass_Windows_Media_Capture_MediaCaptureInitializationSettings).Get(),
++      &settings_insp);
++  ComPtr<wmc::IMediaCaptureInitializationSettings> settings;
++  if (SUCCEEDED(hr)) {
++    hr = settings_insp.As(&settings);
++  }
++  if (FAILED(hr)) {
++    return hr;
++  }
++  settings->put_VideoDeviceId(id);
++  settings->put_PhotoCaptureSource(wmc::PhotoCaptureSource_Auto);
++  settings->put_StreamingCaptureMode(mode);
++
++  ComPtr<IInspectable> mc_insp;
++  hr = ::RoActivateInstance(
++      HStringReference(RuntimeClass_Windows_Media_Capture_MediaCapture).Get(), &mc_insp);
++  ComPtr<wmc::IMediaCapture> mc;
++  if (SUCCEEDED(hr)) {
++    hr = mc_insp.As(&mc);
++  }
++  if (FAILED(hr)) {
++    return hr;
++  }
++  ComPtr<wf::IAsyncAction> init;
++  hr = mc->InitializeWithSettingsAsync(settings.Get(), &init);
++  if (SUCCEEDED(hr)) {
++    hr = AwaitAction(init.Get(), stop, 20000);
++  }
++  if (FAILED(hr)) {
++    CloseIfClosable(mc.Get());
++    return hr;
++  }
++  *out = mc;
++  return S_OK;
++}
++
++// Records MediaCapture.Failed (asynchronous capture errors) into |wake| and wakes the capture loop.
++void WatchCaptureFailures(wmc::IMediaCapture* mc, scoped_refptr<SharedEvent> wake) {
++  EventRegistrationToken token;
++  auto handler = Callback<wmc::IMediaCaptureFailedEventHandler>(
++      [wake](wmc::IMediaCapture*, wmc::IMediaCaptureFailedEventArgs* args) -> HRESULT {
++        UINT32 code = 0;
++        if (args) {
++          args->get_Code(&code);
++        }
++        wake->failure_code.store(code ? code : static_cast<uint32_t>(E_FAIL));
++        wake->Signal();
++        return S_OK;
++      });
++  mc->add_Failed(handler.Get(), &token);
++}
++
++// Converts SystemRelativeTime (100 ns ticks) into one monotonic capture timeline. The time base is fixed by the first
++// frame (camera timestamps if it has one, else wall clock), never mixed, and each timestamp is clamped to move forward.
++class FrameClock {
++ public:
++  base::TimeDelta Next(int64_t ticks, base::TimeTicks now) {
++    if (!started_) {
++      started_ = true;
++      use_ticks_ = ticks != 0;
++      first_ticks_ = ticks;
++      start_ = now;
++    }
++    base::TimeDelta t;
++    if (use_ticks_ && ticks != 0) {
++      t = base::Microseconds((ticks - first_ticks_) / 10);
++    } else if (use_ticks_) {
++      t = last_ + (now - last_now_);  // a frame without a camera timestamp: advance by wall clock
++    } else {
++      t = now - start_;
++    }
++    if (has_last_ && t <= last_) {
++      t = last_ + base::Microseconds(1);
++    }
++    last_ = t;
++    last_now_ = now;
++    has_last_ = true;
++    return t;
++  }
++
++ private:
++  bool started_ = false;
++  bool use_ticks_ = false;
++  bool has_last_ = false;
++  int64_t first_ticks_ = 0;
++  base::TimeTicks start_;
++  base::TimeTicks last_now_;
++  base::TimeDelta last_;
++};
++
++// ---------------------------------------------------------------------------------------------------------------------
++// Streaming path: MediaFrameReader on the camera's VideoPreview frame source. Device-measured on the Surface Tegra
++// (winrtcamprobe v4): 30 fps of live frames on both cameras, delivered as Direct3D surfaces (YUY2, or NV12 when the
++// reader converts) that SoftwareBitmap.CreateCopyFromSurfaceAsync copies to the CPU in ~15-18 ms at 640x480. The
++// VideoRecord source streams too but in NVIDIA's opaque '420O' layout, which the CPU copy rejects (E_INVALIDARG), and
++// a headless StartPreviewAsync fails (0xC00D36BB) - so VideoPreview + frame reader is the one usable stream.
++
++enum class ReaderOutcome {
++  kStopped,        // StopAndDeAllocate() asked us to stop
++  kReported,       // a fatal error was already reported to the client (OnError)
++  kNoFrames,       // nothing usable came out (or the reader couldn't start): the caller may try something else
++};
++
++bool SubtypeIs(HSTRING subtype, const wchar_t* want) {
++  UINT32 n = 0;
++  const wchar_t* w = ::WindowsGetStringRawBuffer(subtype, &n);
++  return w && _wcsicmp(w, want) == 0;
++}
++
++double RatioToFps(wmp::IMediaRatio* ratio) {
++  if (!ratio) {
++    return 0.0;
++  }
++  UINT32 num = 0, den = 0;
++  ratio->get_Numerator(&num);
++  ratio->get_Denominator(&den);
++  return den ? static_cast<double>(num) / den : 0.0;
++}
++
++void DescribeFrameFormat(wmcf::IMediaFrameFormat* format, std::string* subtype, int* width, int* height,
++                         double* fps) {
++  *width = *height = 0;
++  *fps = 0.0;
++  subtype->clear();
++  if (!format) {
++    return;
++  }
++  HString sub;
++  format->get_Subtype(sub.GetAddressOf());
++  *subtype = HStr8(sub.Get());
++  ComPtr<wmcf::IVideoMediaFrameFormat> video;
++  if (SUCCEEDED(format->get_VideoFormat(&video)) && video) {
++    UINT32 w = 0, h = 0;
++    video->get_Width(&w);
++    video->get_Height(&h);
++    *width = static_cast<int>(w);
++    *height = static_cast<int>(h);
++  }
++  ComPtr<wmp::IMediaRatio> rate;
++  format->get_FrameRate(&rate);
++  *fps = RatioToFps(rate.Get());
++}
++
++// The camera's Color frame source of stream type |type|, or null.
++ComPtr<wmcf::IMediaFrameSource> FindFrameSource(wmc::IMediaCapture* mc, wmc::MediaStreamType type) {
++  ComPtr<wmc::IMediaCapture5> mc5;
++  if (FAILED(mc->QueryInterface(IID_PPV_ARGS(&mc5))) || !mc5) {
++    return nullptr;
++  }
++  ComPtr<wfc::IMapView<HSTRING, wmcf::MediaFrameSource*>> sources;
++  if (FAILED(mc5->get_FrameSources(&sources)) || !sources) {
++    return nullptr;
++  }
++  ComPtr<wfc::IIterable<wfc::IKeyValuePair<HSTRING, wmcf::MediaFrameSource*>*>> iterable;
++  ComPtr<wfc::IIterator<wfc::IKeyValuePair<HSTRING, wmcf::MediaFrameSource*>*>> it;
++  if (FAILED(sources.As(&iterable)) || FAILED(iterable->First(&it)) || !it) {
++    return nullptr;
++  }
++  boolean has_current = false;
++  it->get_HasCurrent(&has_current);
++  while (has_current) {
++    ComPtr<wfc::IKeyValuePair<HSTRING, wmcf::MediaFrameSource*>> pair;
++    ComPtr<wmcf::IMediaFrameSource> source;
++    ComPtr<wmcf::IMediaFrameSourceInfo> info;
++    if (SUCCEEDED(it->get_Current(&pair)) && pair && SUCCEEDED(pair->get_Value(&source)) && source &&
++        SUCCEEDED(source->get_Info(&info)) && info) {
++      wmc::MediaStreamType stream_type = wmc::MediaStreamType_Audio;
++      wmcf::MediaFrameSourceKind kind = wmcf::MediaFrameSourceKind_Custom;
++      info->get_MediaStreamType(&stream_type);
++      info->get_SourceKind(&kind);
++      if (kind == wmcf::MediaFrameSourceKind_Color && stream_type == type) {
++        return source;
++      }
++    }
++    if (FAILED(it->MoveNext(&has_current))) {
++      break;
++    }
++  }
++  return nullptr;
++}
++
++// SetFormatAsync to the uncompressed format closest to |target|: not larger if possible, at least the target rate if
++// possible but no faster than needed (a 15 fps request gets the 15 fps mode). Tries the best few candidates in order
++// until one is accepted. |size| / |fps| report the format in effect afterwards.
++void SelectSourceFormat(wmcf::IMediaFrameSource* source,
++                        const gfx::Size& target,
++                        float target_fps,
++                        HANDLE stop,
++                        gfx::Size* size,
++                        float* fps) {
++  std::vector<std::pair<long, ComPtr<wmcf::IMediaFrameFormat>>> candidates;
++  ComPtr<wfc::IVectorView<wmcf::MediaFrameFormat*>> formats;
++  if (SUCCEEDED(source->get_SupportedFormats(&formats)) && formats) {
++    UINT32 count = 0;
++    formats->get_Size(&count);
++    for (UINT32 i = 0; i < count; ++i) {
++      ComPtr<wmcf::IMediaFrameFormat> format;
++      if (FAILED(formats->GetAt(i, &format)) || !format) {
++        continue;
++      }
++      HString sub;
++      format->get_Subtype(sub.GetAddressOf());
++      if (!SubtypeIs(sub.Get(), L"YUY2") && !SubtypeIs(sub.Get(), L"NV12")) {
++        continue;  // compressed / vendor layouts can't be copied to the CPU
++      }
++      std::string subtype;
++      int w = 0, h = 0;
++      double rate = 0.0;
++      DescribeFrameFormat(format.Get(), &subtype, &w, &h, &rate);
++      if (w <= 0 || h <= 0 || (w & 1) || (h & 1)) {
++        continue;
++      }
++      long dw = w - target.width();
++      long dh = h - target.height();
++      long score = (dw < 0 ? -dw : dw) + (dh < 0 ? -dh : dh);
++      if (w > target.width() || h > target.height()) {
++        score += 100000;  // a bigger frame costs frame rate on this hardware
++      }
++      if (rate + 0.5 < target_fps) {
++        score += 50000;
++      } else {
++        score += static_cast<long>((rate - target_fps) * 10);  // no faster than asked
++      }
++      candidates.emplace_back(score, format);
++    }
++  }
++  std::stable_sort(candidates.begin(), candidates.end(),
++                   [](const auto& a, const auto& b) { return a.first < b.first; });
++  for (size_t i = 0; i < candidates.size() && i < 3; ++i) {
++    ComPtr<wf::IAsyncAction> set;
++    HRESULT hr = source->SetFormatAsync(candidates[i].second.Get(), &set);
++    if (SUCCEEDED(hr)) {
++      hr = AwaitAction(set.Get(), stop);
++    }
++    std::string subtype;
++    int w = 0, h = 0;
++    double rate = 0.0;
++    DescribeFrameFormat(candidates[i].second.Get(), &subtype, &w, &h, &rate);
++    VLOG(1) << "VideoCaptureDeviceWinRT: SetFormatAsync(" << subtype << " " << w << "x" << h << " @" << rate
++            << ") = " << HexHr(hr);
++    if (SUCCEEDED(hr) || hr == E_ABORT) {
++      break;
++    }
++  }
++  ComPtr<wmcf::IMediaFrameFormat> current;
++  source->get_CurrentFormat(&current);
++  std::string subtype;
++  int w = 0, h = 0;
++  double rate = 0.0;
++  DescribeFrameFormat(current.Get(), &subtype, &w, &h, &rate);
++  *size = gfx::Size(w, h);
++  *fps = rate > 0.0 ? static_cast<float>(rate) : target_fps;
++  VLOG(1) << "VideoCaptureDeviceWinRT: frame source format " << subtype << " " << w << "x" << h << " @" << rate;
++}
++
++// Creates and starts a MediaFrameReader on |source| (|subtype| = output conversion, null = the source's own format).
++// FrameArrived signals |wake|. On success |reader| is running and |token| holds the handler registration.
++HRESULT StartFrameReader(wmc::IMediaCapture5* mc5,
++                         wmcf::IMediaFrameSource* source,
++                         const wchar_t* subtype,
++                         scoped_refptr<SharedEvent> wake,
++                         HANDLE stop,
++                         ComPtr<wmcf::IMediaFrameReader>* reader,
++                         EventRegistrationToken* token) {
++  ComPtr<wf::IAsyncOperation<wmcf::MediaFrameReader*>> create;
++  HRESULT hr = subtype ? mc5->CreateFrameReaderWithSubtypeAsync(source, HStringReference(subtype).Get(), &create)
++                       : mc5->CreateFrameReaderAsync(source, &create);
++  if (SUCCEEDED(hr)) {
++    hr = AwaitOp(create.Get(), stop);
++  }
++  ComPtr<wmcf::IMediaFrameReader> r;
++  if (SUCCEEDED(hr)) {
++    hr = create->GetResults(&r);
++  }
++  if (FAILED(hr) || !r) {
++    return FAILED(hr) ? hr : E_FAIL;
++  }
++  auto handler = Callback<wf::ITypedEventHandler<wmcf::MediaFrameReader*, wmcf::MediaFrameArrivedEventArgs*>>(
++      [wake](wmcf::IMediaFrameReader*, wmcf::IMediaFrameArrivedEventArgs*) -> HRESULT {
++        wake->Signal();
++        return S_OK;
++      });
++  EventRegistrationToken t = {};
++  hr = r->add_FrameArrived(handler.Get(), &t);
++  if (FAILED(hr)) {
++    CloseIfClosable(r.Get());
++    return hr;
++  }
++  ComPtr<wf::IAsyncOperation<wmcf::MediaFrameReaderStartStatus>> start;
++  hr = r->StartAsync(&start);
++  if (SUCCEEDED(hr)) {
++    hr = AwaitOp(start.Get(), stop);
++  }
++  wmcf::MediaFrameReaderStartStatus status = wmcf::MediaFrameReaderStartStatus_UnknownFailure;
++  if (SUCCEEDED(hr)) {
++    start->GetResults(&status);
++  }
++  if (FAILED(hr) || status != wmcf::MediaFrameReaderStartStatus_Success) {
++    VLOG(1) << "VideoCaptureDeviceWinRT: MediaFrameReader.StartAsync = " << HexHr(hr) << " status "
++            << static_cast<int>(status);
++    r->remove_FrameArrived(t);
++    ComPtr<wf::IAsyncAction> stop_reader;
++    if (SUCCEEDED(r->StopAsync(&stop_reader)) && stop_reader) {
++      AwaitAction(stop_reader.Get(), nullptr, 3000);
++    }
++    CloseIfClosable(r.Get());
++    return FAILED(hr) ? hr : E_FAIL;
++  }
++  *reader = r;
++  *token = t;
++  return S_OK;
++}
++
++// Teardown: bounded, and deliberately not interrupted by the stop event (the camera must be released).
++void StopFrameReader(wmcf::IMediaFrameReader* reader, EventRegistrationToken token) {
++  reader->remove_FrameArrived(token);
++  ComPtr<wf::IAsyncAction> stop;
++  if (SUCCEEDED(reader->StopAsync(&stop)) && stop) {
++    AwaitAction(stop.Get(), nullptr, 3000);
++  }
++  CloseIfClosable(reader);
++}
++
++// The CPU bitmap for |frame|: its own SoftwareBitmap, or a copy of its Direct3D surface (this camera hands the reader
++// GPU surfaces; forcing CPU memory with MemoryPreference=Cpu breaks the camera instead). |*copied| = the bitmap is
++// our own copy and must be Close()d.
++HRESULT GetFrameBitmap(wmcf::IMediaFrameReference* frame,
++                       wgi::ISoftwareBitmapStatics* statics,
++                       HANDLE stop,
++                       ComPtr<wgi::ISoftwareBitmap>* bitmap,
++                       bool* copied) {
++  *copied = false;
++  ComPtr<wmcf::IVideoMediaFrame> video;
++  if (FAILED(frame->get_VideoMediaFrame(&video)) || !video) {
++    return E_UNEXPECTED;
++  }
++  ComPtr<wgi::ISoftwareBitmap> sb;
++  if (SUCCEEDED(video->get_SoftwareBitmap(&sb)) && sb) {
++    *bitmap = sb;
++    return S_OK;
++  }
++  ComPtr<wgd::IDirect3DSurface> surface;
++  if (FAILED(video->get_Direct3DSurface(&surface)) || !surface || !statics) {
++    return E_UNEXPECTED;
++  }
++  ComPtr<wf::IAsyncOperation<wgi::SoftwareBitmap*>> copy;
++  HRESULT hr = statics->CreateCopyFromSurfaceAsync(surface.Get(), &copy);
++  if (SUCCEEDED(hr)) {
++    hr = AwaitOp(copy.Get(), stop, 2000);
++  }
++  if (SUCCEEDED(hr)) {
++    hr = copy->GetResults(&sb);
++  }
++  if (FAILED(hr) || !sb) {
++    return FAILED(hr) ? hr : E_FAIL;
++  }
++  *bitmap = sb;
++  *copied = true;
++  return S_OK;
++}
++
++// A SoftwareBitmap's pixels, locked, in the tightly packed layout VideoCaptureDeviceClient::OnIncomingCapturedData /
++// libyuv expect (row stride == row bytes, NV12's UV plane straight after Y). When the bitmap is already laid out that
++// way (the Tegra case) data() points straight into the locked buffer; otherwise the planes are repacked into the
++// caller's scratch vector. Nv12 -> NV12, Yuy2 -> YUY2, Bgra8 -> ARGB (libyuv's ARGB is B,G,R,A in memory). The data
++// stays valid until Unlock() / destruction.
++class LockedFrame {
++ public:
++  LockedFrame() = default;
++  LockedFrame(const LockedFrame&) = delete;
++  LockedFrame& operator=(const LockedFrame&) = delete;
++  ~LockedFrame() { Unlock(); }
++
++  HRESULT Lock(wgi::ISoftwareBitmap* bitmap, std::vector<uint8_t>* scratch, bool describe);
++  void Unlock() {
++    CloseIfClosable(reference_.Get());
++    CloseIfClosable(buffer_.Get());
++    reference_.Reset();
++    buffer_.Reset();
++    data_ = nullptr;
++    size_ = 0;
++  }
++
++  const uint8_t* data() const { return data_; }
++  size_t size() const { return size_; }
++  VideoPixelFormat pixel_format() const { return pixel_format_; }
++  const gfx::Size& frame_size() const { return frame_size_; }
++  const std::string& layout() const { return layout_; }
++
++ private:
++  ComPtr<wgi::IBitmapBuffer> buffer_;
++  ComPtr<wf::IMemoryBufferReference> reference_;
++  const uint8_t* data_ = nullptr;
++  size_t size_ = 0;
++  VideoPixelFormat pixel_format_ = PIXEL_FORMAT_UNKNOWN;
++  gfx::Size frame_size_;
++  std::string layout_;
++};
++
++HRESULT LockedFrame::Lock(wgi::ISoftwareBitmap* bitmap, std::vector<uint8_t>* scratch, bool describe) {
++  Unlock();
++  wgi::BitmapPixelFormat format = wgi::BitmapPixelFormat_Unknown;
++  INT32 w = 0, h = 0;
++  bitmap->get_BitmapPixelFormat(&format);
++  bitmap->get_PixelWidth(&w);
++  bitmap->get_PixelHeight(&h);
++  if (w <= 0 || h <= 0 || (w & 1) || (h & 1)) {
++    return E_INVALIDARG;  // Chromium CHECKs even dimensions for NV12/YUY2
++  }
++  struct PlaneShape {
++    int row_bytes;
++    int rows;
++  } planes[2] = {};
++  int plane_count = 0;
++  switch (format) {
++    case wgi::BitmapPixelFormat_Nv12:
++      pixel_format_ = PIXEL_FORMAT_NV12;
++      planes[0] = {w, h};
++      planes[1] = {w, h / 2};
++      plane_count = 2;
++      break;
++    case wgi::BitmapPixelFormat_Yuy2:
++      pixel_format_ = PIXEL_FORMAT_YUY2;
++      planes[0] = {w * 2, h};
++      plane_count = 1;
++      break;
++    case wgi::BitmapPixelFormat_Bgra8:
++      pixel_format_ = PIXEL_FORMAT_ARGB;
++      planes[0] = {w * 4, h};
++      plane_count = 1;
++      break;
++    default:
++      return E_NOTIMPL;
++  }
++  HRESULT hr = bitmap->LockBuffer(wgi::BitmapBufferAccessMode_Read, &buffer_);
++  if (FAILED(hr) || !buffer_) {
++    return FAILED(hr) ? hr : E_FAIL;
++  }
++  INT32 have_planes = 0;
++  buffer_->GetPlaneCount(&have_planes);
++  if (have_planes < plane_count) {
++    Unlock();
++    return E_UNEXPECTED;
++  }
++  wgi::BitmapPlaneDescription desc[2] = {};
++  for (int i = 0; i < plane_count; ++i) {
++    buffer_->GetPlaneDescription(i, &desc[i]);
++  }
++  ComPtr<wf::IMemoryBuffer> memory;
++  ComPtr<::Windows::Foundation::IMemoryBufferByteAccess> access;
++  BYTE* bytes = nullptr;
++  UINT32 capacity = 0;
++  hr = buffer_.As(&memory);
++  if (SUCCEEDED(hr)) {
++    hr = memory->CreateReference(&reference_);
++  }
++  if (SUCCEEDED(hr)) {
++    hr = reference_.As(&access);
++  }
++  if (SUCCEEDED(hr)) {
++    hr = access->GetBuffer(&bytes, &capacity);
++  }
++  if (SUCCEEDED(hr) && (!bytes || !capacity)) {
++    hr = E_FAIL;
++  }
++  size_t total = 0;
++  bool packed = true;
++  int64_t expected_start = desc[0].StartIndex;
++  for (int i = 0; SUCCEEDED(hr) && i < plane_count; ++i) {
++    const int64_t start = desc[i].StartIndex;
++    const int64_t stride = desc[i].Stride;
++    const int64_t last_row_end = start + stride * (planes[i].rows - 1) + planes[i].row_bytes;
++    if (start < 0 || stride < planes[i].row_bytes || last_row_end > static_cast<int64_t>(capacity)) {
++      hr = E_BOUNDS;
++      break;
++    }
++    if (stride != planes[i].row_bytes || start != expected_start) {
++      packed = false;
++    }
++    const size_t plane_bytes = static_cast<size_t>(planes[i].row_bytes) * planes[i].rows;
++    expected_start = start + static_cast<int64_t>(plane_bytes);
++    total += plane_bytes;
++  }
++  if (FAILED(hr)) {
++    Unlock();
++    return hr;
++  }
++  if (packed) {
++    data_ = bytes + desc[0].StartIndex;
++  } else {
++    scratch->resize(total);
++    uint8_t* dst = scratch->data();
++    for (int i = 0; i < plane_count; ++i) {
++      const uint8_t* src = bytes + desc[i].StartIndex;
++      for (int row = 0; row < planes[i].rows; ++row) {
++        memcpy(dst, src + static_cast<size_t>(row) * desc[i].Stride, planes[i].row_bytes);
++        dst += planes[i].row_bytes;
++      }
++    }
++    data_ = scratch->data();
++  }
++  size_ = total;
++  frame_size_ = gfx::Size(w, h);
++  if (describe) {
++    layout_ = base::StringPrintf("%s %dx%d, %d plane(s), plane0 start %d stride %d",
++                                 VideoPixelFormatToString(pixel_format_).c_str(), w, h, plane_count,
++                                 desc[0].StartIndex, desc[0].Stride);
++    if (plane_count > 1) {
++      layout_ += base::StringPrintf(", plane1 start %d stride %d", desc[1].StartIndex, desc[1].Stride);
++    }
++    layout_ += packed ? ", delivered in place" : ", repacked";
++  }
++  return S_OK;
++}
++
++// Pumps one running reader until stop, a fatal error (reported here, before the slow teardown) or "nothing usable".
++ReaderOutcome PumpFrames(wmcf::IMediaFrameReader* reader,
++                         float fps,
++                         SharedEvent* wake,
++                         HANDLE stop_event,
++                         wgi::ISoftwareBitmapStatics* bitmap_statics,
++                         VideoCaptureDevice::Client* client,
++                         const std::atomic<bool>& stop,
++                         bool* started,
++                         FrameClock* clock) {
++  const base::TimeTicks start = base::TimeTicks::Now();
++  base::TimeTicks last_delivery = start;
++  base::TimeTicks stats_begin = start;
++  int stats_frames = 0;
++  base::TimeDelta stats_copy;
++  int64_t last_ts = -1;
++  int64_t delivered = 0;
++  int consecutive_failures = 0;
++  HRESULT last_failure = S_OK;
++  std::vector<uint8_t> scratch;
++  LockedFrame locked;
++  HANDLE handles[2] = {wake->handle(), stop_event};
++
++  for (;;) {
++    ::WaitForMultipleObjects(stop_event ? 2 : 1, handles, FALSE, 100);
++    if (stop.load()) {
++      return ReaderOutcome::kStopped;
++    }
++    if (const uint32_t code = wake->failure_code.load()) {
++      // A MediaCapture that raised Failed is dead; nothing else can use it.
++      ReportError(client, "MediaCapture.Failed " + HexHr(static_cast<HRESULT>(code)));
++      return ReaderOutcome::kReported;
++    }
++    const base::TimeTicks now = base::TimeTicks::Now();
++    // Checked on every pass, not just when no frame arrives: frames that keep arriving but can't be converted are a
++    // stall too. 4 s for the first frame is >3x the worst first-frame latency measured on the device.
++    if (now - last_delivery > base::Seconds(delivered ? 5 : 4)) {
++      const std::string why = consecutive_failures
++                                  ? "frames arrive but can't be read (" + HexHr(last_failure) + ")"
++                                  : std::string("the camera delivered no frames");
++      if (!delivered) {
++        VLOG(1) << "VideoCaptureDeviceWinRT: " << why;
++        return ReaderOutcome::kNoFrames;
++      }
++      ReportError(client, "stream stalled: " + why);
++      return ReaderOutcome::kReported;
++    }
++    ComPtr<wmcf::IMediaFrameReference> frame;
++    if (FAILED(reader->TryAcquireLatestFrame(&frame)) || !frame) {
++      continue;
++    }
++    const base::TimeTicks acquired = base::TimeTicks::Now();
++    int64_t ts = 0;
++    ComPtr<wf::IReference<wf::TimeSpan>> ts_ref;
++    if (SUCCEEDED(frame->get_SystemRelativeTime(&ts_ref)) && ts_ref) {
++      wf::TimeSpan span = {};
++      if (SUCCEEDED(ts_ref->get_Value(&span))) {
++        ts = span.Duration;
++      }
++    }
++    if (ts != 0 && ts == last_ts) {
++      CloseIfClosable(frame.Get());  // the same frame again
++      continue;
++    }
++    last_ts = ts;
++
++    ComPtr<wgi::ISoftwareBitmap> bitmap;
++    bool copied = false;
++    HRESULT hr = GetFrameBitmap(frame.Get(), bitmap_statics, stop_event, &bitmap, &copied);
++    if (SUCCEEDED(hr)) {
++      hr = locked.Lock(bitmap.Get(), &scratch, /*describe=*/delivered == 0);
++    }
++    if (FAILED(hr)) {
++      locked.Unlock();
++      if (copied) {
++        CloseIfClosable(bitmap.Get());
++      }
++      CloseIfClosable(frame.Get());
++      if (hr == E_ABORT && stop.load()) {
++        return ReaderOutcome::kStopped;
++      }
++      last_failure = hr;
++      if (++consecutive_failures == 1 || consecutive_failures % 100 == 0) {
++        LOG(WARNING) << "VideoCaptureDeviceWinRT: frame conversion failed hr=" << HexHr(hr) << " ("
++                     << consecutive_failures << " in a row)";
++      }
++      if (*started && client) {
++        client->OnFrameDropped(VideoCaptureFrameDropReason::kWinMediaFoundationLockingBufferDelieveredNullptr);
++      }
++      continue;
++    }
++    consecutive_failures = 0;
++    if (!*started && client) {
++      client->OnStarted();  // like VideoCaptureDeviceMFWin: only once a real frame exists
++      *started = true;
++    }
++    if (delivered == 0) {
++      VLOG(1) << "VideoCaptureDeviceWinRT: first frame " << locked.layout()
++              << (copied ? " (copied from a Direct3D surface)" : "") << ", "
++              << (acquired - start).InMilliseconds() << " ms after start";
++    }
++    if (client) {
++      client->OnIncomingCapturedData(
++          locked.data(), static_cast<int>(locked.size()),
++          VideoCaptureFormat(locked.frame_size(), fps, locked.pixel_format()), gfx::ColorSpace(),
++          /*clockwise_rotation=*/0, /*flip_y=*/false, /*reference_time=*/acquired, clock->Next(ts, acquired),
++          /*capture_begin_timestamp=*/std::nullopt, /*metadata=*/std::nullopt,
++          /*frame_feedback_id=*/0);
++    }
++    const VideoPixelFormat pixel_format = locked.pixel_format();
++    const gfx::Size frame_size = locked.frame_size();
++    locked.Unlock();
++    if (copied) {
++      CloseIfClosable(bitmap.Get());
++    }
++    CloseIfClosable(frame.Get());
++
++    last_delivery = base::TimeTicks::Now();
++    stats_copy += last_delivery - acquired;
++    ++delivered;
++    ++stats_frames;
++    const base::TimeDelta window = last_delivery - stats_begin;
++    if (window >= base::Seconds(5)) {
++      VLOG(1) << "VideoCaptureDeviceWinRT: " << stats_frames << " frames in " << window.InMilliseconds()
++              << " ms = " << base::StringPrintf("%.1f", stats_frames * 1000.0 / window.InMillisecondsF())
++              << " fps, copy+deliver avg "
++              << base::StringPrintf("%.1f", stats_copy.InMillisecondsF() / stats_frames) << " ms, "
++              << VideoPixelFormatToString(pixel_format) << " " << frame_size.ToString();
++      stats_begin = last_delivery;
++      stats_frames = 0;
++      stats_copy = base::TimeDelta();
++    }
++  }
++}
++
++ReaderOutcome RunFrameReader(wmc::IMediaCapture* mc,
++                             const gfx::Size& target,
++                             float target_fps,
++                             scoped_refptr<SharedEvent> wake,
++                             HANDLE stop_event,
++                             VideoCaptureDevice::Client* client,
++                             const std::atomic<bool>& stop,
++                             bool* started) {
++  ComPtr<wmc::IMediaCapture5> mc5;
++  if (FAILED(mc->QueryInterface(IID_PPV_ARGS(&mc5))) || !mc5) {
++    VLOG(1) << "VideoCaptureDeviceWinRT: IMediaCapture5 (frame sources) unavailable";
++    return ReaderOutcome::kNoFrames;
++  }
++  ComPtr<wmcf::IMediaFrameSource> source = FindFrameSource(mc, wmc::MediaStreamType_VideoPreview);
++  if (!source) {
++    VLOG(1) << "VideoCaptureDeviceWinRT: no Color VideoPreview frame source";
++    return ReaderOutcome::kNoFrames;
++  }
++  gfx::Size source_size;
++  float fps = target_fps;
++  SelectSourceFormat(source.Get(), target, target_fps, stop_event, &source_size, &fps);
++
++  ComPtr<wgi::ISoftwareBitmapStatics> bitmap_statics;
++  ::RoGetActivationFactory(HStringReference(RuntimeClass_Windows_Graphics_Imaging_SoftwareBitmap).Get(),
++                           IID_PPV_ARGS(&bitmap_statics));
++
++  FrameClock clock;
++  // NV12 conversion first (cheaper copy, cheaper libyuv), then the source's own format. A reader that starts but
++  // yields nothing usable is torn down and the next one tried before giving up on the frame reader.
++  const wchar_t* const kSubtypes[] = {L"NV12", nullptr};
++  for (const wchar_t* subtype : kSubtypes) {
++    if (stop.load()) {
++      return ReaderOutcome::kStopped;
++    }
++    ComPtr<wmcf::IMediaFrameReader> reader;
++    EventRegistrationToken token = {};
++    HRESULT hr = StartFrameReader(mc5.Get(), source.Get(), subtype, wake, stop_event, &reader, &token);
++    VLOG(1) << "VideoCaptureDeviceWinRT: MediaFrameReader(" << (subtype ? "NV12" : "native") << ") = "
++            << HexHr(hr);
++    if (FAILED(hr) || !reader) {
++      continue;
++    }
++    VLOG(1) << "VideoCaptureDeviceWinRT: frame source = MediaFrameReader (VideoPreview stream)";
++    ReaderOutcome outcome = PumpFrames(reader.Get(), fps, wake.get(), stop_event, bitmap_statics.Get(), client,
++                                       stop, started, &clock);
++    StopFrameReader(reader.Get(), token);
++    VLOG(1) << "VideoCaptureDeviceWinRT: MediaFrameReader(" << (subtype ? "NV12" : "native") << ") stopped";
++    if (outcome != ReaderOutcome::kNoFrames) {
++      return outcome;  // stopped, or an error already reported (PumpFrames never hands back kNoFrames once started)
++    }
++  }
++  return ReaderOutcome::kNoFrames;
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// Fallback path: photo capture polled in a loop (proven, but ~2 fps on the Tegra camera). Used only if the frame
++// reader can't stream on a device.
++
++// Set the camera's PHOTO stream resolution close to |target_w|x|target_h| so CapturePhotoToStreamAsync captures a small
++// frame (the default is the camera's max photo size). Best effort.
++void SetPhotoResolution(wmc::IMediaCapture* mc, int target_w, int target_h, HANDLE stop) {
++  ComPtr<wmd::IVideoDeviceController> vdc;
++  if (FAILED(mc->get_VideoDeviceController(&vdc)) || !vdc) {
++    return;
++  }
++  ComPtr<wmd::IMediaDeviceController> mdc;
++  if (FAILED(vdc.As(&mdc)) || !mdc) {
++    return;
++  }
++  ComPtr<wfc::IVectorView<wmp::IMediaEncodingProperties*>> props;
++  if (FAILED(mdc->GetAvailableMediaStreamProperties(wmc::MediaStreamType_Photo, &props)) || !props) {
++    return;
++  }
++  UINT32 count = 0;
++  props->get_Size(&count);
++  ComPtr<wmp::IMediaEncodingProperties> best;
++  long best_score = 1L << 30;
++  int best_w = 0, best_h = 0;
++  for (UINT32 i = 0; i < count; ++i) {
++    ComPtr<wmp::IMediaEncodingProperties> p;
++    if (FAILED(props->GetAt(i, &p)) || !p) {
++      continue;
++    }
++    UINT32 w = 0, h = 0;
++    ComPtr<wmp::IImageEncodingProperties> ip;
++    if (SUCCEEDED(p.As(&ip)) && ip) {
++      ip->get_Width(&w);
++      ip->get_Height(&h);
++    } else {
++      ComPtr<wmp::IVideoEncodingProperties> vp;
++      if (SUCCEEDED(p.As(&vp)) && vp) {
++        vp->get_Width(&w);
++        vp->get_Height(&h);
++      }
++    }
++    if (w == 0 || h == 0) {
++      continue;
++    }
++    long dw = static_cast<long>(w) - target_w;
++    long dh = static_cast<long>(h) - target_h;
++    long score = (dw < 0 ? -dw : dw) + (dh < 0 ? -dh : dh);
++    // Prefer formats at or below the target (don't blow the frame rate by picking a bigger one when tied-ish).
++    if (static_cast<int>(w) > target_w || static_cast<int>(h) > target_h) {
++      score += 100000;
++    }
++    if (score < best_score) {
++      best_score = score;
++      best = p;
++      best_w = static_cast<int>(w);
++      best_h = static_cast<int>(h);
++    }
++  }
++  if (best) {
++    ComPtr<wf::IAsyncAction> set_action;
++    if (SUCCEEDED(mdc->SetMediaStreamPropertiesAsync(wmc::MediaStreamType_Photo, best.Get(), &set_action))) {
++      AwaitAction(set_action.Get(), stop);
++    }
++    VLOG(1) << "VideoCaptureDeviceWinRT: photo resolution set to " << best_w << "x" << best_h;
++  }
++}
++
++// Read all bytes of a WinRT IRandomAccessStream into |bytes| via a DataReader.
++HRESULT ReadStreamBytes(wss::IRandomAccessStream* ras, HANDLE stop, std::vector<uint8_t>* bytes) {
++  bytes->clear();
++  UINT64 size = 0;
++  ras->get_Size(&size);
++  if (size == 0) {
++    return E_FAIL;
++  }
++  ComPtr<wss::IInputStream> input;
++  HRESULT hr = ras->GetInputStreamAt(0, &input);
++  if (FAILED(hr)) {
++    return hr;
++  }
++  ComPtr<wss::IDataReaderFactory> reader_factory;
++  hr = ::RoGetActivationFactory(
++      HStringReference(RuntimeClass_Windows_Storage_Streams_DataReader).Get(),
++      IID_PPV_ARGS(&reader_factory));
++  if (FAILED(hr)) {
++    return hr;
++  }
++  ComPtr<wss::IDataReader> reader;
++  hr = reader_factory->CreateDataReader(input.Get(), &reader);
++  if (FAILED(hr)) {
++    return hr;
++  }
++  ComPtr<wf::IAsyncOperation<UINT32>> load;
++  hr = reader->LoadAsync(static_cast<UINT32>(size), &load);
++  if (SUCCEEDED(hr)) {
++    hr = AwaitOp(load.Get(), stop);
++  }
++  if (FAILED(hr)) {
++    return hr;
++  }
++  bytes->resize(static_cast<size_t>(size));
++  return reader->ReadBytes(static_cast<UINT32>(size), bytes->data());
++}
++
++// One CapturePhotoToStreamAsync(JPEG) into |bytes|. Slow: it re-arms the photo pipeline on every call.
++HRESULT CapturePhotoJpeg(wmc::IMediaCapture* mc,
++                         wmp::IImageEncodingProperties* jpeg,
++                         HANDLE stop,
++                         std::vector<uint8_t>* bytes) {
++  bytes->clear();
++  ComPtr<IInspectable> ras_insp;
++  HRESULT hr = ::RoActivateInstance(
++      HStringReference(RuntimeClass_Windows_Storage_Streams_InMemoryRandomAccessStream).Get(),
++      &ras_insp);
++  ComPtr<wss::IRandomAccessStream> ras;
++  if (SUCCEEDED(hr)) {
++    hr = ras_insp.As(&ras);
++  }
++  if (FAILED(hr)) {
++    return hr;
++  }
++  ComPtr<wf::IAsyncAction> cap;
++  hr = mc->CapturePhotoToStreamAsync(jpeg, ras.Get(), &cap);
++  if (SUCCEEDED(hr)) {
++    hr = AwaitAction(cap.Get(), stop);
++  }
++  if (FAILED(hr)) {
++    return hr;
++  }
++  return ReadStreamBytes(ras.Get(), stop, bytes);
++}
++
++// One LowLagPhotoCapture frame into |bytes|. PrepareLowLagPhotoCaptureAsync armed the pipeline once, and the frame
++// dimensions come back directly (no JPEG header parse needed).
++HRESULT LowLagCaptureJpeg(wmc::ILowLagPhotoCapture* llpc,
++                          HANDLE stop,
++                          std::vector<uint8_t>* bytes,
++                          int* width,
++                          int* height) {
++  bytes->clear();
++  *width = 0;
++  *height = 0;
++  ComPtr<wf::IAsyncOperation<wmc::CapturedPhoto*>> op;
++  HRESULT hr = llpc->CaptureAsync(&op);
++  if (SUCCEEDED(hr)) {
++    hr = AwaitOp(op.Get(), stop);
++  }
++  if (FAILED(hr)) {
++    return hr;
++  }
++  ComPtr<wmc::ICapturedPhoto> photo;
++  if (FAILED(op->GetResults(&photo)) || !photo) {
++    return E_FAIL;
++  }
++  ComPtr<wmc::ICapturedFrame> frame;
++  if (FAILED(photo->get_Frame(&frame)) || !frame) {
++    return E_FAIL;
++  }
++  UINT32 fw = 0, fh = 0;
++  frame->get_Width(&fw);
++  frame->get_Height(&fh);
++  *width = static_cast<int>(fw);
++  *height = static_cast<int>(fh);
++  ComPtr<wss::IRandomAccessStream> ras;
++  if (FAILED(frame.As(&ras)) || !ras) {
++    return E_FAIL;
++  }
++  return ReadStreamBytes(ras.Get(), stop, bytes);
++}
++
++// Parse a baseline/progressive JPEG's frame dimensions from its SOFn marker. Returns false if not found.
++bool ParseJpegSize(const std::vector<uint8_t>& j, int* width, int* height) {
++  size_t i = 2;  // skip SOI (FF D8)
++  const size_t n = j.size();
++  while (i + 9 < n) {
++    if (j[i] != 0xFF) {
++      ++i;
++      continue;
++    }
++    uint8_t marker = j[i + 1];
++    // Standalone markers (no length).
++    if (marker == 0xFF || (marker >= 0xD0 && marker <= 0xD9) || marker == 0x01) {
++      i += 2;
++      continue;
++    }
++    size_t seg_len = (static_cast<size_t>(j[i + 2]) << 8) | j[i + 3];
++    // SOF0..SOF15 carry the frame size, excluding DHT(C4) DAC(CC) and the RSTs.
++    if (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC) {
++      *height = (static_cast<int>(j[i + 5]) << 8) | j[i + 6];
++      *width = (static_cast<int>(j[i + 7]) << 8) | j[i + 8];
++      return *width > 0 && *height > 0;
++    }
++    i += 2 + seg_len;
++  }
++  return false;
++}
++
++// Polls photo frames until stop or failure and delivers them as MJPEG (decoded downstream). Reports its own fatal
++// errors. OnStarted is sent with the first photo.
++void RunPhotoLoop(wmc::IMediaCapture* mc,
++                  const gfx::Size& target,
++                  float frame_rate,
++                  SharedEvent* wake,
++                  HANDLE stop_event,
++                  VideoCaptureDevice::Client* client,
++                  const std::atomic<bool>& stop,
++                  bool* started) {
++  SetPhotoResolution(mc, target.width(), target.height(), stop_event);
++
++  ComPtr<wmp::IImageEncodingPropertiesStatics> iep_statics;
++  HRESULT hr = ::RoGetActivationFactory(
++      HStringReference(RuntimeClass_Windows_Media_MediaProperties_ImageEncodingProperties).Get(),
++      IID_PPV_ARGS(&iep_statics));
++  ComPtr<wmp::IImageEncodingProperties> jpeg;
++  if (SUCCEEDED(hr)) {
++    hr = iep_statics->CreateJpeg(&jpeg);
++  }
++  if (FAILED(hr) || !jpeg) {
++    ReportError(client, "ImageEncodingProperties.CreateJpeg failed " + HexHr(hr));
++    return;
++  }
++
++  // LowLagPhotoCapture (IMediaCapture2) arms the photo pipeline once; fall back to CapturePhotoToStream otherwise.
++  ComPtr<wmc::IMediaCapture2> mc2;
++  ComPtr<wmc::ILowLagPhotoCapture> llpc;
++  if (SUCCEEDED(mc->QueryInterface(IID_PPV_ARGS(&mc2))) && mc2) {
++    ComPtr<wf::IAsyncOperation<wmc::LowLagPhotoCapture*>> prep;
++    if (SUCCEEDED(mc2->PrepareLowLagPhotoCaptureAsync(jpeg.Get(), &prep)) &&
++        SUCCEEDED(AwaitOp(prep.Get(), stop_event))) {
++      prep->GetResults(&llpc);
++    }
++  }
++  VLOG(1) << "VideoCaptureDeviceWinRT: frame source = "
++          << (llpc ? "LowLagPhotoCapture (fallback)" : "CapturePhotoToStream (slow fallback)");
++
++  FrameClock clock;
++  int consecutive_failures = 0;
++  std::vector<uint8_t> jpeg_bytes;
++  while (!stop.load()) {
++    if (const uint32_t code = wake->failure_code.load()) {
++      ReportError(client, "MediaCapture.Failed " + HexHr(static_cast<HRESULT>(code)));
++      break;
++    }
++    int w = 0, h = 0;
++    HRESULT cap = llpc ? LowLagCaptureJpeg(llpc.Get(), stop_event, &jpeg_bytes, &w, &h)
++                       : CapturePhotoJpeg(mc, jpeg.Get(), stop_event, &jpeg_bytes);
++    if (stop.load()) {
++      break;
++    }
++    if (FAILED(cap) || jpeg_bytes.empty()) {
++      if (++consecutive_failures == 1) {
++        LOG(WARNING) << "VideoCaptureDeviceWinRT: photo capture failed hr=" << HexHr(cap);
++      }
++      if (consecutive_failures >= 15) {
++        ReportError(client, "camera stopped delivering photos " + HexHr(cap));
++        break;
++      }
++      ::WaitForSingleObject(stop_event, 100);
++      continue;
++    }
++    consecutive_failures = 0;
++    if ((w == 0 || h == 0) && !ParseJpegSize(jpeg_bytes, &w, &h)) {
++      continue;  // can't describe the frame
++    }
++    const base::TimeTicks now = base::TimeTicks::Now();
++    if (!*started && client) {
++      client->OnStarted();
++      *started = true;
++    }
++    if (client) {
++      client->OnIncomingCapturedData(
++          jpeg_bytes.data(), static_cast<int>(jpeg_bytes.size()),
++          VideoCaptureFormat(gfx::Size(w, h), frame_rate, PIXEL_FORMAT_MJPEG),
++          gfx::ColorSpace(), /*clockwise_rotation=*/0, /*flip_y=*/false,
++          /*reference_time=*/now, clock.Next(0, now),
++          /*capture_begin_timestamp=*/std::nullopt, /*metadata=*/std::nullopt,
++          /*frame_feedback_id=*/0);
++    }
++  }
++  if (llpc) {
++    ComPtr<wf::IAsyncAction> finish;
++    if (SUCCEEDED(llpc->FinishAsync(&finish)) && finish) {
++      AwaitAction(finish.Get(), nullptr, 3000);
++    }
++  }
++}
++
++}  // namespace
++
++VideoCaptureDeviceWinRT::VideoCaptureDeviceWinRT(
++    const VideoCaptureDeviceDescriptor& descriptor)
++    : descriptor_(descriptor), capture_thread_("VenetiumWinRtCamera") {}
++
++VideoCaptureDeviceWinRT::~VideoCaptureDeviceWinRT() {
++  StopAndDeAllocate();
++}
++
++void VideoCaptureDeviceWinRT::AllocateAndStart(const VideoCaptureParams& params,
++                                               std::unique_ptr<Client> client) {
++  params_ = params;
++  client_ = std::move(client);
++  stop_.store(false);
++  stop_event_.Reset();
++  if (!capture_thread_.Start()) {
++    if (client_) {
++      client_->OnError(VideoCaptureError::kWinMediaFoundationDeviceInitializationFailed,
++                       FROM_HERE, "WinRT camera: capture thread failed to start");
++    }
++    return;
++  }
++  capture_thread_.task_runner()->PostTask(
++      FROM_HERE, base::BindOnce(&VideoCaptureDeviceWinRT::CaptureLoopOnThread,
++                                base::Unretained(this)));
++}
++
++void VideoCaptureDeviceWinRT::StopAndDeAllocate() {
++  stop_.store(true);
++  stop_event_.Signal();  // interrupts any blocking WinRT wait on the capture thread
++  if (capture_thread_.IsRunning()) {
++    capture_thread_.Stop();  // joins; the loop returns once |stop_| is observed
++  }
++  client_.reset();
++}
++
++void VideoCaptureDeviceWinRT::CaptureLoopOnThread() {
++  if (stop_.load()) {
++    return;
++  }
++  // WinRT async callbacks are delivered on the thread pool (MTA), so this thread only needs to be MTA to make the
++  // activation + async calls; it then blocks on each call.
++  HRESULT ro = ::RoInitialize(RO_INIT_MULTITHREADED);
++  if (FAILED(ro) && ro != S_FALSE) {
++    ReportError(client_.get(), "RoInitialize failed " + HexHr(ro));
++    return;
++  }
++  const HANDLE stop_event = stop_event_.handle();
++
++  {
++    HString cam_id = PickCameraId(descriptor_.device_id, stop_event);
++    if (stop_.load()) {
++      ::RoUninitialize();
++      return;
++    }
++    if (::WindowsGetStringLen(cam_id.Get()) == 0) {
++      ReportError(client_.get(), "no WinRT camera found");
++      ::RoUninitialize();
++      return;
++    }
++
++    // Video-only first (a camera-only capture shouldn't open the microphone; the frame reader streams fine in this
++    // mode on the Tegra), then TelegArm's AudioAndVideo recipe.
++    ComPtr<wmc::IMediaCapture> mc;
++    HRESULT hr = InitCapture(cam_id.Get(), wmc::StreamingCaptureMode_Video, stop_event, &mc);
++    if ((FAILED(hr) || !mc) && !stop_.load()) {
++      VLOG(1) << "VideoCaptureDeviceWinRT: Video-only init failed (" << HexHr(hr) << "), trying AudioAndVideo";
++      hr = InitCapture(cam_id.Get(), wmc::StreamingCaptureMode_AudioAndVideo, stop_event, &mc);
++    }
++    if (stop_.load()) {
++      CloseIfClosable(mc.Get());
++      mc.Reset();
++      ::RoUninitialize();
++      return;
++    }
++    if (FAILED(hr) || !mc) {
++      ReportError(client_.get(), "MediaCapture.InitializeWithSettingsAsync failed " + HexHr(hr));
++      ::RoUninitialize();
++      return;
++    }
++
++    // Deliver what the consumer asked for (default 640x480@30), capped at 1280x720: on this hardware each frame is
++    // copied from a GPU surface and converted by the CPU, and 720p keeps that comfortably within the frame budget.
++    int target_w = params_.requested_format.frame_size.width();
++    int target_h = params_.requested_format.frame_size.height();
++    if (target_w <= 0 || target_h <= 0) {
++      target_w = 640;
++      target_h = 480;
++    }
++    if (target_w > 1280 || target_h > 720) {
++      target_w = 1280;
++      target_h = 720;
++    }
++    const gfx::Size target(target_w, target_h);
++    const float target_fps =
++        params_.requested_format.frame_rate > 0 ? params_.requested_format.frame_rate : 30.0f;
++
++    auto wake = base::MakeRefCounted<SharedEvent>(/*manual_reset=*/false);
++    WatchCaptureFailures(mc.Get(), wake);
++
++    bool started = false;
++    ReaderOutcome outcome =
++        RunFrameReader(mc.Get(), target, target_fps, wake, stop_event, client_.get(), stop_, &started);
++    if (outcome == ReaderOutcome::kNoFrames && !stop_.load()) {
++      if (wake->failure_code.load()) {
++        ReportError(client_.get(),
++                    "MediaCapture.Failed " + HexHr(static_cast<HRESULT>(wake->failure_code.load())));
++      } else {
++        LOG(WARNING) << "VideoCaptureDeviceWinRT: frame reader delivered nothing; falling back to photo capture";
++        RunPhotoLoop(mc.Get(), target, target_fps, wake.get(), stop_event, client_.get(), stop_, &started);
++      }
++    }
++
++    // Release the camera.
++    CloseIfClosable(mc.Get());
++    mc.Reset();
++  }
++  ::RoUninitialize();
++  VLOG(1) << "VideoCaptureDeviceWinRT: capture loop exited";
++}
++
++}  // namespace media
+diff --git a/media/capture/video/win/video_capture_device_winrt.h b/media/capture/video/win/video_capture_device_winrt.h
+new file mode 100644
+index 0000000..d92e99c
+--- /dev/null
++++ b/media/capture/video/win/video_capture_device_winrt.h
+@@ -0,0 +1,67 @@
++// Copyright 2024 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++//
++// Venetium: a WinRT MediaCapture-based VideoCaptureDevice for Windows ARM32 (Surface RT / Surface 2 Tegra, Lumia).
++// On this hardware the desktop Media Foundation capture path (VideoCaptureDeviceMFWin) enumerates and opens the
++// NVIDIA Unified AvStream camera but cannot START STREAMING it (ReadSample / the hardware MFT fails with
++// MF_E_HW_MFT_FAILED_START_STREAMING, 0xC00D3704). WinRT Windows.Media.Capture.MediaCapture can, provided it is
++// initialized without MemoryPreference=Cpu (which breaks this camera). This device streams the camera's VideoPreview
++// source through a MediaFrameReader on a dedicated MTA thread - 30 fps on the Surface Tegra (device probe) - copying
++// each frame (a Direct3D surface here) to the CPU and handing it to the pipeline as NV12 / YUY2. If the reader can't
++// stream on a device it falls back to polling photo capture (CapturePhotoToStreamAsync, delivered as MJPEG), which
++// works everywhere but only at the photo cadence (~2 fps on the Tegra).
++
++#ifndef MEDIA_CAPTURE_VIDEO_WIN_VIDEO_CAPTURE_DEVICE_WINRT_H_
++#define MEDIA_CAPTURE_VIDEO_WIN_VIDEO_CAPTURE_DEVICE_WINRT_H_
++
++#include <atomic>
++#include <memory>
++
++#include "base/synchronization/waitable_event.h"
++#include "base/threading/thread.h"
++#include "media/capture/capture_export.h"
++#include "media/capture/video/video_capture_device.h"
++#include "media/capture/video/video_capture_device_descriptor.h"
++
++namespace media {
++
++class CAPTURE_EXPORT VideoCaptureDeviceWinRT : public VideoCaptureDevice {
++ public:
++  explicit VideoCaptureDeviceWinRT(const VideoCaptureDeviceDescriptor& descriptor);
++
++  VideoCaptureDeviceWinRT(const VideoCaptureDeviceWinRT&) = delete;
++  VideoCaptureDeviceWinRT& operator=(const VideoCaptureDeviceWinRT&) = delete;
++
++  ~VideoCaptureDeviceWinRT() override;
++
++  // VideoCaptureDevice:
++  void AllocateAndStart(const VideoCaptureParams& params,
++                        std::unique_ptr<Client> client) override;
++  void StopAndDeAllocate() override;
++
++ private:
++  // Runs on |capture_thread_|: initializes WinRT MediaCapture and streams frames (frame reader, else photo polling)
++  // until |stop_| is set.
++  void CaptureLoopOnThread();
++
++  const VideoCaptureDeviceDescriptor descriptor_;
++  VideoCaptureParams params_;
++
++  // The capture loop runs here (its own MTA thread; WinRT async is driven by blocking waits).
++  base::Thread capture_thread_;
++
++  // Owned by the device; only touched on |capture_thread_| once the loop starts.
++  std::unique_ptr<Client> client_;
++
++  std::atomic<bool> stop_{false};
++
++  // Signalled together with |stop_|: wakes the capture loop and interrupts any blocking WinRT wait at once, so
++  // StopAndDeAllocate() never waits out a slow or hung camera call.
++  base::WaitableEvent stop_event_{base::WaitableEvent::ResetPolicy::MANUAL,
++                                  base::WaitableEvent::InitialState::NOT_SIGNALED};
++};
++
++}  // namespace media
++
++#endif  // MEDIA_CAPTURE_VIDEO_WIN_VIDEO_CAPTURE_DEVICE_WINRT_H_

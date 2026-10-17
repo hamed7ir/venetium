@@ -1,0 +1,226 @@
+Venetium 0060 - no automatic stack-variable initialization in the DSP-only codec targets.
+From the performance research (C:\handoff\PERF-RESEARCH.md, item S2), his "fix all".
+Chromium initializes every stack variable (pattern in non-official builds, zero in official ones). DSP kernels keep
+fixed-size scratch arrays they overwrite in full, so the fill is a pure memset per block: jsimd_idct_islow_neon (the
+JPEG IDCT Blink uses) called memset(0xFF, 64) twice per 8x8 block before its first load; dav1d's cdef and loop
+restoration likewise per block. libaom ("13% slowdown") and V8 already opt out the same way. Applied with
+configs -= [ "//build/config/compiler:default_init_stack_vars" ] to the DSP-only targets: libjpeg_turbo "simd";
+dav1d "dav1d_8bit", "dav1d_10bit", "dav1d_arm", "dav1d_x86"; libvpx's intrinsics source sets (NEON, MMX..AVX-512);
+libwebp "libwebp_dsp" and its NEON/SSE2/SSE4.1/AVX2 variants. Bitstream parsers (libjpeg core, dav1d's decoder,
+ffmpeg, which keeps its parsers in the same target) keep the initialization. Small hardening trade in sandboxed codec
+code that only fills and reads its own scratch buffers.
+
+diff --git a/third_party/dav1d/BUILD.gn b/third_party/dav1d/BUILD.gn
+index d75d823..5e72ebe 100644
+--- a/third_party/dav1d/BUILD.gn
++++ b/third_party/dav1d/BUILD.gn
+@@ -167,6 +167,10 @@ source_set("dav1d_headers") {
+ }
+ 
+ static_library("dav1d_8bit") {
++  # Venetium 0060: no automatic stack-variable initialization in these DSP
++  # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++  # fill costs a memset per block). Same opt-out as libaom and V8.
++  configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+   configs -= [ "//build/config/compiler:chromium_code" ]
+   configs += [
+     "//build/config/compiler:no_chromium_code",
+@@ -189,6 +193,10 @@ static_library("dav1d_8bit") {
+ }
+ 
+ static_library("dav1d_10bit") {
++  # Venetium 0060: no automatic stack-variable initialization in these DSP
++  # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++  # fill costs a memset per block). Same opt-out as libaom and V8.
++  configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+   configs -= [
+     "//build/config/compiler:chromium_code",
+ 
+@@ -220,6 +228,10 @@ static_library("dav1d_10bit") {
+ 
+ if (current_cpu == "x86" || current_cpu == "x64") {
+   static_library("dav1d_x86") {
++    # Venetium 0060: no automatic stack-variable initialization in these DSP
++    # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++    # fill costs a memset per block). Same opt-out as libaom and V8.
++    configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+     sources = [
+       "libdav1d/src/x86/cpu.c",
+       "libdav1d/src/x86/cpu.h",
+@@ -238,6 +250,10 @@ if (current_cpu == "x86" || current_cpu == "x64") {
+ } else if (current_cpu == "arm" || current_cpu == "arm64" ||
+            current_cpu == "arm64e") {
+   static_library("dav1d_arm") {
++    # Venetium 0060: no automatic stack-variable initialization in these DSP
++    # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++    # fill costs a memset per block). Same opt-out as libaom and V8.
++    configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+     sources = [
+       "libdav1d/src/arm/cpu.c",
+       "libdav1d/src/arm/cpu.h",
+diff --git a/third_party/libjpeg_turbo/BUILD.gn b/third_party/libjpeg_turbo/BUILD.gn
+index b423384..49a0511 100644
+--- a/third_party/libjpeg_turbo/BUILD.gn
++++ b/third_party/libjpeg_turbo/BUILD.gn
+@@ -184,6 +184,10 @@ config("libjpeg_simd_config") {
+ }
+ 
+ static_library("simd") {
++  # Venetium 0060: no automatic stack-variable initialization in these DSP
++  # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++  # fill costs a memset per block). Same opt-out as libaom and V8.
++  configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+   include_dirs = [ "." ]
+   deps = [ ":libjpeg_headers" ]
+   defines = [ "MANGLE_JPEG_NAMES" ]
+diff --git a/third_party/libvpx/BUILD.gn b/third_party/libvpx/BUILD.gn
+index 9661be8..d8b6a27 100644
+--- a/third_party/libvpx/BUILD.gn
++++ b/third_party/libvpx/BUILD.gn
+@@ -171,6 +171,10 @@ if (current_cpu == "x86" || (current_cpu == "x64" && !is_msan)) {
+   # symbols.
+ 
+   source_set("libvpx_intrinsics_mmx") {
++    # Venetium 0060: no automatic stack-variable initialization in these DSP
++    # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++    # fill costs a memset per block). Same opt-out as libaom and V8.
++    configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+     configs -= [ "//build/config/compiler:chromium_code" ]
+     configs += [ "//build/config/compiler:no_chromium_code" ]
+     configs += [ ":libvpx_config" ]
+@@ -187,6 +191,10 @@ if (current_cpu == "x86" || (current_cpu == "x64" && !is_msan)) {
+   }
+ 
+   source_set("libvpx_intrinsics_sse2") {
++    # Venetium 0060: no automatic stack-variable initialization in these DSP
++    # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++    # fill costs a memset per block). Same opt-out as libaom and V8.
++    configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+     configs -= [ "//build/config/compiler:chromium_code" ]
+     configs += [ "//build/config/compiler:no_chromium_code" ]
+     configs += [ ":libvpx_config" ]
+@@ -203,6 +211,10 @@ if (current_cpu == "x86" || (current_cpu == "x64" && !is_msan)) {
+   }
+ 
+   source_set("libvpx_intrinsics_ssse3") {
++    # Venetium 0060: no automatic stack-variable initialization in these DSP
++    # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++    # fill costs a memset per block). Same opt-out as libaom and V8.
++    configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+     configs -= [ "//build/config/compiler:chromium_code" ]
+     configs += [ "//build/config/compiler:no_chromium_code" ]
+     configs += [ ":libvpx_config" ]
+@@ -219,6 +231,10 @@ if (current_cpu == "x86" || (current_cpu == "x64" && !is_msan)) {
+   }
+ 
+   source_set("libvpx_intrinsics_sse4_1") {
++    # Venetium 0060: no automatic stack-variable initialization in these DSP
++    # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++    # fill costs a memset per block). Same opt-out as libaom and V8.
++    configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+     configs -= [ "//build/config/compiler:chromium_code" ]
+     configs += [ "//build/config/compiler:no_chromium_code" ]
+     configs += [ ":libvpx_config" ]
+@@ -235,6 +251,10 @@ if (current_cpu == "x86" || (current_cpu == "x64" && !is_msan)) {
+   }
+ 
+   source_set("libvpx_intrinsics_avx") {
++    # Venetium 0060: no automatic stack-variable initialization in these DSP
++    # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++    # fill costs a memset per block). Same opt-out as libaom and V8.
++    configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+     configs -= [ "//build/config/compiler:chromium_code" ]
+     configs += [ "//build/config/compiler:no_chromium_code" ]
+     configs += [ ":libvpx_config" ]
+@@ -253,6 +273,10 @@ if (current_cpu == "x86" || (current_cpu == "x64" && !is_msan)) {
+   }
+ 
+   source_set("libvpx_intrinsics_avx2") {
++    # Venetium 0060: no automatic stack-variable initialization in these DSP
++    # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++    # fill costs a memset per block). Same opt-out as libaom and V8.
++    configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+     configs -= [ "//build/config/compiler:chromium_code" ]
+     configs += [ "//build/config/compiler:no_chromium_code" ]
+     configs += [ ":libvpx_config" ]
+@@ -271,6 +295,10 @@ if (current_cpu == "x86" || (current_cpu == "x64" && !is_msan)) {
+   }
+ 
+   source_set("libvpx_intrinsics_avx512") {
++    # Venetium 0060: no automatic stack-variable initialization in these DSP
++    # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++    # fill costs a memset per block). Same opt-out as libaom and V8.
++    configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+     configs -= [ "//build/config/compiler:chromium_code" ]
+     configs += [ "//build/config/compiler:no_chromium_code" ]
+     configs += [ ":libvpx_config" ]
+@@ -309,6 +337,10 @@ if (current_cpu == "loong64") {
+ 
+ if (current_cpu == "arm" || current_cpu == "arm64" || current_cpu == "arm64e") {
+   source_set("libvpx_intrinsics_neon") {
++    # Venetium 0060: no automatic stack-variable initialization in these DSP
++    # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++    # fill costs a memset per block). Same opt-out as libaom and V8.
++    configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+     check_includes = false
+     configs -= [ "//build/config/compiler:chromium_code" ]
+     configs += [ "//build/config/compiler:no_chromium_code" ]
+diff --git a/third_party/libwebp/BUILD.gn b/third_party/libwebp/BUILD.gn
+index 1b6eeb5..e1d2f1c 100644
+--- a/third_party/libwebp/BUILD.gn
++++ b/third_party/libwebp/BUILD.gn
+@@ -153,6 +153,10 @@ source_set("libwebp_dsp_headers") {
+ }
+ 
+ static_library("libwebp_dsp") {
++  # Venetium 0060: no automatic stack-variable initialization in these DSP
++  # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++  # fill costs a memset per block). Same opt-out as libaom and V8.
++  configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+   visibility += allowed_visibility
+ 
+   sources = [
+@@ -236,6 +240,10 @@ static_library("libwebp_dsp") {
+ }
+ 
+ static_library("libwebp_dsp_avx2") {
++  # Venetium 0060: no automatic stack-variable initialization in these DSP
++  # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++  # fill costs a memset per block). Same opt-out as libaom and V8.
++  configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+   visibility += allowed_visibility
+ 
+   sources = [
+@@ -265,6 +273,10 @@ static_library("libwebp_dsp_avx2") {
+ }
+ 
+ static_library("libwebp_dsp_sse41") {
++  # Venetium 0060: no automatic stack-variable initialization in these DSP
++  # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++  # fill costs a memset per block). Same opt-out as libaom and V8.
++  configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+   visibility += allowed_visibility
+ 
+   sources = [
+@@ -299,6 +311,10 @@ static_library("libwebp_dsp_sse41") {
+ }
+ 
+ static_library("libwebp_dsp_sse2") {
++  # Venetium 0060: no automatic stack-variable initialization in these DSP
++  # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++  # fill costs a memset per block). Same opt-out as libaom and V8.
++  configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+   visibility += allowed_visibility
+ 
+   sources = [
+@@ -341,6 +357,10 @@ static_library("libwebp_dsp_sse2") {
+ 
+ if (use_dsp_neon) {
+   static_library("libwebp_dsp_neon") {
++    # Venetium 0060: no automatic stack-variable initialization in these DSP
++    # kernels (fixed-size scratch arrays they overwrite in full; the pattern/zero
++    # fill costs a memset per block). Same opt-out as libaom and V8.
++    configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+     sources = [
+       "src/src/dsp/alpha_processing_neon.c",
+       "src/src/dsp/cost_neon.c",

@@ -1,0 +1,79 @@
+Venetium 0056 - low-end defaults: no hidden WebUI preload, no anchor-metrics scan, no tab thumbnails on ARM32, and
+Memory Saver discards idle tabs sooner on <= 2 GB machines.
+From the performance research (C:\handoff\PERF-RESEARCH.md, items M3, M4, B5), his "fix all".
+- chrome/browser/metrics/chrome_feature_list_creator.cc (0005's defaults table; the user's own --enable/--disable-
+  features still win):
+  PreloadTopChromeWebUI off - a hidden Tab Search WebUI with its own renderer was created after the first paint.
+  NavigationPredictor off - per-anchor layout metrics computed on every https page and sent to the browser, whose only
+  consumers (preloading and its model) stand down while "Preload pages" is off.
+  TabHoverCardImages off on ARM32 - a GPU readback of every tab as it goes to the background, for hover previews a
+  touch tablet rarely shows.
+- chrome/browser/performance_manager/policies/memory_saver_mode_policy.cc: Memory Saver (on by default since 0005)
+  discards a background tab after 6/4/2 hours (conservative/medium/aggressive); on a low-end (<= 2 GB) machine it is
+  now an eighth of that, 45/30/15 minutes. The usual protections (audio, pinned, forms, recently used) still apply.
+
+diff --git a/chrome/browser/metrics/chrome_feature_list_creator.cc b/chrome/browser/metrics/chrome_feature_list_creator.cc
+index c7815a2..c888617 100644
+--- a/chrome/browser/metrics/chrome_feature_list_creator.cc
++++ b/chrome/browser/metrics/chrome_feature_list_creator.cc
+@@ -22,6 +22,7 @@
+ #include "base/time/default_tick_clock.h"
+ #include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
++#include "build/build_config.h"
+ #include "chrome/browser/about_flags.h"
+ #include "chrome/browser/devtools/features.h"
+ #include "chrome/browser/enterprise/browser_management/management_service_factory.h"
+@@ -125,6 +126,19 @@ constexpr VenetiumFeatureDefault kVenetiumFeatureDefaults[] = {
+     {"NtpMiddleSlotPromo", false},
+     // Autofill: no form-type queries or votes sent to Google's server.
+     {"AutofillServerCommunication", false},
++    // Venetium 0056: a hidden Tab Search WebUI (with its own renderer) is
++    // preloaded after the first paint; on a 2 GB machine that is a renderer
++    // and tens of MB kept for a menu that is rarely opened.
++    {"PreloadTopChromeWebUI", false},
++    // Venetium 0056: per-anchor layout metrics computed on every https page
++    // and sent to the browser, whose only consumers (preloading and its model)
++    // stand down while "Preload pages" is off.
++    {"NavigationPredictor", false},
++#if defined(ARCH_CPU_ARMEL)
++    // Venetium 0056: a GPU readback of every tab when it goes to the
++    // background, for hover-card previews a touch tablet rarely shows.
++    {"TabHoverCardImages", false},
++#endif
+ };
+ 
+ // A starting value, to be tuned on the tablet (Surface 2: Tegra 4, 2 GB).
+diff --git a/chrome/browser/performance_manager/policies/memory_saver_mode_policy.cc b/chrome/browser/performance_manager/policies/memory_saver_mode_policy.cc
+index 76a12a2..fc6815b 100644
+--- a/chrome/browser/performance_manager/policies/memory_saver_mode_policy.cc
++++ b/chrome/browser/performance_manager/policies/memory_saver_mode_policy.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/performance_manager/policies/memory_saver_mode_policy.h"
+ 
+ #include "base/notreached.h"
++#include "base/system/sys_info.h"
+ #include "chrome/browser/performance_manager/policies/page_discarding_helper.h"
+ #include "components/performance_manager/public/decorators/tab_page_decorator.h"
+ #include "components/performance_manager/public/features.h"
+@@ -200,13 +201,17 @@ void MemorySaverModePolicy::DiscardPageTimerCallback(
+ 
+ base::TimeDelta MemorySaverModePolicy::GetTimeBeforeDiscardForCurrentMode()
+     const {
++  // Venetium 0056: on a low-end (<= 2 GB) machine an idle background tab
++  // costs the foreground tab memory long before 2-6 hours pass; discard after
++  // an eighth of the time (45 / 30 / 15 minutes).
++  const int divisor = base::SysInfo::IsLowEndDevice() ? 8 : 1;
+   switch (mode_) {
+     case MemorySaverModeAggressiveness::kConservative:
+-      return base::Hours(6);
++      return base::Hours(6) / divisor;
+     case MemorySaverModeAggressiveness::kMedium:
+-      return base::Hours(4);
++      return base::Hours(4) / divisor;
+     case MemorySaverModeAggressiveness::kAggressive:
+-      return base::Hours(2);
++      return base::Hours(2) / divisor;
+   }
+   NOTREACHED();
+ }

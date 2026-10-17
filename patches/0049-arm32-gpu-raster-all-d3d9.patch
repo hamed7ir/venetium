@@ -1,0 +1,13 @@
+--- a/gpu/config/software_rendering_list.json
++++ b/gpu/config/software_rendering_list.json
+@@ -878,9 +878,7 @@
+           "gl_renderer": ".*OpenGL.*"
+         },
+         {
+-          "comment": "Venetium 0039: NVIDIA Tegra 4 (Surface 2) on Windows ARM32 renders through ANGLE's D3D9 backend, which Skia Ganesh supports (GrGLANGLEBackend::kD3D9); Chromium 77 rasterized on the GPU here by default. DXGI ids are fourccs ('NVDA' vendor, Tegra 4 device 0x35303230 from trip-6 d3dprobe), not PCI ids. Scoped to the Tegra 4 device id on purpose. Tegra 3 (Surface RT, device 0x35303130, d3dprobe on Windows RT 8.1, 2026-10-06) has identical D3D9 shader caps (PS20Caps 0x19, 512 slots, ps_2_a accepted), so correctness is the same, but its GPU is several times weaker relative to its CPU than Tegra 4's, and that GPU also composites everything; it stays on software raster (opt in with --enable-gpu-rasterization) until a Windows 10 Surface RT A/B run justifies adding 0x35303130 here.",
+-          "vendor_id": "0x4144564e",
+-          "device_id": [ "0x35303230" ],
++          "comment": "Venetium 0039/0049: GPU rasterization for ARM32 devices that render through ANGLE's D3D9 backend. Skia Ganesh supports it (GrGLANGLEBackend::kD3D9) and Chromium 77 rasterized on the GPU here by default; crbug 1047002/1462800 blocklisted it for Windows GPUs below ps_5.0 + Direct3D11, which dropped every ANGLE-D3D9 (ps_2.0) ARM32 device. Correctness is the same across these SM2/ps2.0 D3D9 GPUs - Tegra 3 (Surface RT, device 0x35303130), Tegra 4 (Surface 2, 0x35303230): identical PS20Caps 0x19, 512 slots, ps_2_a; Adreno (Lumia) on D3D9; and any other ARM32 ANGLE-D3D9 device. 0039 first scoped this to the Tegra 4 device id; 0049 (his decision 2026-10-11) drops the vendor/device restriction so it matches the renderer, enabling Tegra 3 and other ARM32 devices too. --disable-gpu-rasterization still overrides. x86 is effectively unaffected: modern x86 uses the ps_5.0 + Direct3D11 exceptions above, and ANGLE-D3D9 there is legacy/rare (software WARP/SwiftShader report their own renderer strings, not Direct3D9). Adreno on the D3D11 FL9_3 path (Venetium 0045) is a separate case handled with the Lumia GPU test.",
+           "gl_renderer": ".*Direct3D9.*"
+         }
+       ]

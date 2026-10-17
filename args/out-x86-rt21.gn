@@ -15,7 +15,7 @@ dcheck_always_on = false
 is_component_build = false
 symbol_level = 1                 # line tables in the PDBs for crash stacks; the PDBs are not shipped
 generate_about_credits = true    # chrome://credits carries Supermium's credit
-# is_official_build stays at its default (false): an official build is a later decision.
+# is_official_build = true comes from venetium.gn (v1.2).
 
 # --- toolchain (V8SIM-1 §0.3): rt2.1 and rustc-rt2.1, whose sysroot has the i686 std since RUSTC-3 ---
 clang_base_path = "F:/cr/rt21-cr"   # fixed rt2.1 (BATCH-RT21-FIX-1): clang-cl d572c493…, lld-link 6e203038…, llvm-lib 9e197c48…
@@ -28,7 +28,9 @@ rust_bindgen_root = "F:/cr/bindgen-rt"   # the x64 control's Windows bindgen
 
 # --- carried from the x64 control (out\x64-rt2) because they concern the toolchain, not the product ---
 use_thin_lto = false
-chrome_pgo_phase = 0
+# v1.2: Chrome's own win32 PGO profile for this branch (chrome/build/win32.pgo.txt; fetch it into
+# chrome/build/pgo_profiles/ first, see RECIPE.md). Also turns on V8 builtins PGO and call-graph-sorted linking.
+chrome_pgo_phase = 2
 clang_use_chrome_plugins = false   # rt2.x has no Chromium clang plugins
 use_siso = false                   # we drive ninja
 # V8SIM-2 §4 (his decision 2026-09-29): no precompiled headers. Chromium 150 adds "-fmodule-name=..._Private" to every
@@ -47,3 +49,15 @@ enable_reporting = false
 use_on_device_model_service = false
 # #15 JPEG XL decoder off.
 enable_jxl_decoder = false
+# D13 (his decision, 2026-10-02: "video and audio should be on"): proprietary codecs (H.264, AAC, ...) in every Venetium build.
+proprietary_codecs = true
+ffmpeg_branding = "Chrome"
+# D15 (his decision, 2026-10-02: "official build, I agree with you"): use the real build/util/LASTCHANGE (Chromium's
+# revision and year, venetium\deps\release-inputs.tsv) instead of LASTCHANGE.dummy.
+use_dummy_lastchange = false
+# v1.2 (his decision, 2026-10-15): an official build (chrome://version no longer says "Developer Build"). It defines
+# OFFICIAL_BUILD: compact CHECKs, zero instead of pattern stack-variable init, no PartitionAlloc per-allocation thread-cache
+# statistics, report-only (not crashing) DUMP_WILL_BE_CHECKs, V8 logging level 0, Rust codegen-units=1. Each output
+# directory keeps its explicit use_thin_lto / chrome_pgo_phase / symbol_level / dcheck_always_on lines, which official
+# would otherwise default to ThinLTO on, PGO on and full symbols.
+is_official_build = true

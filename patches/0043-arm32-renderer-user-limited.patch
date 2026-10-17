@@ -8,7 +8,8 @@ slows every process startup noticeably on Tegra, so this patch keeps the paralle
 ARM32 renderer's lockdown token to USER_LIMITED -- the exact token the GPU process already runs with successfully on this hardware
 (content/browser/gpu/gpu_process_host.cc: "we gotten as far as USER_LIMITED; USER_RESTRICTED breaks DirectX+OpenGL"). USER_LIMITED's
 restricting SIDs (Users/World/RESTRICTED/logon) let the loader worker threads read the application and system DLLs, while still
-enforcing a real restricted-token sandbox (integrity stays LOW -> delayed UNTRUSTED, lockdown job, win32k lockdown, all mitigations).
+enforcing a real restricted-token sandbox (integrity stays LOW -> delayed UNTRUSTED, lockdown job). [0053: no win32k lockdown on
+ARM32 since 0030; the creation-time mitigations 0029 lost are re-applied after startup by 0053.]
 Weaker than USER_LOCKDOWN, far stronger than --no-sandbox. The override is placed in the renderer delegate's InitializeConfig, which
 sandbox_win.cc invokes AFTER AddDefaultConfigForSandboxedProcess() has set USER_LOCKDOWN, so the second SetTokenLevel() cleanly
 overrides it (ConfigBase::SetTokenLevel only stores the levels and checks initial>=lockdown). Guarded by ARCH_CPU_ARMEL so the x86

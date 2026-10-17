@@ -41,7 +41,7 @@ tarball and apply the .222 -> .226 delta. confirm you are on it: `chrome/VERSION
 
 ## apply the patches
 
-apply `patches/0001` through `patches/0047` in order. they are plain `git apply` patches. apply them with
+apply `patches/0001` through `patches/0061` in order. they are plain `git apply` patches. apply them with
 `core.autocrlf=false` so the files stay byte-for-byte - arm32 is sensitive and i hash every file. the missing
 numbers (0009, 0024, 0031, 0034, 0038) are patches i dropped or replaced along the way; the old versions are kept
 under `patches/superseded/` for history, you do not apply those.
@@ -54,10 +54,21 @@ make your output directory with `args/out-arm-rt21.gn` as its `args.gn` (that fi
 - `target_cpu = "arm"`
 - `clang_base_path` -> your llvm-rt2.1
 - `rust_sysroot_absolute` -> your rustc-rt2.1 sysroot; `rust_bindgen_root` -> your bindgen
-- arm32 is angle-on-d3d9 only, so: `enable_swiftshader=false`, `angle_enable_wgpu=false`,
-  `dawn_use_swiftshader=false`, `dawn_use_built_dxc=false`. the tegra is d3d9 / feature level 9_1 - there is no
-  d3d11/d3d12/webgpu, and the windows sdk ships no 32-bit-arm `dxil.dll`, so dxc has to stay off.
-- codecs on: `proprietary_codecs=true`, `ffmpeg_branding="Chrome"` (so h.264 / aac work).
+- arm32 renders through angle on d3d9 (the tegras, feature level 9_1) or on d3d11 at feature level 9_3 (adreno,
+  0045), so: `enable_swiftshader=false`, `angle_enable_wgpu=false`, `dawn_use_swiftshader=false`,
+  `dawn_use_built_dxc=false`. there is no d3d12/webgpu on these gpus, and the windows sdk ships no 32-bit-arm
+  `dxil.dll`, so dxc has to stay off.
+- codecs on: `proprietary_codecs=true`, `ffmpeg_branding="Chrome"` (so h.264 / aac work). both come from
+  `args/venetium.gn`, so the x86 build gets them too.
+- `is_official_build = true` (in `args/venetium.gn`): a real release build, the way google builds chrome -
+  `chrome://version` says "official build". the out-dir files keep their own `use_thin_lto = false`,
+  `chrome_pgo_phase` and `symbol_level = 1`, which win over what official turns on.
+- arm32: `v8_enable_builtins_optimization = true` - v8's own builtins profile. there is no chrome pgo profile for
+  arm32, so `chrome_pgo_phase = 0` there.
+- x86: `chrome_pgo_phase = 2` - google's profile-guided optimization data for chrome on 32-bit windows. the file
+  name is in `chrome/build/win32.pgo.txt`; put that file into `chrome/build/pgo_profiles/` before `gn gen`
+  (download `https://storage.googleapis.com/chromium-optimization-profiles/pgo_profiles/<that name>`, or let
+  depot_tools' pgo hook fetch it). it is about 480 mb, and rt2.1's llvm-profdata reads it.
 
 ## build
 
@@ -67,7 +78,28 @@ put ninja and the toolchain on your PATH, then:
 ninja -C out\arm-rt21 chrome
 ```
 
-that gives you the whole browser: `venetium.exe`, `chrome.dll`, the angle d3d9 dlls, and the resources.
+that gives you the whole browser: `venetium.exe`, `chrome.dll`, the angle dlls, and the resources.
+
+**one gotcha with the official build from the source tarball:** near the end, the build makes a resource allowlist
+from `chrome.dll.pdb` with `third_party/llvm-build/Release+Asserts/bin/llvm-pdbutil`. in the tarball that file is a
+linux binary sitting next to the windows `llvm-pdbutil.exe`, and windows picks the extensionless one, so the step fails
+with `WinError 193 ... not a valid Win32 application`. rename the linux one (i call it `llvm-pdbutil.linux-elf`) and
+run ninja again. don't turn the allowlist off instead (`enable_resource_allowlist_generation`): grit uses that arg too,
+so changing it recompiles everything.
+
+**the ad-blocker list (0059).** the blocker reads `venetium_filters\filters.dat` next to `venetium.exe`. it is made
+from easylist + easyprivacy (https://easylist.to/easylist/easylist.txt and .../easyprivacy.txt) by chromium's own
+`ruleset_converter`. build it once for x86 (it runs on the x64 build box) and convert:
+
+```
+ninja -C out\x86-rt21 components/subresource_filter/tools:ruleset_converter
+out\x86-rt21\ruleset_converter.exe --input_format=filter-list --output_format=unindexed-ruleset --input_files=easylist.txt,easyprivacy.txt --output_file=filters.dat
+```
+
+then make a `venetium_filters` folder in each out dir with `filters.dat`, a one-line `version.txt` (i use
+`easylist-<its ! Version>.easyprivacy-<its ! Version>`; a new version makes the browser re-index the list once) and
+`package/venetium_filters/LICENSE.txt`. `chrome.release` lists the three files, so the zip and the installer pick
+them up. no folder = no blocking, everything else works.
 
 ## package
 
@@ -123,3 +155,70 @@ real sandbox. 0046 adds a "renderer sandbox" row to chrome://version so you can 
 level 9_3: 0045 brings angle's d3d11 backend back on arm32 with a one-shot probe that only picks d3d11 at fl 9_3 (tegra
 stays on d3d9, no change), and 0047 bridges the hardware h.264 decoder's output into that d3d11 device. tegra is
 untouched by both.
+
+**the second batch (0048-0051)** - the next round of device reports.
+
+0048 is the big one: a data-alignment crash that only hit arm32. blink's garbage-collected collection backings
+(HeapVectorBacking / HeapHashTableBacking) are empty tag types whose address *is* the element array, and cppgc was
+aligning them to 4 bytes on 32-bit. an element with an 8-byte member (a double, an int64) then landed at a 4-byte
+address, and arm32's ldrd / vldr fault on that (x86-32 just tolerates it). that is why recaptcha, telegram web, css
+animations and some extensions crashed the tab. 0048 makes those backings carry alignof(element) on arm32 (8 bytes
+when the element needs it), and keeps the now-8-byte-aligned ones out of the compaction space, which cppgc won't let
+you align past the default. no-op off arm32. device-confirmed fixed.
+
+0049 turns gpu rasterization on for every arm32 device that draws through angle's d3d9, not just the surface 2. 0039
+had scoped it to the tegra 4's gpu id; 0049 drops the id check so the surface rt (tegra 3) and any other arm32 d3d9
+device get it too. correctness is the same across these ps_2.0 d3d9 gpus. device-confirmed on the tegra 3
+(chrome://gpu reads "hardware accelerated"). `--disable-gpu-rasterization` still turns it off.
+
+0050 is the real fix for web store extensions. ungoogled had inverted a helper (`IsExtensionDownload` returned
+`ShouldDownloadAsRegularFile()`, which is false unless you pass a flag), so the installer rejected every .crx with
+"download was not a valid extension or user script". 0050 negates it to match the sibling download path. this, not
+the utility-process sandbox (0044), turned out to be what actually blocked installs - with 0050 extensions install
+and run. device-confirmed. (cross-arch: x86 gets this one too.)
+
+0051 lets the adreno gpu (the lumias) rasterize on its d3d11 fl9_3 path - the one 0045 brings up - scoped to the
+adreno 330 gpu id from a community d3dprobe report (vendor 0x4d4f4351, device 0x46363432). tegra is untouched; x86
+has no such gpu.
+
+**the third batch (0052-0053)** - the webcam, and the fixes from a review of the whole series.
+
+0052 makes the webcam work on arm32. the desktop media foundation capture path opens these cameras (the tegra's
+nvidia avstream camera, the lumias) but can never start streaming them - every format fails with
+MF_E_HW_MFT_FAILED_START_STREAMING, even unsandboxed - so getUserMedia said "could not start video source". 0052 adds
+a winrt MediaCapture capture backend for arm32 (wrl only, no exceptions): a MediaFrameReader on the camera's
+VideoPreview source, frames copied off the gpu surface and handed to chromium as nv12 / yuy2, with photo capture as a
+slow fallback. the probe measured 30 fps on both tegra cameras (photo capture was ~2 fps). camera enumeration stays on
+media foundation, and x86 capture is unchanged. one gotcha: don't set MemoryPreference=Cpu on these cameras, it makes
+the hardware mft refuse to start.
+
+0053 is the review round: small, mostly arm32 fixes to earlier patches. the 0047 d3d11 decode bridge could never run
+(its probe only looked at angle's d3d9 device) and had no sync between the two devices - fixed, but it stays behind
+`--enable-features=VenetiumDxvaD3D11Bridge` until it is tested on an adreno. 0049's gpu-raster exception is scoped to
+the arm32 gpu vendors (nvidia, qualcomm), so x86 with `use-angle=d3d9` no longer picks it up. on arm32 the
+process mitigations that 0029 lost at process creation are applied by the child after startup instead, best-effort.
+the sandbox's ntdll hooks flush the instruction cache, crashpad's arm32 CaptureContext records the right pc / cpsr and
+the vfp registers, angle's failed-shader cache is keyed by signature (no hlsl rebuilt per draw), the d3d11 probe no
+longer creates a device, cpuinfo reports fma/idiv on the cores that have them (tegra 4, krait), the dxva decoder keeps
+6 picture buffers instead of 8, and three flag-text typos are fixed.
+
+**the fourth batch (0054-0061)** - speed, mostly for 2 gb tablets. this is also the first full official build, so
+build it from scratch (no incremental tricks: a patch that adds a string shifts every later string id, and only a
+full build recompiles everything that uses them).
+
+0054 stops treating every 2 gb machine as permanently short of memory: windows' pressure thresholds (moderate below
+1000 mib free, critical below 400) now scale with the installed ram below 4 gib, renderers get v8's
+`--max-semi-space-size=8` instead of `--optimize-for-size`, and on angle's d3d9 backend the swap interval is set
+once instead of being toggled (each toggle rebuilt the whole window's swap chain). 0055 steers 720p+ video to the
+hardware h.264 decoder on arm32 (vp9 level 3.1+ and av1 level 4+ report unsupported when the codec string has a
+level, and vp9/av1 above 480p count as not smooth until real stats exist; feature VenetiumArm32CodecSteering), and
+gives software h.264 / vp9 up to 4 decode threads on 32-bit. 0056 turns off the hidden tab-search preload, the
+per-anchor navigation-predictor metrics and (arm32) tab hover-card images, and memory saver discards idle tabs after
+an eighth of the usual time on low-end machines. 0057 serves a page's own preconnect / dns-prefetch hints while
+"preload pages" is off. 0058 is the small stuff: no delayed dawn/dx12 gpu info collection, cache budgets for 1-2 gb,
+always qpc on x86, the d3d9 fallback on x86, fewer component registrations and a 10-minute first update check, and
+mksnapshot warns instead of failing on a builtins-profile mismatch. 0059 is the ad and tracker blocker: chromium's
+subresource_filter with an all-sites preset and the list from `venetium_filters\` (see "the ad-blocker list" above).
+0060 takes automatic stack-variable initialization out of the dsp-only codec targets (jpeg simd, dav1d, libvpx
+intrinsics, libwebp dsp). 0061 replaces the arm32 crt's byte-at-a-time memchr / memcmp / strlen / strchr / strcmp
+with word-at-a-time versions (`build/win/venetium_string_arm.c`, linked into every arm32 binary).

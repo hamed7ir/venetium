@@ -10,6 +10,12 @@ enable_jxl_decoder = false
 # D13 (his decision, 2026-10-02: "video and audio should be on"): proprietary codecs (H.264, AAC, ...) in every Venetium build.
 proprietary_codecs = true
 ffmpeg_branding = "Chrome"
-# D15 (his decision, 2026-10-02: "official build, I agree with you"): stay non-official (no ThinLTO/PGO), but use the real
-# build/util/LASTCHANGE (Chromium's revision and year, venetium\deps\release-inputs.tsv) instead of LASTCHANGE.dummy.
+# D15 (his decision, 2026-10-02: "official build, I agree with you"): use the real build/util/LASTCHANGE (Chromium's
+# revision and year, venetium\deps\release-inputs.tsv) instead of LASTCHANGE.dummy.
 use_dummy_lastchange = false
+# v1.2 (his decision, 2026-10-15): an official build (chrome://version no longer says "Developer Build"). It defines
+# OFFICIAL_BUILD: compact CHECKs, zero instead of pattern stack-variable init, no PartitionAlloc per-allocation thread-cache
+# statistics, report-only (not crashing) DUMP_WILL_BE_CHECKs, V8 logging level 0, Rust codegen-units=1. Each output
+# directory keeps its explicit use_thin_lto / chrome_pgo_phase / symbol_level / dcheck_always_on lines, which official
+# would otherwise default to ThinLTO on, PGO on and full symbols.
+is_official_build = true

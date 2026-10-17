@@ -1,0 +1,724 @@
+Venetium 0053 - fixes from the full review of patches 0001-0051 (C:\handoff\PATCH-REVIEW.md, 2026-10-15, his "fix all").
+Each item names the patch it corrects; the review's ids are in brackets.
+- 0047 [B1, B2] dxva_video_decoder.cc: the D3D11 decode bridge could never run - ProbeMaxDecodeSize only looked at
+  ANGLE's D3D9 device, which a D3D11 render path does not have, so the probe always failed first - and its output had no
+  ordering between our D3D9 device and ANGLE's D3D11 device. The probe and the decoder now share GetDecodeD3D9DeviceEx()
+  (ANGLE's D3D9Ex device; else, on the D3D11 path, one standalone D3D9Ex device per GPU process), and after the
+  NV12 -> RGB StretchRect on that own device an event query is flushed and polled (at most 250 ms) before the D3D11 side
+  samples the shared texture. The bridge has never run on hardware and the Adreno it is for has the bad D3D9 driver, so it
+  is behind the feature VenetiumDxvaD3D11Bridge, DISABLED by default (--enable-features=VenetiumDxvaD3D11Bridge to try
+  it). The Tegra path (ANGLE on D3D9, ANGLE's own device) is unchanged.
+- 0041 [P1] dxva_video_decoder.cc: kNumPictureBuffers 8 -> 6, the renderer's queue (limits::kMaxVideoFrames = 4) plus the
+  frame being composited and the one on screen; ~16 MB less of the Tegra's shared memory at 1080p (Chromium 77 used 5).
+- 0020 [B3] capture_context_win_arm.asm: CaptureContext stored LR (Thumb bit set) as Pc, a CPSR without the T bit and no
+  VFP state. Now Pc = LR & ~1, Cpsr = APSR | T, D0-D31 and Fpscr are stored and ContextFlags is CONTEXT_ARM | CONTROL |
+  INTEGER | FLOATING_POINT (0x200007); r1/r2 are restored before returning. Crash-report quality only (dumps taken from a
+  captured context now unwind from the right instruction and carry the VFP registers).
+- 0049 [B4] software_rendering_list.json: the ANGLE-D3D9 GPU-raster exception matched any Direct3D9 renderer, so on x86
+  chrome://flags#use-angle=d3d9 turned GPU raster on for old D3D9 GPUs too. It is now scoped by the DXGI vendor ids the
+  ARM32 SoCs report - NVIDIA 0x4144564e ('NVDA': Tegra 3 and 4) and, as its own exception, Qualcomm 0x4d4f4351 ('QCOM':
+  Adreno on D3D9) - which x86 GPUs (PCI ids 0x10de/0x8086/0x1002) never report. 0051's Adreno D3D11 entry is unchanged.
+- 0029 [S1] sandbox_policy_base.cc + process_mitigations.cc: on ARM32 the creation-time mitigation attribute is dropped
+  (build 15035 refuses it), so the extension-point, non-system-font and image-load (no remote / no low label) policies
+  were never applied - while the child was told they were. On ARM32 the broker now re-homes those four into the delayed
+  set (the conversion AddAppContainerProfile() already does for its CreateProcess bug) and transfers an empty startup
+  set, and the child applies them after startup, best-effort: a refusal leaves that flag off instead of hitting
+  SetProcessMitigationPolicyInternal's PCHECK. Other platforms keep the fatal path, byte-for-byte the same behaviour.
+- 0019 [S2] service_resolver_arm.cc: FlushInstructionCache on the child after writing the interception thunks (the copied
+  original and the patched ntdll stub); ARMv7's instruction cache is not coherent with data writes, and nothing documents
+  that WriteProcessMemory flushes. resolver_arm.cc: comment only (the in-place EAT thunk is not flushed; on ARM32 its only
+  user is the CreateThread interception, armed only for CSRSS-disconnected children, none since 0030).
+- 0032 [P3] ProgramExecutableD3D.{h,cpp}: the failed-compile cache was keyed by the full generated HLSL, so every draw on
+  a too-large Skia program still regenerated its vertex/pixel HLSL just to look it up. It is now keyed by the executable's
+  signature (vertex input signature or pixel output layout, plus the image2D bind layout) - at least as specific as
+  ANGLE's own executable cache - and checked before any HLSL is generated; reset() clears it with the rest of the link.
+  The serialized program format is unchanged.
+- 0045 [P4] gl_features.cc: the one-shot D3D11 probe passes ppDevice = ppImmediateContext = nullptr, so
+  D3D11CreateDevice only reports the feature level (S_FALSE) instead of creating a device and context to throw away.
+- 0025 [P5] cpuinfo arm/windows/init.c: report idiv, fma and fp16 when Windows reports hardware divide
+  (PF_ARM_DIVIDE_INSTRUCTION_AVAILABLE) - every ARMv7 core with it (Cortex-A15, Krait: Tegra 4, the Lumias) is ARMv7VE with
+  VFPv4. Cortex-A9 (Tegra 3) reports none and stays on the baseline, so XNNPACK/ruy pick their NEON-FMA kernels only where
+  VFMA exists.
+- 0012 supermium_flag_entries.h: flag text typos - "mimick" -> "mimic", "Windows 11 Mica Taskbar" -> "Titlebar" (the flag is
+  windows11-mica-titlebar), "Diasble" -> "Disable". Internal flag names are unchanged (renaming would reset users' flags).
+- 0043 (description only): it said the USER_LIMITED renderer keeps "win32k lockdown, all mitigations"; on ARM32 0030 dropped
+  the win32k lockdown and 0029 the creation-time mitigations. 0043's header text is corrected in place; its diff is untouched.
+NOT changed (see the review): P2, the MFT running on the GPU main thread, needs a device trace first; P6, BoringSSL without
+asm on ARM32, is not worth it (ChaCha20 in C outruns the Wi-Fi); P7, prediction/preconnect off, is a privacy choice.
+Device: none of these are device-tested yet. Structural gates pass on both arches (ARMNT/I386, CFG, no new DLL imports,
+identical exports, the 15035 kernel32/ntdll import check, CaptureContext's VFP stores linked into all three crashpad users).
+
+diff --git a/chrome/browser/supermium_flag_entries.h b/chrome/browser/supermium_flag_entries.h
+index 4b70865..12d1325 100644
+--- a/chrome/browser/supermium_flag_entries.h
++++ b/chrome/browser/supermium_flag_entries.h
+@@ -19,7 +19,7 @@
+ 	 SINGLE_VALUE_TYPE("disable-windows10-custom-titlebar")},
+ 	{"force-xp-theme",
+ 	 "Use Classic Theme", 
+-     "Use the classic Chrome theme designed to mimick \"Aero\" window controls. " 
++     "Use the classic Chrome theme designed to mimic \"Aero\" window controls. " 
+      "Typically used when desktop composition is disabled or unavailable.", kOsWin,
+ 	 FEATURE_VALUE_TYPE(kForceXpTheme)},	 
+ #endif
+@@ -101,8 +101,8 @@
+      kOsDesktop, SINGLE_VALUE_TYPE("transparent-tabs")},
+   /**/
+ 	{"windows11-mica-titlebar",
+-     "Windows 11 Mica Taskbar",
+-     "Enables support for the Windows 11 Mica Taskbar, as used in 22H2 and up.",
++     "Windows 11 Mica Titlebar",
++     "Enables support for the Windows 11 Mica titlebar, as used in 22H2 and up.",
+      kOsDesktop, SINGLE_VALUE_TYPE("windows11-mica-titlebar")},
+ 	{"disable-pwa-install-prompt",
+      "Disable PWA Install Prompt in Address Bar",
+@@ -199,7 +199,7 @@
+      "Compact tab options, compatible with all tab types, and preferred for the v60 tabs.",
+      kOsDesktop, SINGLE_VALUE_TYPE("compact-tab-ui")},
+     {"disable-gpu-driver-bug-workarounds",
+-     "Diasble GPU Driver Bug Workarounds",
++     "Disable GPU Driver Bug Workarounds",
+      "Disables all workarounds for bugs experienced in certain drivers. Can increase performance, but use with caution.",
+      kOsDesktop, SINGLE_VALUE_TYPE("disable-gpu-driver-bug-workarounds")},
+     {"autoplay-policy",
+diff --git a/gpu/config/software_rendering_list.json b/gpu/config/software_rendering_list.json
+index dde55a8..2191b22 100644
+--- a/gpu/config/software_rendering_list.json
++++ b/gpu/config/software_rendering_list.json
+@@ -878,7 +878,13 @@
+           "gl_renderer": ".*OpenGL.*"
+         },
+         {
+-          "comment": "Venetium 0039/0049: GPU rasterization for ARM32 devices that render through ANGLE's D3D9 backend. Skia Ganesh supports it (GrGLANGLEBackend::kD3D9) and Chromium 77 rasterized on the GPU here by default; crbug 1047002/1462800 blocklisted it for Windows GPUs below ps_5.0 + Direct3D11, which dropped every ANGLE-D3D9 (ps_2.0) ARM32 device. Correctness is the same across these SM2/ps2.0 D3D9 GPUs - Tegra 3 (Surface RT, device 0x35303130), Tegra 4 (Surface 2, 0x35303230): identical PS20Caps 0x19, 512 slots, ps_2_a; Adreno (Lumia) on D3D9; and any other ARM32 ANGLE-D3D9 device. 0039 first scoped this to the Tegra 4 device id; 0049 (his decision 2026-10-11) drops the vendor/device restriction so it matches the renderer, enabling Tegra 3 and other ARM32 devices too. --disable-gpu-rasterization still overrides. x86 is effectively unaffected: modern x86 uses the ps_5.0 + Direct3D11 exceptions above, and ANGLE-D3D9 there is legacy/rare (software WARP/SwiftShader report their own renderer strings, not Direct3D9). Adreno on the D3D11 FL9_3 path (Venetium 0045) is a separate case handled with the Lumia GPU test.",
++          "comment": "Venetium 0039/0049/0053: GPU rasterization for ARM32 devices that render through ANGLE's D3D9 backend. Skia Ganesh supports it (GrGLANGLEBackend::kD3D9) and Chromium 77 rasterized on the GPU here by default; crbug 1047002/1462800 blocklisted it for Windows GPUs below ps_5.0 + Direct3D11, which dropped every ANGLE-D3D9 (ps_2.0) ARM32 device. Correctness is the same across these SM2/ps2.0 D3D9 GPUs - Tegra 3 (Surface RT, device 0x35303130), Tegra 4 (Surface 2, 0x35303230): identical PS20Caps 0x19, 512 slots, ps_2_a; Adreno (Lumia) on D3D9. 0039 first scoped this to the Tegra 4 device id; 0049 (his decision 2026-10-11) dropped the device restriction to cover Tegra 3 and the other ARM32 devices. 0053 scopes it by vendor instead: the ARM SoC drivers report fourcc DXGI vendor ids (NVIDIA Tegra 'NVDA' 0x4144564e here, Qualcomm 'QCOM' 0x4d4f4351 in the next exception) that no x86 GPU uses, so an x86 legacy-DX9 GPU forced onto ANGLE D3D9 (chrome://flags #use-angle) keeps upstream's blocklist. --disable-gpu-rasterization still overrides.",
++          "vendor_id": "0x4144564e",
++          "gl_renderer": ".*Direct3D9.*"
++        },
++        {
++          "comment": "Venetium 0053: the Qualcomm Adreno half of the exception above (DXGI vendor 'QCOM' 0x4d4f4351) - an Adreno whose ANGLE runs on D3D9. Same reasoning; ARM32-only by vendor.",
++          "vendor_id": "0x4d4f4351",
+           "gl_renderer": ".*Direct3D9.*"
+         },
+         {
+diff --git a/media/gpu/windows/dxva_video_decoder.cc b/media/gpu/windows/dxva_video_decoder.cc
+index 8033688..33926e5 100644
+--- a/media/gpu/windows/dxva_video_decoder.cc
++++ b/media/gpu/windows/dxva_video_decoder.cc
+@@ -22,15 +22,19 @@
+ #include <vector>
+ 
+ #include "base/containers/span.h"
++#include "base/feature_list.h"
+ #include "base/file_version_info.h"
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+ #include "base/memory/ptr_util.h"
+ #include "base/memory/ref_counted.h"
+ #include "base/memory/ref_counted_delete_on_sequence.h"
++#include "base/no_destructor.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/task/bind_post_task.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "base/threading/platform_thread.h"
++#include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
+ #include "components/viz/common/resources/shared_image_format.h"
+ #include "gpu/command_buffer/client/client_shared_image.h"
+@@ -84,9 +88,12 @@ constexpr GUID kCodecApiAVLowLatencyMode = {
+ constexpr D3DFORMAT kNV12 =
+     static_cast<D3DFORMAT>(MAKEFOURCC('N', 'V', '1', '2'));
+ 
+-// Frames the client may hold at once (VideoRendererImpl queues a few ahead of
+-// the frame being composited). A 1080p X8R8G8B8 picture is ~8 MB.
+-constexpr size_t kNumPictureBuffers = 8;
++// Frames the client may hold at once: VideoRendererImpl queues up to
++// limits::kMaxVideoFrames (4) ahead of the one being composited, plus the one
++// on screen. A 1080p X8R8G8B8 picture is ~8 MB of the Tegra's shared memory, so
++// Venetium 0053 keeps exactly that working set (was 8, ~67 MB at 1080p;
++// Chromium 77's DXVA decoder used 5).
++constexpr size_t kNumPictureBuffers = 6;
+ // Every output sample is copied out of the MFT before the next one is pulled,
+ // but one may be held while waiting for a free picture buffer.
+ constexpr UINT32 kMinOutputSamples = 2;
+@@ -210,7 +217,66 @@ Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> CreateOwnD3D9DeviceEx() {
+   return device;
+ }
+ 
+-// Probes this GPU process's ANGLE D3D9 device once: msmpeg2vdec.dll preloaded,
++// Venetium 0053: the 0047 bridge (decode on our own D3D9Ex device, sample the
++// result from ANGLE's D3D11 device) has never run on hardware - the Adreno it is
++// for draws D3D9 output wrongly elsewhere - so it stays off unless enabled with
++// --enable-features=VenetiumDxvaD3D11Bridge. The Tegra path (ANGLE on D3D9) does
++// not depend on this.
++BASE_FEATURE(kVenetiumDxvaD3D11Bridge, base::FEATURE_DISABLED_BY_DEFAULT);
++
++// The D3D9Ex device to decode on: ANGLE's own when ANGLE renders on D3D9
++// (Tegra); otherwise, when ANGLE renders on D3D11 and the bridge is enabled, one
++// standalone device for this GPU process, created once. The probe and the
++// decoder both use this, so the probe tests the device the decoder will use
++// (Venetium 0053: the probe used to look only at ANGLE's D3D9 device, so on a
++// D3D11 render path it always found nothing and 0047 never ran).
++Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> GetDecodeD3D9DeviceEx(
++    bool* is_own_device) {
++  *is_own_device = false;
++  Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> angle_device =
++      GetAngleD3D9DeviceEx();
++  if (angle_device) {
++    return angle_device;
++  }
++  if (!base::FeatureList::IsEnabled(kVenetiumDxvaD3D11Bridge) ||
++      !gl::QueryD3D11DeviceObjectFromANGLE()) {
++    return nullptr;
++  }
++  static base::NoDestructor<Microsoft::WRL::ComPtr<IDirect3DDevice9Ex>>
++      own_device(CreateOwnD3D9DeviceEx());
++  if (!*own_device) {
++    return nullptr;
++  }
++  *is_own_device = true;
++  return *own_device;
++}
++
++// Venetium 0053: waits until `device` has executed everything submitted so far
++// (an event query flushed and polled). The D3D11 bridge needs it after the
++// NV12 -> RGB copy: ANGLE's D3D11 device reads the shared texture with no
++// ordering against our own D3D9 device. Bounded, so a hung driver costs at most
++// that long per frame.
++bool WaitForD3D9DeviceIdle(IDirect3DDevice9Ex* device) {
++  Microsoft::WRL::ComPtr<IDirect3DQuery9> query;
++  if (FAILED(device->CreateQuery(D3DQUERYTYPE_EVENT, &query)) ||
++      FAILED(query->Issue(D3DISSUE_END))) {
++    return false;
++  }
++  const base::TimeTicks deadline =
++      base::TimeTicks::Now() + base::Milliseconds(250);
++  for (;;) {
++    const HRESULT hr = query->GetData(nullptr, 0, D3DGETDATA_FLUSH);
++    if (hr == S_OK) {
++      return true;
++    }
++    if (FAILED(hr) || base::TimeTicks::Now() > deadline) {
++      return false;
++    }
++    base::PlatformThread::YieldCurrentThread();
++  }
++}
++
++// Probes this GPU process's decode D3D9 device once: msmpeg2vdec.dll preloaded,
+ // NV12 -> X8R8G8B8 StretchRect supported, a DXVA2 H.264 VLD mode with NV12
+ // render targets, and the largest of 1920x1088 / 1280x720 the driver offers a
+ // decoder configuration for. Returns an empty size if any step fails. Tegra 3
+@@ -218,9 +284,12 @@ Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> CreateOwnD3D9DeviceEx() {
+ // drivers answer here, never by vendor or device id.
+ gfx::Size ProbeMaxDecodeSize() {
+   static const gfx::Size kMaxSize = []() -> gfx::Size {
+-    Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> device = GetAngleD3D9DeviceEx();
++    bool is_own_device = false;
++    Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> device =
++        GetDecodeD3D9DeviceEx(&is_own_device);
+     if (!device) {
+-      VLOG(1) << "DXVAVideoDecoder: no ANGLE D3D9Ex device";
++      VLOG(1) << "DXVAVideoDecoder: no D3D9Ex decode device (ANGLE is not on "
++                 "D3D9, and the D3D11 bridge is off or unavailable)";
+       return gfx::Size();
+     }
+     if (!::GetModuleHandle(L"msmpeg2vdec.dll")) {
+@@ -657,14 +726,14 @@ DecoderStatus DXVAVideoDecoder::InitializeDecoder(
+     return fail("Media Foundation unavailable");
+   }
+ 
+-  device_ = GetAngleD3D9DeviceEx();
++  bool is_own_device = false;
++  device_ = GetDecodeD3D9DeviceEx(&is_own_device);
+   if (!device_) {
++    return fail("no D3D9Ex decode device");
++  }
++  if (is_own_device) {
+     // Venetium 0047: ANGLE has no D3D9 device - it renders on D3D11 (e.g. an Adreno at FL 9_3, via
+     // 0045). Decode on our own D3D9Ex device and bridge the output into ANGLE's D3D11 device.
+-    device_ = CreateOwnD3D9DeviceEx();
+-    if (!device_) {
+-      return fail("no D3D9Ex device (neither ANGLE's nor our own)");
+-    }
+     angle_d3d11_device_ = gl::QueryD3D11DeviceObjectFromANGLE();
+     if (!angle_d3d11_device_) {
+       return fail("ANGLE exposes neither a D3D9 nor a D3D11 device");
+@@ -1040,8 +1109,9 @@ bool DXVAVideoDecoder::OutputSample(Microsoft::WRL::ComPtr<IMFSample> sample) {
+     return false;
+   }
+ 
+-  // NV12 -> RGB on the GPU (driver colour matrix). Same device as ANGLE, so
+-  // this is ordered before any draw that samples the picture.
++  // NV12 -> RGB on the GPU (driver colour matrix). On the D3D9 render path this
++  // is ANGLE's own device, so it is ordered before any draw that samples the
++  // picture.
+   hr = device_->StretchRect(surface.Get(), nullptr,
+                             picture_buffer->d3d_surface(), nullptr,
+                             D3DTEXF_NONE);
+@@ -1050,6 +1120,13 @@ bool DXVAVideoDecoder::OutputSample(Microsoft::WRL::ComPtr<IMFSample> sample) {
+                 "StretchRect (NV12 -> RGB)", hr);
+     return true;
+   }
++  // Venetium 0053: on the D3D11 bridge the copy ran on our own D3D9 device;
++  // finish it before ANGLE's D3D11 device can sample the shared texture.
++  if (angle_d3d11_device_ && !WaitForD3D9DeviceIdle(device_.Get())) {
++    NotifyError(DecoderStatus::Codes::kPlatformDecodeFailure,
++                "waiting for the NV12 -> RGB copy (D3D11 bridge)");
++    return true;
++  }
+ 
+   LONGLONG sample_time = 0;
+   sample->GetSampleTime(&sample_time);
+diff --git a/sandbox/win/src/process_mitigations.cc b/sandbox/win/src/process_mitigations.cc
+index dc70a7a..e4faa13 100644
+--- a/sandbox/win/src/process_mitigations.cc
++++ b/sandbox/win/src/process_mitigations.cc
+@@ -92,6 +92,33 @@ bool SetProcessMitigationPolicyInternal(PROCESS_MITIGATION_POLICY policy,
+   return true;
+ }
+ 
++// Venetium 0053: on Windows ARM32 the extension-point, font and image-load
++// policies are applied after startup instead of at creation (build 15035
++// refuses the creation-time attribute - Venetium 0029; the broker re-homes them
++// into the delayed set). Whether this OS accepts each of them post-startup is
++// not proven on the device, so a refusal must not kill the child the way
++// SetProcessMitigationPolicyInternal's PCHECK would: try, and report whether it
++// took (the caller records the flag only then). Every other platform keeps the
++// fatal path.
++bool ApplyRehomedPolicy(PROCESS_MITIGATION_POLICY policy,
++                        PVOID lpBuffer,
++                        SIZE_T dwLength) {
++#if defined(_M_ARM)
++  return ::SetProcessMitigationPolicy(policy, lpBuffer, dwLength) != FALSE;
++#else
++  return SetProcessMitigationPolicyInternal(policy, lpBuffer, dwLength);
++#endif
++}
++
++// What a refused ApplyRehomedPolicy() means to the caller: on ARM32, carry on
++// without that flag; elsewhere (fatal path) it never returns false.
++constexpr bool kRehomedRefusalIsFatal =
++#if defined(_M_ARM)
++    false;
++#else
++    true;
++#endif
++
+ bool ApplyProcessMitigationsToCurrentProcess(MitigationFlags starting_flags,
+                                              MitigationFlags flags,
+                                              MitigationFlags& applied_flags) {
+@@ -221,11 +248,12 @@ bool ApplyProcessMitigationsToCurrentProcess(MitigationFlags starting_flags,
+     PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY policy = {};
+     policy.DisableExtensionPoints = true;
+ 
+-    if (!SetProcessMitigationPolicyInternal(ProcessExtensionPointDisablePolicy,
+-                                            &policy, sizeof(policy))) {
++    if (ApplyRehomedPolicy(ProcessExtensionPointDisablePolicy, &policy,
++                           sizeof(policy))) {
++      applied_flags |= MITIGATION_EXTENSION_POINT_DISABLE;
++    } else if (kRehomedRefusalIsFatal) {
+       return false;
+     }
+-    applied_flags |= MITIGATION_EXTENSION_POINT_DISABLE;
+   }
+ 
+   // Enable dynamic code policies.
+@@ -249,11 +277,11 @@ bool ApplyProcessMitigationsToCurrentProcess(MitigationFlags starting_flags,
+     PROCESS_MITIGATION_FONT_DISABLE_POLICY policy = {};
+     policy.DisableNonSystemFonts = true;
+ 
+-    if (!SetProcessMitigationPolicyInternal(ProcessFontDisablePolicy, &policy,
+-                                            sizeof(policy))) {
++    if (ApplyRehomedPolicy(ProcessFontDisablePolicy, &policy, sizeof(policy))) {
++      applied_flags |= MITIGATION_NONSYSTEM_FONT_DISABLE;
++    } else if (kRehomedRefusalIsFatal) {
+       return false;
+     }
+-    applied_flags |= MITIGATION_NONSYSTEM_FONT_DISABLE;
+   }
+ 
+   if (version < base::win::Version::WIN10_TH2)
+@@ -290,13 +318,13 @@ bool ApplyProcessMitigationsToCurrentProcess(MitigationFlags starting_flags,
+       policy.PreferSystem32Images = true;
+     }
+ 
+-    if (!SetProcessMitigationPolicyInternal(ProcessImageLoadPolicy, &policy,
+-                                            sizeof(policy))) {
++    if (ApplyRehomedPolicy(ProcessImageLoadPolicy, &policy, sizeof(policy))) {
++      applied_flags |= (combined_flags & (MITIGATION_IMAGE_LOAD_NO_REMOTE |
++                                          MITIGATION_IMAGE_LOAD_NO_LOW_LABEL |
++                                          MITIGATION_IMAGE_LOAD_PREFER_SYS32));
++    } else if (kRehomedRefusalIsFatal) {
+       return false;
+     }
+-    applied_flags |= (combined_flags & (MITIGATION_IMAGE_LOAD_NO_REMOTE |
+-                                        MITIGATION_IMAGE_LOAD_NO_LOW_LABEL |
+-                                        MITIGATION_IMAGE_LOAD_PREFER_SYS32));
+   }
+ 
+   if (version < base::win::Version::WIN10_RS1)
+diff --git a/sandbox/win/src/resolver_arm.cc b/sandbox/win/src/resolver_arm.cc
+index c0ce01b..6b091af 100644
+--- a/sandbox/win/src/resolver_arm.cc
++++ b/sandbox/win/src/resolver_arm.cc
+@@ -37,10 +37,13 @@ struct InternalThunk {
+   // call that was patched.
+   //
+   // NOTE: the thunk is written either into a local buffer that is then copied
+-  // to the patched function (ServiceResolverThunk) or in place, in memory that
+-  // will execute (EatResolverThunk). Nothing here flushes the instruction
+-  // cache; if the device shows stale code, the flush belongs after the writes
+-  // of those two callers (see service_resolver_arm.cc and eat_resolver.cc).
++  // to the patched function (ServiceResolverThunk, which flushes the child's
++  // instruction cache after its writes - Venetium 0053) or in place, in memory
++  // that will execute (EatResolverThunk). The EAT case is not flushed: on ARM32
++  // its only user is the CreateThread interception, armed only in children
++  // that disconnect from CSRSS, which none do since Venetium 0030 dropped the
++  // win32k lockdown; the in-child flush would need NtFlushInstructionCache in
++  // NtExports if that ever changes.
+ 
+   InternalThunk() {
+     ldr_pc_pc0 = kLdrPcPc0;
+diff --git a/sandbox/win/src/sandbox_policy_base.cc b/sandbox/win/src/sandbox_policy_base.cc
+index 44ac929..0d53bbc 100644
+--- a/sandbox/win/src/sandbox_policy_base.cc
++++ b/sandbox/win/src/sandbox_policy_base.cc
+@@ -358,7 +358,21 @@ ResultCode ConfigBase::SetDelayedProcessMitigations(MitigationFlags flags) {
+ }
+ 
+ MitigationFlags ConfigBase::GetDelayedProcessMitigations() const {
++#if defined(_M_ARM)
++  // Venetium 0053: Windows 10 build 15035 on ARM32 refuses the creation-time
++  // mitigation attribute, so Venetium 0029 drops it and these never applied at
++  // launch. Have the child apply the ones that work after startup to itself
++  // instead, the same conversion AddAppContainerProfile() does for its
++  // CreateProcess bug. process_mitigations.cc applies them best-effort on ARM32
++  // (a refusal on this OS must not kill the child).
++  return delayed_mitigations_ |
++         (mitigations_ & (MITIGATION_EXTENSION_POINT_DISABLE |
++                          MITIGATION_NONSYSTEM_FONT_DISABLE |
++                          MITIGATION_IMAGE_LOAD_NO_REMOTE |
++                          MITIGATION_IMAGE_LOAD_NO_LOW_LABEL));
++#else
+   return delayed_mitigations_;
++#endif
+ }
+ 
+ void ConfigBase::AddRestrictingRandomSid() {
+@@ -723,6 +737,13 @@ ResultCode PolicyBase::InitProcess(HANDLE process_handle,
+     return ret;
+ 
+   MitigationFlags startup_mitigations = config()->GetProcessMitigations();
++#if defined(_M_ARM)
++  // Venetium 0053: on ARM32 nothing is applied at creation (Venetium 0029
++  // drops the attribute that would do it), so tell the child that. Otherwise
++  // LockDownSecurityMitigations() would take the mitigations re-homed into the
++  // delayed set (GetDelayedProcessMitigations) as already in force.
++  startup_mitigations = 0;
++#endif
+   static_assert(sizeof(g_shared_startup_mitigations) ==
+                 sizeof(startup_mitigations));
+   ret = target->TransferVariable(&startup_mitigations,
+diff --git a/sandbox/win/src/service_resolver_arm.cc b/sandbox/win/src/service_resolver_arm.cc
+index be48cb6..88b4391 100644
+--- a/sandbox/win/src/service_resolver_arm.cc
++++ b/sandbox/win/src/service_resolver_arm.cc
+@@ -206,10 +206,12 @@ NTSTATUS ServiceResolverThunk::PerformPatch(void* local_thunk,
+       return STATUS_UNSUCCESSFUL;
+   }
+ 
+-  // NOTE: no ::FlushInstructionCache(process_, ...) after the two writes above
+-  // (neither for remote_thunk nor for target_). WriteProcessMemory is expected
+-  // to do it for what it writes; if a device run shows stale code, this is
+-  // where the explicit calls go.
++  // Venetium 0053: ARMv7 instruction caches are not coherent with data writes.
++  // WriteProcessMemory happens to flush what it writes, but nothing guarantees
++  // that, so flush explicitly: both the copied original (called through
++  // g_originals) and the patched stub are executed by the child.
++  ::FlushInstructionCache(process_, remote_thunk, sizeof(ServiceFullThunk));
++  ::FlushInstructionCache(process_, target_, sizeof(local_service));
+ 
+   return STATUS_SUCCESS;
+ }
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.cpp b/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.cpp
+index 1a9c547..59638a8 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.cpp
+@@ -475,6 +475,11 @@ void ProgramExecutableD3D::reset()
+ 
+     mCachedPixelExecutableIndex.reset();
+     mCachedVertexExecutableIndex.reset();
++
++    // Venetium 0053: failures are per link (keyed by signature, not by HLSL).
++    mFailedVertexSignatures.clear();
++    mFailedPixelSignatures.clear();
++    mFailedGeometryHLSL.clear();
+ }
+ 
+ bool ProgramExecutableD3D::load(const gl::Context *context,
+@@ -1201,6 +1206,18 @@ angle::Result ProgramExecutableD3D::getVertexExecutableForCachedInputLayout(
+         return angle::Result::Continue;
+     }
+ 
++    // Venetium 0032/0053: this signature already failed to compile; return "no executable" without building its HLSL
++    // or recompiling.
++    for (const auto &failed : mFailedVertexSignatures)
++    {
++        if (failed.first == mCachedVertexSignature &&
++            failed.second == mImage2DBindLayoutCache[gl::ShaderType::Vertex])
++        {
++            *outExectuable = nullptr;
++            return angle::Result::Continue;
++        }
++    }
++
+     // Generate new dynamic layout with attribute conversions
+     std::string vertexHLSL = DynamicHLSL::GenerateVertexShaderForInputLayout(
+         renderer, mShaderHLSL[gl::ShaderType::Vertex], mCachedInputLayout,
+@@ -1210,13 +1227,6 @@ angle::Result ProgramExecutableD3D::getVertexExecutableForCachedInputLayout(
+         mImage2DUniforms[gl::ShaderType::Vertex], mImage2DBindLayoutCache[gl::ShaderType::Vertex],
+         static_cast<unsigned int>(mPixelShaderKey.size()));
+ 
+-    // Venetium 0032: this HLSL already failed to compile once; return "no executable" without recompiling.
+-    if (mFailedVertexHLSL.count(finalVertexHLSL) != 0)
+-    {
+-        *outExectuable = nullptr;
+-        return angle::Result::Continue;
+-    }
+-
+     // Generate new vertex executable
+     ShaderExecutableD3D *vertexExecutable = nullptr;
+ 
+@@ -1236,10 +1246,12 @@ angle::Result ProgramExecutableD3D::getVertexExecutableForCachedInputLayout(
+     }
+     else
+     {
+-        // Venetium 0032: remember this HLSL (ANGLE_TRY above already returned on a device-lost Stop, so this is a
+-        // deterministic compile failure), and log the source + message once so the next device run hands it back.
+-        bool firstTime = mFailedVertexHLSL.insert(finalVertexHLSL).second;
+-        if (!infoLog && firstTime)
++        // Venetium 0032: remember this signature (ANGLE_TRY above already returned on a device-lost Stop, so this is a
++        // deterministic compile failure), and log the source + message once so the next device run hands it back. It is
++        // the first failure for this signature: a repeat returns above (0053).
++        mFailedVertexSignatures.emplace_back(mCachedVertexSignature,
++                                             mImage2DBindLayoutCache[gl::ShaderType::Vertex]);
++        if (!infoLog)
+         {
+             ERR() << "Error compiling dynamic vertex executable (Venetium 0032: caching this signature, will not retry):"
+                   << std::endl
+@@ -1351,6 +1363,18 @@ angle::Result ProgramExecutableD3D::getPixelExecutableForCachedOutputLayout(
+         return angle::Result::Continue;
+     }
+ 
++    // Venetium 0032/0053: this signature already failed to compile; return "no executable" without building its HLSL
++    // or recompiling. This is the hot path on the device (every draw that needs one of the too-large Skia programs).
++    for (const auto &failed : mFailedPixelSignatures)
++    {
++        if (failed.first == mPixelShaderOutputLayoutCache &&
++            failed.second == mImage2DBindLayoutCache[gl::ShaderType::Fragment])
++        {
++            *outExecutable = nullptr;
++            return angle::Result::Continue;
++        }
++    }
++
+     std::string pixelHLSL = DynamicHLSL::GeneratePixelShaderForOutputSignature(
+         renderer, mShaderHLSL[gl::ShaderType::Fragment], mPixelShaderKey, mFragDepthUsage,
+         mUsesSampleMask, mPixelShaderOutputLayoutCache, mPixelShaderKey.size());
+@@ -1361,14 +1385,6 @@ angle::Result ProgramExecutableD3D::getPixelExecutableForCachedOutputLayout(
+         mImage2DBindLayoutCache[gl::ShaderType::Fragment],
+         static_cast<unsigned int>(mPixelShaderKey.size()));
+ 
+-    // Venetium 0032: this HLSL already failed to compile once; return "no executable" without recompiling. This is the hot
+-    // path on the device (every draw that needs one of the too-large Skia programs), so skipping the compile removes the stall.
+-    if (mFailedPixelHLSL.count(finalPixelHLSL) != 0)
+-    {
+-        *outExecutable = nullptr;
+-        return angle::Result::Continue;
+-    }
+-
+     // Generate new pixel executable
+     ShaderExecutableD3D *pixelExecutable = nullptr;
+ 
+@@ -1389,10 +1405,12 @@ angle::Result ProgramExecutableD3D::getPixelExecutableForCachedOutputLayout(
+     }
+     else
+     {
+-        // Venetium 0032: remember this HLSL (ANGLE_TRY above already returned on a device-lost Stop, so this is a
+-        // deterministic compile failure), and log the source + message once so the next device run hands it back.
+-        bool firstTime = mFailedPixelHLSL.insert(finalPixelHLSL).second;
+-        if (!infoLog && firstTime)
++        // Venetium 0032: remember this signature (ANGLE_TRY above already returned on a device-lost Stop, so this is a
++        // deterministic compile failure), and log the source + message once so the next device run hands it back. It is
++        // the first failure for this signature: a repeat returns above (0053).
++        mFailedPixelSignatures.emplace_back(mPixelShaderOutputLayoutCache,
++                                            mImage2DBindLayoutCache[gl::ShaderType::Fragment]);
++        if (!infoLog)
+         {
+             ERR() << "Error compiling dynamic pixel executable (Venetium 0032: caching this signature, will not retry):"
+                   << std::endl
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.h b/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.h
+index d06aa1f..f7f92e5 100644
+--- a/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.h
++++ b/third_party/angle/src/libANGLE/renderer/d3d/ProgramExecutableD3D.h
+@@ -11,6 +11,8 @@
+ 
+ #include <set>
+ #include <string>
++#include <utility>
++#include <vector>
+ 
+ #include "compiler/translator/hlsl/blocklayoutHLSL.h"
+ #include "libANGLE/ProgramExecutable.h"
+@@ -447,13 +449,17 @@ class ProgramExecutableD3D : public ProgramExecutableImpl
+     angle::PackedEnumMap<gl::PrimitiveMode, std::unique_ptr<ShaderExecutableD3D>>
+         mGeometryExecutables;
+ 
+-    // Venetium 0032: the exact generated HLSL of a dynamic executable whose compile returned no executable (a deterministic
+-    // compile failure, e.g. a Skia program that needs more arithmetic slots than ps_2_0 allows on the device's D3D9/SM2). A
+-    // repeat of the same HLSL returns "no executable" at once, skipping the (seconds-long, always-failing) recompile. Keyed by
+-    // the HLSL string, which is identical for repeats and distinct per signature. Device-lost errors (angle::Result::Stop) are
+-    // not recorded here.
+-    std::set<std::string> mFailedVertexHLSL;
+-    std::set<std::string> mFailedPixelHLSL;
++    // Venetium 0032: dynamic executables whose compile returned no executable (a deterministic compile failure, e.g. a
++    // Skia program that needs more arithmetic slots than ps_2_0 allows on the device's D3D9/SM2). A repeat returns "no
++    // executable" at once, skipping the (seconds-long, always-failing) recompile. Device-lost errors
++    // (angle::Result::Stop) are not recorded here.
++    // Venetium 0053: vertex and pixel failures are keyed by the same signatures the success caches match
++    // (mVertexExecutables / mPixelExecutables), and checked before any HLSL is generated, so a known failure no longer
++    // rebuilds two HLSL strings on every draw. Cleared in reset(): after a relink the same signature may compile.
++    // Geometry (D3D11 point-sprite emulation only) stays keyed by its HLSL.
++    std::vector<std::pair<D3DVertexExecutable::Signature, gl::ImageUnitTextureTypeMap>>
++        mFailedVertexSignatures;
++    std::vector<std::pair<std::vector<GLenum>, gl::ImageUnitTextureTypeMap>> mFailedPixelSignatures;
+     std::set<std::string> mFailedGeometryHLSL;
+ 
+     gl::ShaderMap<std::string> mShaderHLSL;
+diff --git a/third_party/cpuinfo/src/src/arm/windows/init.c b/third_party/cpuinfo/src/src/arm/windows/init.c
+index c53dc1d..fa28b13 100644
+--- a/third_party/cpuinfo/src/src/arm/windows/init.c
++++ b/third_party/cpuinfo/src/src/arm/windows/init.c
+@@ -223,6 +223,16 @@ static void set_cpuinfo_isa_fields(void) {
+ 	cpuinfo_isa.vfpv3 = true;
+ 	cpuinfo_isa.d32 = true;
+ 	cpuinfo_isa.neon = true;
++	/* Venetium 0053: beyond that baseline, an ARMv7 part with hardware integer divide is an ARMv7VE core
++	 * (Cortex-A7/A15/A12/A17, Qualcomm Krait - Tegra 4 and the Lumia SoCs), and all of those have VFPv4: fused
++	 * multiply-add and half-precision conversion. Cortex-A9 (Tegra 3) has neither and stays on the baseline. Windows
++	 * reports divide directly; FMA is inferred from it rather than from PF_ARM_FMAC_INSTRUCTIONS_AVAILABLE, whose
++	 * documented meaning is ambiguous (VFPv2 FMAC is not fused), so XNNPACK/ruy only pick their NEON-FMA kernels
++	 * where VFMA really exists. */
++	const bool armv7ve = IsProcessorFeaturePresent(PF_ARM_DIVIDE_INSTRUCTION_AVAILABLE) != 0;
++	cpuinfo_isa.idiv = armv7ve;
++	cpuinfo_isa.fma = armv7ve;
++	cpuinfo_isa.fp16 = armv7ve;
+ #else
+ 	cpuinfo_isa.atomics = IsProcessorFeaturePresent(PF_ARM_V81_ATOMIC_INSTRUCTIONS_AVAILABLE) != 0;
+ 
+diff --git a/third_party/crashpad/crashpad/util/misc/capture_context_win_arm.asm b/third_party/crashpad/crashpad/util/misc/capture_context_win_arm.asm
+index 9ce5fa6..9cb8211 100644
+--- a/third_party/crashpad/crashpad/util/misc/capture_context_win_arm.asm
++++ b/third_party/crashpad/crashpad/util/misc/capture_context_win_arm.asm
+@@ -41,6 +41,11 @@ CONTEXT_SP   EQU 0x038  ; Stack Pointer (r13)
+ CONTEXT_LR   EQU 0x03c  ; Link Register (r14)
+ CONTEXT_PC   EQU 0x040  ; Program Counter (r15)
+ CONTEXT_CPSR EQU 0x044  ; Current Program Status Register
++CONTEXT_FPSCR EQU 0x048 ; Floating-point status and control register
++CONTEXT_D    EQU 0x050  ; D0-D31 (NEON128 Q[16] / ULONGLONG D[32])
++
++; Thumb state bit of CPSR. MRS in user mode returns the APSR view, where the execution-state bits read as zero.
++CPSR_T       EQU 0x20
+ 
+ 
+ |?CaptureContext@crashpad@@YAXPAU_CONTEXT@@@Z| PROC
+@@ -66,6 +71,15 @@ CONTEXT_CPSR EQU 0x044  ; Current Program Status Register
+   str  r11, [r0, #CONTEXT_R11]
+   str  r12, [r0, #CONTEXT_R12]
+ 
++  ; --- Save Processor State ---
++  ; Read the status register first: nothing below sets the condition flags (all 32-bit encodings without S), but
++  ; reading it before any scratch arithmetic keeps that true by construction.
++  ; Venetium 0053: user-mode MRS returns the APSR view, whose T (Thumb state) bit reads as zero. All Windows ARM32
++  ; code is Thumb-2, so set it: a CONTEXT with T clear tells debuggers and stack walkers the code is in ARM state.
++  mrs  r1, cpsr
++  orr  r1, r1, #CPSR_T
++  str  r1, [r0, #CONTEXT_CPSR] ; Save CPSR to context->Cpsr
++
+   ; --- Save Control Registers ---
+   ; The Link Register (lr/r14) and Stack Pointer (sp/r13) must also be saved.
+   ; We use r1 as a scratch register to hold the value of SP.
+@@ -75,29 +89,34 @@ CONTEXT_CPSR EQU 0x044  ; Current Program Status Register
+ 
+   ; Save the "program counter". From the perspective of the captured context,
+   ; the PC is the return address of this function, which is in the Link Register.
+-  str  lr, [r0, #CONTEXT_PC]   ; Save current LR to context->Pc
++  ; Venetium 0053: LR holds a Thumb return address (bit 0 set). A CONTEXT's Pc is the instruction address itself,
++  ; with the instruction set given by CPSR.T, as Windows' own exception contexts store it - clear bit 0.
++  bic  r1, lr, #1
++  str  r1, [r0, #CONTEXT_PC]   ; Save the return address to context->Pc
+ 
+-  ; --- Save Processor State and Set ContextFlags ---
+-  ; Get the Current Program Status Register (CPSR), which contains the NZCV flags.
+-  mrs  r1, cpsr
+-  str  r1, [r0, #CONTEXT_CPSR] ; Save CPSR to context->Cpsr
++  ; --- Save Floating-Point State ---
++  ; Venetium 0053 (was a TODO, crashpad.chromium.org/bug/300): the Windows ARM32 ABI guarantees VFPv3-D32 + NEON,
++  ; so D0-D31 all exist. Save them and FPSCR, and report CONTEXT_FLOATING_POINT.
++  add  r1, r0, #CONTEXT_D
++  vstm r1!, {d0-d15}
++  vstm r1, {d16-d31}
++  vmrs r2, fpscr
++  str  r2, [r0, #CONTEXT_FPSCR]
+ 
+   ; Set the ContextFlags field. The value is a combination of:
+-  ; CONTEXT_ARM     (0x200000)
+-  ; CONTEXT_CONTROL (0x000001)
+-  ; CONTEXT_INTEGER (0x000002)
+-  ; Total = 0x200003
+-  ldr  r1, =0x200003
++  ; CONTEXT_ARM            (0x200000)
++  ; CONTEXT_CONTROL        (0x000001)
++  ; CONTEXT_INTEGER        (0x000002)
++  ; CONTEXT_FLOATING_POINT (0x000004)
++  ; Total = 0x200007
++  ldr  r1, =0x200007
+   str  r1, [r0, #0]            ; Store flags at the start of the CONTEXT struct.
+ 
+   ; --- Cleanup and Return ---
+-  ; Restore r1, which we used as a scratch register. This is good practice,
+-  ; even though r1 is a caller-saved register.
++  ; Restore r1 and r2, which we used as scratch registers. This is good practice,
++  ; even though both are caller-saved registers.
+   ldr  r1, [r0, #CONTEXT_R1]
+-
+-  ; TODO(https://crashpad.chromium.org/bug/300): save floating-point registers
+-  ; (VFP/NEON). This would involve checking CONTEXT_FLOATING_POINT and storing
+-  ; the D registers and FPSCR.
++  ldr  r2, [r0, #CONTEXT_R2]
+ 
+   ; Return to the caller.
+   bx   lr
+diff --git a/ui/gl/gl_features.cc b/ui/gl/gl_features.cc
+index eacf78f..0ce98f5 100644
+--- a/ui/gl/gl_features.cc
++++ b/ui/gl/gl_features.cc
+@@ -404,13 +404,13 @@ bool VenetiumArm32PrefersD3D11() {
+         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
+         D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3};
+     D3D_FEATURE_LEVEL got = D3D_FEATURE_LEVEL_9_1;
+-    ID3D11Device* device = nullptr;
++    // Venetium 0053: no device out-pointer - D3D11CreateDevice then only
++    // reports the highest feature level it would create (S_FALSE), without
++    // creating the device and immediate context just to read it.
+     HRESULT hr = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels,
+                         sizeof(levels) / sizeof(levels[0]), D3D11_SDK_VERSION,
+-                        &device, &got, nullptr);
+-    if (device) {
+-      device->Release();
+-    }
++                        /*ppDevice=*/nullptr, &got,
++                        /*ppImmediateContext=*/nullptr);
+     ::FreeLibrary(d3d11);
+     return SUCCEEDED(hr) && got >= D3D_FEATURE_LEVEL_9_3;
+   }();

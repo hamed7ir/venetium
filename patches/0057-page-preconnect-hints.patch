@@ -1,0 +1,169 @@
+Venetium 0057 - honour the page's own preconnect / dns-prefetch hints while "Preload pages" stays off.
+From the performance research (C:\handoff\PERF-RESEARCH.md, item N1), his "fix all".
+0005 makes "Preload pages" off the default (NetworkPredictionOptions::kDisabled). Besides stopping predictive
+preconnects, that made the PreconnectManager refuse every request, including the hints a page asks for itself:
+<link rel=preconnect>, <link rel=dns-prefetch> and Link: headers reach chrome/browser/predictors/
+network_hints_handler_impl.cc and were silently dropped (preconnect_manager_impl.cc returns early on every entry point).
+Those hints only reach origins the page is about to load from anyway, so with preloading off the handler now serves
+them straight from the frame's network context (PreconnectSockets / a speculative, idle-priority ResolveHost), the way
+Android WebView and content_shell do (components/network_hints/browser/simple_network_hints_handler_impl.cc), with the
+pending NetworkAnonymizationKey and the frame's network restrictions. Predictive preconnects (omnibox, search engine,
+history, hover) still go through the PreconnectManager and stay off; off-the-record profiles still get no hints;
+with "Preload pages" turned on everything goes the stock way. web.dev puts a preconnect to a critical third-party
+origin at 100-500 ms saved.
+
+diff --git a/chrome/browser/predictors/network_hints_handler_impl.cc b/chrome/browser/predictors/network_hints_handler_impl.cc
+index 4baec27..71e2ae7 100644
+--- a/chrome/browser/predictors/network_hints_handler_impl.cc
++++ b/chrome/browser/predictors/network_hints_handler_impl.cc
+@@ -6,16 +6,24 @@
+ 
+ #include <optional>
+ 
++#include "base/functional/bind.h"
+ #include "base/memory/ptr_util.h"
+ #include "chrome/browser/predictors/loading_predictor.h"
++#include "chrome/browser/predictors/loading_predictor_config.h"
+ #include "chrome/browser/predictors/loading_predictor_factory.h"
+ #include "chrome/browser/predictors/predictors_traffic_annotations.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "content/public/browser/preconnect_manager.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/render_process_host.h"
++#include "content/public/browser/storage_partition.h"
++#include "mojo/public/cpp/bindings/receiver.h"
+ #include "mojo/public/cpp/bindings/self_owned_receiver.h"
+ #include "net/base/isolation_info.h"
++#include "net/base/request_priority.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resolve_host_client_base.h"
++#include "services/network/public/mojom/network_context.mojom.h"
+ 
+ namespace predictors {
+ 
+@@ -32,6 +40,65 @@ net::NetworkAnonymizationKey GetPendingNetworkAnonymizationKey(
+       .network_anonymization_key();
+ }
+ 
++// Venetium 0057: with "Preload pages" off (Venetium's default, 0005) the
++// PreconnectManager refuses every request, including the hints a page asks
++// for itself with <link rel=preconnect>, <link rel=dns-prefetch> and Link:
++// headers. Those only reach origins the page is about to load from anyway, so
++// serve them straight from the frame's network context, the way Android
++// WebView and content_shell do (components/network_hints/browser/
++// simple_network_hints_handler_impl.cc). Predictive preconnects (omnibox,
++// search engine, history, hover) still go through the PreconnectManager and
++// stay off. Off-the-record profiles keep getting no hints, as before.
++bool ServePageHintsDirectly(content::RenderFrameHost* render_frame_host) {
++  Profile* profile =
++      Profile::FromBrowserContext(render_frame_host->GetBrowserContext());
++  return profile && !profile->IsOffTheRecord() && !IsPreconnectAllowed(profile);
++}
++
++// Deletes itself when the resolve completes or the pipe closes.
++class PageHintDnsLookup : public network::ResolveHostClientBase {
++ public:
++  PageHintDnsLookup(const PageHintDnsLookup&) = delete;
++  PageHintDnsLookup& operator=(const PageHintDnsLookup&) = delete;
++
++  static void Start(content::RenderFrameHost* render_frame_host,
++                    const url::SchemeHostPort& url) {
++    auto* lookup = new PageHintDnsLookup();
++    network::mojom::ResolveHostParametersPtr parameters =
++        network::mojom::ResolveHostParameters::New();
++    parameters->initial_priority = net::RequestPriority::IDLE;
++    parameters->is_speculative = true;
++    parameters->network_restrictions_id =
++        render_frame_host->GetNetworkRestrictionsID();
++    render_frame_host->GetProcess()
++        ->GetStoragePartition()
++        ->GetNetworkContext()
++        ->ResolveHost(network::mojom::HostResolverHost::NewSchemeHostPort(url),
++                      GetPendingNetworkAnonymizationKey(render_frame_host),
++                      std::move(parameters),
++                      lookup->receiver_.BindNewPipeAndPassRemote());
++    lookup->receiver_.set_disconnect_handler(
++        base::BindOnce(&PageHintDnsLookup::Done, base::Unretained(lookup)));
++  }
++
++ private:
++  PageHintDnsLookup() = default;
++  ~PageHintDnsLookup() override = default;
++
++  // network::mojom::ResolveHostClient:
++  void OnComplete(
++      int result,
++      const net::ResolveErrorInfo& resolve_error_info,
++      const net::AddressList& resolved_addresses,
++      const net::HostResolverEndpointResults& alternative_endpoints) override {
++    Done();
++  }
++
++  void Done() { delete this; }
++
++  mojo::Receiver<network::mojom::ResolveHostClient> receiver_{this};
++};
++
+ }  // namespace
+ 
+ NetworkHintsHandlerImpl::~NetworkHintsHandlerImpl() = default;
+@@ -47,14 +114,21 @@ void NetworkHintsHandlerImpl::Create(
+ 
+ void NetworkHintsHandlerImpl::PrefetchDNS(
+     const std::vector<url::SchemeHostPort>& urls) {
+-  if (!preconnect_manager_)
+-    return;
+-
+   content::RenderFrameHost* render_frame_host =
+       content::RenderFrameHost::FromID(render_process_id_, render_frame_id_);
+   if (!render_frame_host)
+     return;
+ 
++  if (ServePageHintsDirectly(render_frame_host)) {
++    for (const auto& url : urls) {
++      PageHintDnsLookup::Start(render_frame_host, url);
++    }
++    return;
++  }
++
++  if (!preconnect_manager_)
++    return;
++
+   std::vector<GURL> gurls;
+   for (const auto& url : urls) {
+     gurls.emplace_back(url.GetURL());
+@@ -69,9 +143,6 @@ void NetworkHintsHandlerImpl::PrefetchDNS(
+ 
+ void NetworkHintsHandlerImpl::Preconnect(const url::SchemeHostPort& url,
+                                          bool allow_credentials) {
+-  if (!preconnect_manager_)
+-    return;
+-
+   if (url.scheme() != url::kHttpScheme && url.scheme() != url::kHttpsScheme) {
+     return;
+   }
+@@ -84,6 +155,24 @@ void NetworkHintsHandlerImpl::Preconnect(const url::SchemeHostPort& url,
+   if (!render_frame_host)
+     return;
+ 
++  if (ServePageHintsDirectly(render_frame_host)) {
++    render_frame_host->GetStoragePartition()
++        ->GetNetworkContext()
++        ->PreconnectSockets(
++            /*num_streams=*/1, url.GetURL(),
++            allow_credentials ? network::mojom::CredentialsMode::kInclude
++                              : network::mojom::CredentialsMode::kOmit,
++            GetPendingNetworkAnonymizationKey(render_frame_host),
++            render_frame_host->GetNetworkRestrictionsID(),
++            net::MutableNetworkTrafficAnnotationTag(
++                kNetworkHintsTrafficAnnotation),
++            /*keepalive_config=*/std::nullopt, mojo::NullRemote());
++    return;
++  }
++
++  if (!preconnect_manager_)
++    return;
++
+   std::optional<base::UnguessableToken> network_restrictions_id =
+       render_frame_host->GetNetworkRestrictionsID();
+   preconnect_manager_->StartPreconnectUrl(

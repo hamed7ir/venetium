@@ -1,0 +1,14 @@
+--- a/gpu/config/software_rendering_list.json
++++ b/gpu/config/software_rendering_list.json
+@@ -880,6 +880,11 @@
+         {
+           "comment": "Venetium 0039/0049: GPU rasterization for ARM32 devices that render through ANGLE's D3D9 backend. Skia Ganesh supports it (GrGLANGLEBackend::kD3D9) and Chromium 77 rasterized on the GPU here by default; crbug 1047002/1462800 blocklisted it for Windows GPUs below ps_5.0 + Direct3D11, which dropped every ANGLE-D3D9 (ps_2.0) ARM32 device. Correctness is the same across these SM2/ps2.0 D3D9 GPUs - Tegra 3 (Surface RT, device 0x35303130), Tegra 4 (Surface 2, 0x35303230): identical PS20Caps 0x19, 512 slots, ps_2_a; Adreno (Lumia) on D3D9; and any other ARM32 ANGLE-D3D9 device. 0039 first scoped this to the Tegra 4 device id; 0049 (his decision 2026-10-11) drops the vendor/device restriction so it matches the renderer, enabling Tegra 3 and other ARM32 devices too. --disable-gpu-rasterization still overrides. x86 is effectively unaffected: modern x86 uses the ps_5.0 + Direct3D11 exceptions above, and ANGLE-D3D9 there is legacy/rare (software WARP/SwiftShader report their own renderer strings, not Direct3D9). Adreno on the D3D11 FL9_3 path (Venetium 0045) is a separate case handled with the Lumia GPU test.",
+           "gl_renderer": ".*Direct3D9.*"
++        },
++        {
++          "comment": "Venetium 0051: Qualcomm Adreno 330 (Lumia 1520 / 640 XL) on Windows ARM32 renders through ANGLE's Direct3D11 backend at feature level 9_3 (Venetium 0045) - its D3D9 driver paints garbage, so D3D11 is the good path. d3dprobe (community report 2026-10-11): DXGI vendor 0x4D4F4351 ('QCOM'), device 0x46363432, D3D11 max FL 9_3, ps_4_0_level_9_3 accepted, NV12 vp in/out. Skia Ganesh rasters on its D3D11 backend here. Scoped to this Adreno device id: the 0x4d4f4351 exceptions above require driver >= 31.0.2.0, which this ~2014 Adreno driver predates; and x86 has no such GPU. The D3D11 FL9_3 render path itself is 0045 - this entry just lets it GPU-rasterize once it is up.",
++          "vendor_id": "0x4d4f4351",
++          "device_id": [ "0x46363432" ]
+         }
+       ]
+     },

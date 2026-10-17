@@ -1,0 +1,20 @@
+Venetium's built-in ad and tracker blocker list (venetium_filters\filters.dat)
+
+filters.dat is built from these two filter lists, unmodified, by Chromium's ruleset_converter
+(components/subresource_filter/tools), which keeps their network-request rules:
+
+  EasyList     https://easylist.to/easylist/easylist.txt
+  EasyPrivacy  https://easylist.to/easylist/easyprivacy.txt
+
+The list versions are in version.txt next to this file.
+
+EasyList and EasyPrivacy are written by The EasyList authors (https://easylist.to/).
+They are dual licensed under the GNU General Public License, version 3 or later
+(https://www.gnu.org/licenses/gpl-3.0.html), and the Creative Commons Attribution-ShareAlike 3.0
+Unported licence or later (https://creativecommons.org/licenses/by-sa/3.0/). Venetium distributes
+them under the GNU GPL v3, the licence of Venetium's own patches.
+
+To report a site the lists break, or an ad they miss, use https://easylist.to/ (forums and GitHub
+issue tracker). In Venetium, "Always allow ads on this site" in the blocked-ads bubble, or the
+site's "Ads" setting, turns the blocker off for that site; "Any site you visit can show any ad" in
+chrome://settings/content/ads, or --disable-features=SubresourceFilter, turns it off everywhere.

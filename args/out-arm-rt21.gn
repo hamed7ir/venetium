@@ -11,7 +11,7 @@ dcheck_always_on = false
 is_component_build = false
 symbol_level = 1                 # line tables in the PDBs for crash stacks; the PDBs are not shipped
 generate_about_credits = true    # chrome://credits carries Supermium's credit
-# is_official_build stays at its default (false): an official build is a later decision.
+# is_official_build = true comes from venetium.gn (v1.2).
 
 # --- toolchain: rt2.1 and rustc-rt2.1 (the sysroot has the thumbv7a-pc-windows-msvc std since RUSTC-2, 21 rlibs) ---
 clang_base_path = "F:/cr/rt21-cr"   # fixed rt2.1 (BATCH-RT21-FIX-1: clang-cl d572c493… lld-link 6e203038… llvm-lib 9e197c48…); clean clang_rt.builtins-arm.lib 6be30eaa… (no __rt_* shim — B5/LLVM 0015)
@@ -24,7 +24,10 @@ rust_bindgen_root = "F:/cr/bindgen-rt"   # host tool (x64)
 
 # --- carried from the x86 control because they concern the toolchain, not the product ---
 use_thin_lto = false
-chrome_pgo_phase = 0
+chrome_pgo_phase = 0   # no ARM32 profile exists (Chrome's win32 one is x86 code with different MSVC mangling)
+# v1.2: V8 builtins PGO with the x86 profile V8 ships for x86 and ARM (v8/BUILD.gn); the mksnapshot step warns, not
+# aborts, on a builtin whose graph does not match (Venetium 0058).
+v8_enable_builtins_optimization = true
 clang_use_chrome_plugins = false   # rt2.x has no Chromium clang plugins
 use_siso = false                   # we drive ninja
 enable_precompiled_headers = false # V8SIM-2 §4 / TOOLCHAIN-ISSUES P1
@@ -59,6 +62,12 @@ enable_jxl_decoder = false
 # D13 (his decision, 2026-10-02: "video and audio should be on"): proprietary codecs (H.264, AAC, ...) in every Venetium build.
 proprietary_codecs = true
 ffmpeg_branding = "Chrome"
-# D15 (his decision, 2026-10-02: "official build, I agree with you"): stay non-official (no ThinLTO/PGO), but use the real
-# build/util/LASTCHANGE (Chromium's revision and year, venetium\deps\release-inputs.tsv) instead of LASTCHANGE.dummy.
+# D15 (his decision, 2026-10-02: "official build, I agree with you"): use the real build/util/LASTCHANGE (Chromium's
+# revision and year, venetium\deps\release-inputs.tsv) instead of LASTCHANGE.dummy.
 use_dummy_lastchange = false
+# v1.2 (his decision, 2026-10-15): an official build (chrome://version no longer says "Developer Build"). It defines
+# OFFICIAL_BUILD: compact CHECKs, zero instead of pattern stack-variable init, no PartitionAlloc per-allocation thread-cache
+# statistics, report-only (not crashing) DUMP_WILL_BE_CHECKs, V8 logging level 0, Rust codegen-units=1. Each output
+# directory keeps its explicit use_thin_lto / chrome_pgo_phase / symbol_level / dcheck_always_on lines, which official
+# would otherwise default to ThinLTO on, PGO on and full symbols.
+is_official_build = true
