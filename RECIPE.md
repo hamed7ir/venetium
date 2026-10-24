@@ -23,7 +23,10 @@ toolchain. everything else is normal chromium plus my patches.
   llvm, or the rust objects get the same arm32 miscompiles. so build rustc from source against llvm-rt2.1, build a
   `thumbv7a-pc-windows-msvc` std for it, and point `rust_sysroot_absolute` at that sysroot. build bindgen the same
   way (it is an x64 host tool) and point `rust_bindgen_root` at it.
+  
 https://github.com/hamed7ir/llvm-rt1/releases/tag/rt2.1-23.1.1
+
+
 **visual studio 2022 build tools** - the msvc headers and libs, the windows sdk, and `csc` (used by the installer).
 you also need the **ATL** and **ARM ATL** components (`base/win/atl_throw.cc` needs `atldef.h`, and the arm build
 needs the arm atl libs), and the arm32 sdk libs (i build with the 10.0.19041 arm libs and the 10.0.26100 headers).
