@@ -67,6 +67,9 @@ try {
     Check '--check writes a report' ((Test-Path $rep) -and $code -in 0, 2, 3) "exit $code"
 
     # 2. silent install to scratch
+    # (a real install on this machine may already have a desktop Venetium.lnk: --no-desktop must leave it as it was)
+    $desk = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'Venetium.lnk'
+    $deskBefore = if (Test-Path $desk) { (Get-FileHash $desk).Hash + '|' + (Get-Item $desk).LastWriteTimeUtc.Ticks } else { $null }
     $code = RunSetup @('--silent', "`"$dir`"", '--no-desktop')
     Check '--silent install exit 0' ($code -eq 0) "exit $code"
     foreach ($f in 'venetium.exe', 'chrome.dll', 'libGLESv2.dll', 'resources.pak', 'uninstall.exe', 'locales\en-US.pak') {
@@ -83,7 +86,8 @@ try {
     Check 'uninstall entry written (location + version)' ($k -and $k.InstallLocation -eq $dir -and $k.DisplayVersion -eq $version) ("" + $k.DisplayVersion + " " + $k.InstallLocation)
     $sh = New-Object -ComObject WScript.Shell
     Check 'start menu shortcut -> installed exe' ((Test-Path $lnk) -and $sh.CreateShortcut($lnk).TargetPath -eq (Join-Path $dir 'venetium.exe'))
-    Check 'no desktop shortcut with --no-desktop' (-not (Test-Path (Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'Venetium.lnk')))
+    $deskAfter = if (Test-Path $desk) { (Get-FileHash $desk).Hash + '|' + (Get-Item $desk).LastWriteTimeUtc.Ticks } else { $null }
+    Check 'no desktop shortcut with --no-desktop' ($deskAfter -eq $deskBefore) $(if ($deskBefore) { 'pre-existing shortcut unchanged' })
 
     # 3. a running venetium.exe from the folder blocks upgrade + uninstall (exit 4), and is never killed
     & $csc /nologo "/out:$Work\venetium.exe" "$here\Sleeper.cs" | Out-Null

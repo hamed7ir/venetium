@@ -1,0 +1,15 @@
+--- a/llvm/lib/Transforms/Instrumentation/CGProfile.cpp
++++ b/llvm/lib/Transforms/Instrumentation/CGProfile.cpp
+@@ -53,7 +53,11 @@
+                           Function *CalledF, uint64_t NewCount) {
+     if (NewCount == 0)
+       return;
+-    if (!CalledF || !TTI.isLoweredToCall(CalledF) ||
++    // rt2.1: never record an edge to an intrinsic. ARM's TTI reports math
++    // intrinsics (exp2, pow, sin, ...) as lowered to calls, so their
++    // declarations reached the CG profile and .cg_profile named them; on COFF
++    // that is an undefined symbol such as llvm.exp2.f64 at link time.
++    if (!CalledF || CalledF->isIntrinsic() || !TTI.isLoweredToCall(CalledF) ||
+         CalledF->hasDLLImportStorageClass())
+       return;
+     uint64_t &Count = Counts[std::make_pair(F, CalledF)];

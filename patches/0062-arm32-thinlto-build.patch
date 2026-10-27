@@ -1,0 +1,126 @@
+Venetium 0062 - the build edits for the Windows ARM32 PGO + ThinLTO build (v1.3, args/out-arm-pgo.gn).
+Three build files; nothing changes for a non-LTO build (out-arm-rt21, out-x86-rt21 build exactly as before).
+A. build/config/compiler/BUILD.gn - new arg win_thin_lto_jobs (default "all" = upstream's /opt:lldltojobs=all). The ARM32
+   PGO build sets "8": all of chrome.dll's code generation runs inside its one lld-link, and one thread per hardware
+   thread oversubscribes a shared-vCPU build box.
+B. build/config/compiler/BUILD.gn, thinlto_optimize_default - lto_opt_level 2 instead of 0 for Windows ARM32 targets
+   (libGLESv2/libEGL, chrome_elf, ...). ThinLTO's compile step leaves the loop and SLP vectorizers and late unrolling
+   to the link, so level 0 would make those binaries slower on the Tegra than the non-LTO -O2 build. chrome.dll already
+   uses thinlto_optimize_max (2).
+C. build/toolchain/win/toolchain.gni, alink - for current_cpu == "arm" with use_lld && use_thin_lto, static libraries
+   are made with `llvm-ar rcsT --format=gnu` (a thin GNU archive, what llvm-lib writes for thin archives) instead of
+   `lld-link /lib`. llvm-lib cannot archive Windows ARM32 bitcode: LibDriver's getBitcodeFileMachine maps Triple::arm
+   but not Triple::thumb ("unknown arch in target triple: thumbv7-unknown-windows-msvc"); still so in LLVM main. lld-link
+   itself reads the archives fine. The proper fix is one line in llvm-lib (toolchain/rt21-lto/README.md, 0023).
+D. build/win/BUILD.gn - 0061's word-at-a-time string routines stay native code (config venetium_string_arm_no_lto:
+   -fno-lto -fno-whole-program-vtables -fno-split-lto-unit). Their -fno-vectorize / -fno-slp-vectorize are compile-time
+   pipeline options the LTO backend never sees, and LTO could import and inline the bodies into callers, where the
+   in-word read past the NUL becomes visible to the optimizer; the native object is the device-verified code. It has to
+   be a config: a target's own cflags come before the compiler config's -flto=thin, and the last one wins.
+The linker needs three lld fixes for Windows ARM32 ThinLTO (toolchain/rt21-lto); the profile is pgo/.
+
+--- a/build/config/compiler/BUILD.gn
++++ b/build/config/compiler/BUILD.gn
+@@ -130,6 +130,11 @@
+   # See: https://clang.llvm.org/docs/ThinLTO.html#incremental
+   # The cache can lead to non-determinism: https://crbug.com/1486045
+   thin_lto_enable_cache = true
++
++  # Venetium: ThinLTO backend jobs per lld-link invocation on Windows
++  # (/opt:lldltojobs=). Upstream hard-codes "all" (one per hardware thread);
++  # set a number where hardware threads outnumber real cores or RAM is tight.
++  win_thin_lto_jobs = "all"
+ 
+   # Initialize all local variables with a pattern. This flag will fill
+   # uninitialized floating-point types (and 32-bit pointers) with 0xFF and the
+@@ -806,7 +811,7 @@
+ 
+     if (is_win) {
+       ldflags += [
+-        "/opt:lldltojobs=all",
++        "/opt:lldltojobs=$win_thin_lto_jobs",
+         "-mllvm:-import-instr-limit=$import_instr_limit",
+         "-mllvm:-disable-auto-upgrade-debug-info",
+       ]
+@@ -1261,6 +1266,14 @@
+ config("thinlto_optimize_default") {
+   if (!is_debug && use_thin_lto && is_a_target_toolchain) {
+     lto_opt_level = 0
++
++    # Venetium: every shipped Windows ARM32 binary (ANGLE's libGLESv2/libEGL,
++    # chrome_elf, ...) gets the full post-link optimization. The ThinLTO
++    # compile step leaves out the loop/SLP vectorizers and late unrolling, so
++    # level 0 would make them slower than the non-LTO -O2 build on the Tegra.
++    if (is_win && current_cpu == "arm" && thin_lto_enable_optimizations) {
++      lto_opt_level = 2
++    }
+ 
+     if (is_win) {
+       ldflags = [ "/opt:lldlto=" + lto_opt_level ]
+--- a/build/toolchain/win/toolchain.gni
++++ b/build/toolchain/win/toolchain.gni
+@@ -594,7 +594,21 @@
+ 
+     tool("alink") {
+       rspfile = "{{output}}.rsp"
+-      command = "$linker_wrapper$lib \"/OUT:{{output}}\" /nologo {{arflags}} \"@$rspfile\""
++      if (use_lld && use_thin_lto && toolchain_args.current_cpu == "arm") {
++        # Venetium: lld-link /lib (llvm-lib) cannot archive Windows ARM32 LTO
++        # bitcode: its getBitcodeFileMachine() maps Triple::arm but not
++        # Triple::thumb, and Windows-on-ARM triples are always thumbv7-*
++        # ("unknown arch in target triple: thumbv7-unknown-windows-msvc").
++        # llvm-ar (the same rt2.1 binary in ar mode) writes the same archive
++        # llvm-lib writes for /llvmlibthin (thin, GNU format, deterministic)
++        # without that check; lld-link maps thumb bitcode to ARMNT itself.
++        # ar updates an existing archive in place, so delete it first.
++        not_needed([ "lib" ])
++        _llvm_ar = string_replace("${_clang_bin_path}/llvm-ar${_exe}", "/", "\\")
++        command = "cmd /s /c \"\"$python_path\" $_tool_wrapper_path delete-file {{output}} && $_llvm_ar rcsT --format=gnu {{output}} @$rspfile\""
++      } else {
++        command = "$linker_wrapper$lib \"/OUT:{{output}}\" /nologo {{arflags}} \"@$rspfile\""
++      }
+       description = "LIB {{output}}"
+       outputs = [
+         # Ignore {{output_extension}} and always use .lib, there's no reason to
+--- a/build/win/BUILD.gn
++++ b/build/win/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//build/config/clang/clang.gni")
++import("//build/config/compiler/compiler.gni")
+ import("//build/config/sanitizers/sanitizers.gni")
+ import("//build/config/win/manifest.gni")
+ 
+@@ -21,6 +22,23 @@
+          "Windows cross-builds from Mac must be 64-bit.")
+ 
+   if (current_cpu == "arm") {
++    # Venetium: keep 0061 out of ThinLTO. Its -fno-vectorize/-fno-slp-vectorize
++    # are compile-time pipeline options that the LTO backend never sees, and
++    # LTO could import and inline the word-at-a-time bodies into callers, where
++    # the in-word read past the NUL becomes visible to the optimizer. A native
++    # object keeps the device-verified code. A config, so these flags come
++    # after the compiler config's -flto=thin (a target's own cflags come
++    # first); -fwhole-program-vtables is rejected without LTO.
++    config("venetium_string_arm_no_lto") {
++      if (use_thin_lto) {
++        cflags = [
++          "-fno-lto",
++          "-fno-whole-program-vtables",
++          "-fno-split-lto-unit",
++        ]
++      }
++    }
++
+     # Venetium 0061: replaces the static CRT's byte-at-a-time ARM32 memchr,
+     # memcmp, strchr, strcmp and strlen (see the source). A source_set, so its
+     # object is linked directly into each binary and wins over the CRT
+@@ -34,6 +52,7 @@
+         "/clang:-fno-vectorize",
+         "/clang:-fno-slp-vectorize",
+       ]
++      configs += [ ":venetium_string_arm_no_lto" ]
+     }
+   }
+ 

@@ -44,7 +44,7 @@ tarball and apply the .222 -> .226 delta. confirm you are on it: `chrome/VERSION
 
 ## apply the patches
 
-apply `patches/0001` through `patches/0061` in order. they are plain `git apply` patches. apply them with
+apply `patches/0001` through `patches/0062` in order. they are plain `git apply` patches. apply them with
 `core.autocrlf=false` so the files stay byte-for-byte - arm32 is sensitive and i hash every file. the missing
 numbers (0009, 0024, 0031, 0034, 0038) are patches i dropped or replaced along the way; the old versions are kept
 under `patches/superseded/` for history, you do not apply those.
@@ -66,8 +66,14 @@ make your output directory with `args/out-arm-rt21.gn` as its `args.gn` (that fi
 - `is_official_build = true` (in `args/venetium.gn`): a real release build, the way google builds chrome -
   `chrome://version` says "official build". the out-dir files keep their own `use_thin_lto = false`,
   `chrome_pgo_phase` and `symbol_level = 1`, which win over what official turns on.
-- arm32: `v8_enable_builtins_optimization = true` - v8's own builtins profile. there is no chrome pgo profile for
-  arm32, so `chrome_pgo_phase = 0` there.
+- arm32: `v8_enable_builtins_optimization = true` - v8's own builtins profile. google has no chrome pgo profile for
+  arm32, so `out-arm-rt21.gn` has `chrome_pgo_phase = 0`.
+- **arm32 release build (v1.3): `args/out-arm-pgo.gn`** = `out-arm-rt21.gn` with pgo + thinlto: `use_thin_lto =
+  true`, `chrome_pgo_phase = 2` with my own arm32 profile (`pgo_data_path`, see `pgo/README.md` - unpack it into
+  `chrome/build/pgo_profiles/` first), `win_thin_lto_jobs` (0062) and `toolchain_supports_rust_thin_lto = false`
+  (rust stays native). its `clang_base_path` must be llvm-rt2.1 with the lld fixes in `toolchain/rt21-lto/` - the
+  unfixed lld cannot link windows arm32 thinlto at all. on a surface 2 this build scores about 50% higher in
+  speedometer than the same code without pgo/lto. `out-arm-rt21.gn` stays the quick build for testing patches.
 - x86: `chrome_pgo_phase = 2` - google's profile-guided optimization data for chrome on 32-bit windows. the file
   name is in `chrome/build/win32.pgo.txt`; put that file into `chrome/build/pgo_profiles/` before `gn gen`
   (download `https://storage.googleapis.com/chromium-optimization-profiles/pgo_profiles/<that name>`, or let
@@ -82,6 +88,10 @@ ninja -C out\arm-rt21 chrome
 ```
 
 that gives you the whole browser: `venetium.exe`, `chrome.dll`, the angle dlls, and the resources.
+
+the pgo + thinlto build is the same command on `out\arm-pgo`. with thinlto the compile step only writes bitcode and
+all of chrome.dll's machine code is made in its final link, so that one link takes a long time and a lot of memory;
+`win_thin_lto_jobs` sets its threads. on my build server the whole build took about 21 hours at -j8.
 
 **one gotcha with the official build from the source tarball:** near the end, the build makes a resource allowlist
 from `chrome.dll.pdb` with `third_party/llvm-build/Release+Asserts/bin/llvm-pdbutil`. in the tarball that file is a
@@ -105,6 +115,8 @@ then make a `venetium_filters` folder in each out dir with `filters.dat`, a one-
 them up. no folder = no blocking, everything else works.
 
 ## package
+
+(the commands use `out\arm-rt21`; for the v1.3 release build use `out\arm-pgo`.)
 
 - **portable zip:** `package/portable.py zip out\arm-rt21 arm32 venetium-arm32.zip --kit tests/kit --v8-config out\arm-rt21\clang_x86_v8_arm\v8_build_config.json`
 - **installer:** `installer/build-installer.ps1 -OutDir out\arm-rt21` builds `Venetium-Setup-<ver>-arm32.exe` - one
@@ -225,3 +237,9 @@ subresource_filter with an all-sites preset and the list from `venetium_filters\
 0060 takes automatic stack-variable initialization out of the dsp-only codec targets (jpeg simd, dav1d, libvpx
 intrinsics, libwebp dsp). 0061 replaces the arm32 crt's byte-at-a-time memchr / memcmp / strlen / strchr / strcmp
 with word-at-a-time versions (`build/win/venetium_string_arm.c`, linked into every arm32 binary).
+
+**0062 (v1.3)** - only build files, for the arm32 pgo + thinlto build; non-lto builds do not change. it adds the
+`win_thin_lto_jobs` arg, gives every arm32 binary the full post-link optimization (lto level 2: the thinlto compile
+step leaves vectorizing and unrolling to the link), archives arm32 bitcode with `llvm-ar` because `llvm-lib` cannot
+(it does not know the `thumbv7` triple, see `toolchain/rt21-lto/README.md`), and keeps 0061's string routines out of
+lto so they stay the device-tested native code. the profile is in `pgo/`, the linker fixes in `toolchain/rt21-lto/`.
