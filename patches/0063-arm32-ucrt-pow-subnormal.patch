@@ -1,0 +1,31 @@
+Venetium 0063 - Math.pow uses V8's own pow on Windows ARM32 (the ARM32 UCRT pow returns 0 for subnormal results).
+Found by the device test run of the Thumb-2 V8 port (mjsunit es6/math-log2-log10 on a Surface RT): Math.pow(10, -310),
+10 ** -310 and Math.pow(2, -1070) were 0 in every tier, --jitless included, while division, Math.sqrt and Math.exp
+gave the subnormal results. V8's math::pow (v8/src/numbers/ieee754.cc) is behind every Math.pow and ** in all tiers and
+behind the parser's and the compilers' constant folding. With v8_flags.use_std_math_pow (true everywhere but AIX) it
+called std::pow = the statically linked UCRT pow, which on ARM32 installs its own FP control state (_ctrlfp) and returns
+0 where the result is subnormal. On Windows ARM32 math::pow now always uses V8's own implementation
+(base::ieee754::legacy::pow = LLVM libc pow, the AIX path); the flag is ignored there. Device-verified with the same
+change in the Thumb-2 d8 on Windows RT 8.1: Math.pow(10, -310) = 1e-310 in every tier, and mjsunit math-pow,
+es7/exponentiation-operator, es6/math-log2-log10 and the two regress tests that force --use-std-math-pow pass.
+Other platforms are unchanged.
+
+diff --git a/v8/src/numbers/ieee754.cc b/v8/src/numbers/ieee754.cc
+index 1835062..e31ec6f 100644
+--- a/v8/src/numbers/ieee754.cc
++++ b/v8/src/numbers/ieee754.cc
+@@ -44,9 +44,14 @@ double pow(double x, double y) {
+     }
+   }
+ 
++#if defined(V8_OS_WIN) && defined(V8_TARGET_ARCH_ARM)
++  // Venetium: the Windows ARM32 UCRT pow returns 0 for subnormal results
++  // (Math.pow(10, -310)), so V8's own pow is used there.
++#else
+   if (v8_flags.use_std_math_pow) {
+     return std::pow(x, y);
+   }
++#endif
+   return base::ieee754::legacy::pow(x, y);
+ }
+ 

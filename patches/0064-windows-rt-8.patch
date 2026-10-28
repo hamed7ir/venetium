@@ -1,0 +1,518 @@
+Venetium 0064 - Windows RT 8.0 / 8.1 support for the ARM32 build (the Chromium side; no extra DLL).
+Used by the v1.3 Thumb-2 build together with the V8 Thumb-2 port (github.com/hamed7ir/v8-thumb2-rt): Windows RT 8.x only
+runs Thumb-2 code, so the A32 V8 cannot run there, and the browser itself needed these 14 files. Every gap was measured
+against the Windows 8.0 RTM system DLLs (6.2.9200) and the browser was run on a Surface RT with Windows RT 8.1.
+Windows 10 stays on the old code paths: run-time lookups fall back only where a function is missing, version gates use
+base::win::GetVersion(), and the delay-load stand-ins only replace what would otherwise be a crash.
+- build/config/win/BUILD.gn: ARM32 PEs say OS/subsystem 6.02 (the 8.x loader refuses EXEs newer than the OS; 10.0 before).
+- DiscardVirtualMemory (8.1 Update) was a static import of chrome.dll: looked up at run time (base and PartitionAlloc).
+- SetProcessDpiAwareness (shcore, 8.1) at every process start: looked up at run time.
+- QueryUnbiasedInterruptTimePrecise (Windows 10) behind LiveTicks: QueryUnbiasedInterruptTime below Windows 10.
+- ProcessPrng is CHECKed at start-up: RtlGenRandom (SystemFunction036) when bcryptprimitives lacks it (base, PartitionAlloc).
+- ANGLE: D3DCompiler_46.dll is tried when D3DCompiler_47 does not load (the shipped _47 needs 8.1 API sets).
+- TrimD3DResources: Trim() only when the device has IDXGIDevice3 (8.1).
+- ProcessDynamicCodePolicy (8.1) is set only on 8.1 and later; a failing mitigation-mask query is not a NOTREACHED.
+- PROC_THREAD_ATTRIBUTE_COMPONENT_FILTER is sent only on Windows 10.
+- Delay-load failure hook: stand-ins for the 8.1/10-only delay imports (SetProcessDpiAwareness, GetDpiForMonitor,
+  GetScaleFactorForMonitor, QueryUnbiasedInterruptTimePrecise, CompareObjectHandles, d3d12 #101,
+  NetGet/FreeAadJoinInformation, RoGetAgileReference, ProcessPrng) instead of the crash.
+- GetPackagePathByFullName (not in 8.0's kernel32) is looked up at run time (media, webnn).
+
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/page_allocator_internals_win.h b/base/allocator/partition_allocator/src/partition_alloc/page_allocator_internals_win.h
+index d51b047..d879754 100644
+--- a/base/allocator/partition_allocator/src/partition_alloc/page_allocator_internals_win.h
++++ b/base/allocator/partition_allocator/src/partition_alloc/page_allocator_internals_win.h
+@@ -236,7 +236,19 @@ void DiscardSystemPagesInternal(uintptr_t address, size_t length) {
+   void* ptr = reinterpret_cast<void*>(address);
+   // Use DiscardVirtualMemory when available because it releases faster than
+   // MEM_RESET.
+-  DWORD ret = DiscardVirtualMemory(ptr, length);
++  // Venetium RT 8.0: DiscardVirtualMemory is Windows 8.1 Update, so it is
++  // looked up at run time instead of imported (MEM_RESET below without it).
++  // Constant-initialized: PartitionAlloc runs before magic statics work.
++  using DiscardVirtualMemoryFunction = DWORD(WINAPI*)(PVOID, SIZE_T);
++  static uintptr_t discard_virtual_memory = 1;  // 1 = not looked up yet.
++  if (discard_virtual_memory == 1) {
++    discard_virtual_memory = reinterpret_cast<uintptr_t>(GetProcAddress(
++        GetModuleHandleW(L"kernel32.dll"), "DiscardVirtualMemory"));
++  }
++  DWORD ret = discard_virtual_memory
++                  ? reinterpret_cast<DiscardVirtualMemoryFunction>(
++                        discard_virtual_memory)(ptr, length)
++                  : ERROR_NOT_SUPPORTED;
+   // DiscardVirtualMemory is buggy in Win10 SP0, so fall back to MEM_RESET on
+   // failure.
+   if (ret) {
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/rand_util_win.cc b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/rand_util_win.cc
+index 1596bc2..34e8260 100644
+--- a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/rand_util_win.cc
++++ b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/rand_util_win.cc
+@@ -28,14 +28,26 @@ void RandBytes(void* output, size_t output_length) {
+   // startup, but this should be safe as the process will be single-threaded
+   // when this first runs.
+   static decltype(&ProcessPrng) process_prng_fn = nullptr;
+-  if (!process_prng_fn) {
++  // Venetium RT 8.0: without ProcessPrng, RtlGenRandom
++  // (advapi32!SystemFunction036, Windows XP).
++  using RtlGenRandomFunction = BOOLEAN(WINAPI*)(PVOID, ULONG);
++  static RtlGenRandomFunction rtl_gen_random_fn = nullptr;
++  if (!process_prng_fn && !rtl_gen_random_fn) {
+     HMODULE hmod = LoadLibraryW(L"bcryptprimitives.dll");
+-    PA_BASE_CHECK(hmod);
+-    process_prng_fn = reinterpret_cast<decltype(&ProcessPrng)>(
+-        GetProcAddress(hmod, "ProcessPrng"));
+-    PA_BASE_CHECK(process_prng_fn);
++    if (hmod) {
++      process_prng_fn = reinterpret_cast<decltype(&ProcessPrng)>(
++          GetProcAddress(hmod, "ProcessPrng"));
++    }
++    if (!process_prng_fn) {
++      rtl_gen_random_fn = reinterpret_cast<RtlGenRandomFunction>(
++          GetProcAddress(LoadLibraryW(L"advapi32.dll"), "SystemFunction036"));
++      PA_BASE_CHECK(rtl_gen_random_fn);
++    }
+   }
+-  BOOL success = process_prng_fn(static_cast<BYTE*>(output), output_length);
++  BOOL success =
++      process_prng_fn
++          ? process_prng_fn(static_cast<BYTE*>(output), output_length)
++          : rtl_gen_random_fn(output, static_cast<ULONG>(output_length));
+   // ProcessPrng is documented to always return TRUE.
+   PA_BASE_CHECK(success);
+ }
+diff --git a/base/memory/discardable_shared_memory.cc b/base/memory/discardable_shared_memory.cc
+index 3a9977f..96cb654 100644
+--- a/base/memory/discardable_shared_memory.cc
++++ b/base/memory/discardable_shared_memory.cc
+@@ -438,7 +438,15 @@ bool DiscardableSharedMemory::Purge(Time current_time) {
+   uint8_t* address = mapped.data();
+   size_t length = AlignToPageSize(mapped.size());
+ 
+-  DWORD ret = DiscardVirtualMemory(address, length);
++  // Venetium RT 8.0: DiscardVirtualMemory is Windows 8.1 Update, so it is
++  // looked up at run time (as V8 does) instead of imported; without it the
++  // MEM_RESET fallback below runs.
++  using DiscardVirtualMemoryFunction = DWORD(WINAPI*)(PVOID, SIZE_T);
++  static const DiscardVirtualMemoryFunction discard_virtual_memory =
++      reinterpret_cast<DiscardVirtualMemoryFunction>(::GetProcAddress(
++          ::GetModuleHandleW(L"kernel32.dll"), "DiscardVirtualMemory"));
++  DWORD ret = discard_virtual_memory ? discard_virtual_memory(address, length)
++                                     : ERROR_NOT_SUPPORTED;
+   // DiscardVirtualMemory is buggy in Win10 SP0, so fall back to MEM_RESET on
+   // failure.
+   if (ret != ERROR_SUCCESS) {
+diff --git a/base/rand_util_win.cc b/base/rand_util_win.cc
+index c840303..d74ebeb 100644
+--- a/base/rand_util_win.cc
++++ b/base/rand_util_win.cc
+@@ -15,6 +15,7 @@
+ 
+ #include "base/check.h"
+ #include "base/feature_list.h"
++#include "base/numerics/safe_conversions.h"
+ #include "third_party/boringssl/src/include/openssl/rand.h"
+ 
+ // Prototype for ProcessPrng.
+@@ -52,14 +53,24 @@ namespace {
+ 
+ // Import bcryptprimitives!ProcessPrng rather than cryptbase!RtlGenRandom to
+ // avoid opening a handle to \\Device\KsecDD in the renderer.
++// Venetium RT 8.0: if bcryptprimitives has no ProcessPrng, RtlGenRandom
++// (advapi32!SystemFunction036, Windows XP) fills the buffer instead.
++BOOL WINAPI RtlGenRandomPrng(PBYTE data, SIZE_T size) {
++  using RtlGenRandomFunction = BOOLEAN(WINAPI*)(PVOID, ULONG);
++  static const RtlGenRandomFunction rtl_gen_random =
++      reinterpret_cast<RtlGenRandomFunction>(::GetProcAddress(
++          ::LoadLibraryW(L"advapi32.dll"), "SystemFunction036"));
++  CHECK(rtl_gen_random);
++  return rtl_gen_random(data, checked_cast<ULONG>(size));
++}
++
+ decltype(&ProcessPrng) GetProcessPrng() {
+   HMODULE hmod = LoadLibraryW(L"bcryptprimitives.dll");
+-  CHECK(hmod);
+   decltype(&ProcessPrng) process_prng_fn =
+-      reinterpret_cast<decltype(&ProcessPrng)>(
+-          GetProcAddress(hmod, "ProcessPrng"));
+-  CHECK(process_prng_fn);
+-  return process_prng_fn;
++      hmod ? reinterpret_cast<decltype(&ProcessPrng)>(
++                 GetProcAddress(hmod, "ProcessPrng"))
++           : nullptr;
++  return process_prng_fn ? process_prng_fn : &RtlGenRandomPrng;
+ }
+ 
+ void RandBytesInternal(span<uint8_t> output, bool avoid_allocation) {
+diff --git a/base/time/time_win.cc b/base/time/time_win.cc
+index cab0fbb..4bf40b5 100644
+--- a/base/time/time_win.cc
++++ b/base/time/time_win.cc
+@@ -52,6 +52,7 @@
+ #include "base/synchronization/lock.h"
+ #include "base/threading/platform_thread.h"
+ #include "base/time/time_override.h"
++#include "base/win/windows_version.h"
+ #include "build/build_config.h"
+ 
+ namespace base {
+@@ -762,7 +763,15 @@ TimeTicks::Clock TimeTicks::GetClock() {
+ namespace subtle {
+ LiveTicks LiveTicksNowIgnoringOverride() {
+   ULONGLONG unbiased_interrupt_time;
+-  QueryUnbiasedInterruptTimePrecise(&unbiased_interrupt_time);
++  // Venetium RT 8.0: QueryUnbiasedInterruptTimePrecise is Windows 10; Windows
++  // 8.x has QueryUnbiasedInterruptTime (Windows 7, timer-tick resolution).
++  static const bool has_precise =
++      base::win::GetVersion() >= base::win::Version::WIN10;
++  if (has_precise) {
++    QueryUnbiasedInterruptTimePrecise(&unbiased_interrupt_time);
++  } else {
++    QueryUnbiasedInterruptTime(&unbiased_interrupt_time);
++  }
+   // QueryUnbiasedInterruptTimePrecise gets the interrupt time in system time
+   // units of 100 nanoseconds.
+   return LiveTicks() + Nanoseconds(unbiased_interrupt_time * 100);
+diff --git a/base/win/win_util.cc b/base/win/win_util.cc
+index 1933efe..2c6b327 100644
+--- a/base/win/win_util.cc
++++ b/base/win/win_util.cc
+@@ -1038,9 +1038,19 @@ void EnableHighDPISupport() {
+     return;
+   }
+ 
+-  // Fall back to per-monitor DPI for older versions of Win10.
+-  PROCESS_DPI_AWARENESS process_dpi_awareness = PROCESS_PER_MONITOR_DPI_AWARE;
+-  if (!::SetProcessDpiAwareness(process_dpi_awareness)) {
++  // Fall back to per-monitor DPI for older versions of Win10 and Windows 8.1.
++  // Venetium RT 8.0: SetProcessDpiAwareness (shcore) is Windows 8.1, so it is
++  // looked up at run time; Windows 8.0 gets system DPI awareness.
++  using SetProcessDpiAwarenessFunction =
++      HRESULT(WINAPI*)(PROCESS_DPI_AWARENESS);
++  HMODULE shcore =
++      ::LoadLibraryExW(L"shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
++  const auto set_process_dpi_awareness =
++      shcore ? reinterpret_cast<SetProcessDpiAwarenessFunction>(
++                   ::GetProcAddress(shcore, "SetProcessDpiAwareness"))
++             : nullptr;
++  if (!set_process_dpi_awareness ||
++      FAILED(set_process_dpi_awareness(PROCESS_PER_MONITOR_DPI_AWARE))) {
+     // For windows versions where SetProcessDpiAwareness fails, try its
+     // predecessor.
+     BOOL result = ::SetProcessDPIAware();
+diff --git a/build/config/win/BUILD.gn b/build/config/win/BUILD.gn
+index c1bac78..48cd920 100644
+--- a/build/config/win/BUILD.gn
++++ b/build/config/win/BUILD.gn
+@@ -632,8 +632,15 @@ config("static_crt") {
+ 
+ # This is appended to the subsystem to specify a minimum version.
+ # The number after the comma is the minimum required OS version.
+-# Set to 10.0 since we only support >= Win10 since M110.
+-subsystem_version_suffix = ",10.0"
++# Venetium RT 8.0: ARM32 binaries say 6.02, the ARM minimum (Windows 8.0 is
++# NT 6.2): the 8.x loader refuses an executable that asks for a newer OS.
++# Host tools keep 10.0, so their links (and everything generated by them)
++# stay unchanged.
++if (current_cpu == "arm") {
++  subsystem_version_suffix = ",6.02"
++} else {
++  subsystem_version_suffix = ",10.0"
++}
+ 
+ config("console") {
+   ldflags = [ "/SUBSYSTEM:CONSOLE$subsystem_version_suffix" ]
+diff --git a/chrome/common/win/delay_load_failure_hook.cc b/chrome/common/win/delay_load_failure_hook.cc
+index 91dccbd..76eed32 100644
+--- a/chrome/common/win/delay_load_failure_hook.cc
++++ b/chrome/common/win/delay_load_failure_hook.cc
+@@ -19,6 +19,91 @@
+ 
+ namespace {
+ 
++// Venetium RT 8.0 (RTreviver): stand-ins for delay-loaded functions newer than
++// Windows 8.0 that ordinary code can reach. When the DLL or the function is
++// missing, the delay-load helper gets one of these instead of the crash below;
++// each returns the failure its callers already handle.
++HRESULT WINAPI SetProcessDpiAwarenessStandIn(int /*awareness*/) {
++  return E_NOTIMPL;
++}
++HRESULT WINAPI GetDpiForMonitorStandIn(HMONITOR, int, UINT*, UINT*) {
++  return E_NOTIMPL;
++}
++HRESULT WINAPI GetScaleFactorForMonitorStandIn(HMONITOR, int*) {
++  return E_NOTIMPL;
++}
++void WINAPI QueryUnbiasedInterruptTimePreciseStandIn(PULONGLONG time) {
++  ::QueryUnbiasedInterruptTime(time);
++}
++BOOL WINAPI CompareObjectHandlesStandIn(HANDLE first, HANDLE second) {
++  return first == second;
++}
++HRESULT WINAPI D3D12CreateDeviceStandIn(void*, int, REFIID, void** device) {
++  if (device) {
++    *device = nullptr;
++  }
++  return E_NOINTERFACE;
++}
++HRESULT WINAPI NetGetAadJoinInformationStandIn(LPCWSTR, void** info) {
++  if (info) {
++    *info = nullptr;
++  }
++  return E_NOTIMPL;
++}
++void WINAPI NetFreeAadJoinInformationStandIn(void*) {}
++HRESULT WINAPI RoGetAgileReferenceStandIn(int, REFIID, void*, void** ref) {
++  if (ref) {
++    *ref = nullptr;
++  }
++  return E_NOTIMPL;
++}
++BOOL WINAPI ProcessPrngStandIn(PBYTE data, SIZE_T size) {
++  using RtlGenRandomFunction = BOOLEAN(WINAPI*)(PVOID, ULONG);
++  const auto rtl_gen_random = reinterpret_cast<RtlGenRandomFunction>(
++      ::GetProcAddress(::LoadLibraryW(L"advapi32.dll"), "SystemFunction036"));
++  return rtl_gen_random &&
++         rtl_gen_random(data, base::checked_cast<ULONG>(size));
++}
++
++FARPROC StandInFor(const DelayLoadInfo* dll_info) {
++  if (!dll_info->dlp.fImportByName) {
++    // d3d12.dll is imported by ordinal: 101 = D3D12CreateDevice.
++    return base::EqualsCaseInsensitiveASCII(dll_info->szDll, "d3d12.dll") &&
++                   dll_info->dlp.dwOrdinal == 101
++               ? reinterpret_cast<FARPROC>(&D3D12CreateDeviceStandIn)
++               : nullptr;
++  }
++  const std::string_view name(dll_info->dlp.szProcName);
++  if (name == "SetProcessDpiAwareness") {
++    return reinterpret_cast<FARPROC>(&SetProcessDpiAwarenessStandIn);
++  }
++  if (name == "GetDpiForMonitor") {
++    return reinterpret_cast<FARPROC>(&GetDpiForMonitorStandIn);
++  }
++  if (name == "GetScaleFactorForMonitor") {
++    return reinterpret_cast<FARPROC>(&GetScaleFactorForMonitorStandIn);
++  }
++  if (name == "QueryUnbiasedInterruptTimePrecise") {
++    return reinterpret_cast<FARPROC>(&QueryUnbiasedInterruptTimePreciseStandIn);
++  }
++  if (name == "CompareObjectHandles") {
++    return reinterpret_cast<FARPROC>(&CompareObjectHandlesStandIn);
++  }
++  if (name == "NetGetAadJoinInformation") {
++    return reinterpret_cast<FARPROC>(&NetGetAadJoinInformationStandIn);
++  }
++  if (name == "NetFreeAadJoinInformation") {
++    return reinterpret_cast<FARPROC>(&NetFreeAadJoinInformationStandIn);
++  }
++  if (name == "RoGetAgileReference") {
++    return reinterpret_cast<FARPROC>(&RoGetAgileReferenceStandIn);
++  }
++  if (name == "ProcessPrng") {
++    return reinterpret_cast<FARPROC>(&ProcessPrngStandIn);
++  }
++  return nullptr;
++}
++
+ // Delay load failure hook that generates a crash report. By default a failure
+ // to delay load will trigger an exception handled by the delay load runtime and
+ // this won't generate a crash report.
+@@ -49,6 +134,17 @@ FARPROC WINAPI DelayLoadFailureHook(unsigned reason, DelayLoadInfo* dll_info) {
+     }
+   }
+ 
++  // Venetium RT 8.0: a missing DLL with a stand-in for this function gets
++  // kernel32 as its module, so the helper's GetProcAddress fails and the
++  // dliFailGetProc call below hands out the stand-in.
++  if (FARPROC stand_in = StandInFor(dll_info)) {
++    if (reason == dliFailLoadLib) {
++      return reinterpret_cast<FARPROC>(::GetModuleHandleW(L"kernel32.dll"));
++    }
++    if (reason == dliFailGetProc) {
++      return stand_in;
++    }
++  }
+   return HandleDelayLoadFailureCommon(reason, dll_info);
+ }
+ 
+diff --git a/gpu/ipc/service/gpu_channel_manager.cc b/gpu/ipc/service/gpu_channel_manager.cc
+index 9039daa..254e071 100644
+--- a/gpu/ipc/service/gpu_channel_manager.cc
++++ b/gpu/ipc/service/gpu_channel_manager.cc
+@@ -106,8 +106,10 @@ void TrimD3DResources(const scoped_refptr<SharedContextState>& context_state) {
+   if (d3d11_device) {
+     Microsoft::WRL::ComPtr<IDXGIDevice3> dxgi_device;
+     HRESULT hr = d3d11_device.As(&dxgi_device);
+-    CHECK_EQ(hr, S_OK);
+-    dxgi_device->Trim();
++    // Venetium RT 8.0: IDXGIDevice3 (Trim) is Windows 8.1.
++    if (SUCCEEDED(hr)) {
++      dxgi_device->Trim();
++    }
+   }
+ 
+   Microsoft::WRL::ComPtr<ID3D11Device> angle_d3d11_device =
+@@ -115,8 +117,10 @@ void TrimD3DResources(const scoped_refptr<SharedContextState>& context_state) {
+   if (angle_d3d11_device && angle_d3d11_device != d3d11_device) {
+     Microsoft::WRL::ComPtr<IDXGIDevice3> dxgi_device;
+     HRESULT hr = angle_d3d11_device.As(&dxgi_device);
+-    CHECK_EQ(hr, S_OK);
+-    dxgi_device->Trim();
++    // Venetium RT 8.0: IDXGIDevice3 (Trim) is Windows 8.1.
++    if (SUCCEEDED(hr)) {
++      dxgi_device->Trim();
++    }
+   }
+ }
+ #endif
+diff --git a/media/base/win/media_foundation_package_locator_helper.cc b/media/base/win/media_foundation_package_locator_helper.cc
+index a89fbd8..b823cdf 100644
+--- a/media/base/win/media_foundation_package_locator_helper.cc
++++ b/media/base/win/media_foundation_package_locator_helper.cc
+@@ -15,6 +15,23 @@
+ namespace media {
+ 
+ namespace {
++
++// Venetium RT 8.0: GetPackagePathByFullName is not in Windows 8.0's kernel32
++// (measured on 6.2.9200), so it is looked up at run time instead of imported;
++// without it every package counts as not found.
++LONG VenetiumGetPackagePathByFullName(PCWSTR package_full_name,
++                                      UINT32* path_length,
++                                      PWSTR path) {
++  using GetPackagePathByFullNameFunction =
++      LONG(WINAPI*)(PCWSTR, UINT32*, PWSTR);
++  static const GetPackagePathByFullNameFunction get_package_path =
++      reinterpret_cast<GetPackagePathByFullNameFunction>(::GetProcAddress(
++          ::GetModuleHandleW(L"kernel32.dll"), "GetPackagePathByFullName"));
++  return get_package_path
++             ? get_package_path(package_full_name, path_length, path)
++             : ERROR_NOT_SUPPORTED;
++}
++
+ #if defined(_M_AMD64)
+ constexpr std::array<std::wstring_view, 1> kArchSubDirs = {L"x64"};
+ #elif defined(_M_IX86)
+@@ -66,7 +83,7 @@ std::vector<base::FilePath> MediaFoundationPackageInstallPaths(
+     for (const wchar_t* package_full_name : package_full_names) {
+       DVLOG(2) << __func__ << ": package_full_name=" << package_full_name;
+       uint32_t package_path_len = std::size(package_path);
+-      rc = GetPackagePathByFullName(package_full_name, &package_path_len,
++      rc = VenetiumGetPackagePathByFullName(package_full_name, &package_path_len,
+                                     package_path);
+       if (rc != ERROR_SUCCESS) {
+         DLOG(WARNING) << "Cannot find " << package_full_name << ". rc=" << rc;
+diff --git a/sandbox/win/src/process_mitigations.cc b/sandbox/win/src/process_mitigations.cc
+index e4faa13..e9c29d8 100644
+--- a/sandbox/win/src/process_mitigations.cc
++++ b/sandbox/win/src/process_mitigations.cc
+@@ -62,7 +62,10 @@ const ULONG64* GetSupportedMitigations() {
+         !::GetProcessMitigationPolicy(::GetCurrentProcess(),
+                                       ProcessMitigationOptionsMask,
+                                       &mitigations, mits_size)) {
+-      NOTREACHED();
++      // Venetium RT 8.0: an OS that cannot report the mask supports none of
++      // the creation-time mitigations as far as the sandbox is concerned.
++      mitigations[0] = 0;
++      mitigations[1] = 0;
+     }
+   }
+ 
+@@ -257,7 +260,9 @@ bool ApplyProcessMitigationsToCurrentProcess(MitigationFlags starting_flags,
+   }
+ 
+   // Enable dynamic code policies.
++  // Venetium RT 8.0: ProcessDynamicCodePolicy is Windows 8.1.
+   if (!IsRunning32bitEmulatedOnArm64() &&
++      base::win::GetVersion() >= base::win::Version::WIN8_1 &&
+       (flags & MITIGATION_DYNAMIC_CODE_DISABLE)) {
+     // Verify caller is not accidentally setting both mutually exclusive
+     // policies.
+@@ -332,7 +337,9 @@ bool ApplyProcessMitigationsToCurrentProcess(MitigationFlags starting_flags,
+ 
+   // Enable dynamic code policies.
+   // Per-thread opt-out is only supported on >= Anniversary (RS1).
++  // Venetium RT 8.0: ProcessDynamicCodePolicy is Windows 8.1.
+   if (!IsRunning32bitEmulatedOnArm64() &&
++      base::win::GetVersion() >= base::win::Version::WIN8_1 &&
+       (flags & MITIGATION_DYNAMIC_CODE_DISABLE_WITH_OPT_OUT)) {
+     // Verify caller is not accidentally setting both mutually exclusive
+     // policies.
+diff --git a/sandbox/win/src/startup_information_helper.cc b/sandbox/win/src/startup_information_helper.cc
+index e885141..efa5785 100644
+--- a/sandbox/win/src/startup_information_helper.cc
++++ b/sandbox/win/src/startup_information_helper.cc
+@@ -55,7 +55,11 @@ void StartupInformationHelper::SetMitigations(MitigationFlags flags) {
+   mitigations_[1] = 0;
+   mitigations_size_ = 0;
+ #endif
+-  ConvertProcessMitigationsToComponentFilter(flags, &component_filter_);
++  // Venetium RT 8.0: COMPONENT_FILTER is a Windows 10 attribute; an older
++  // kernel may refuse it with an error other than ERROR_NOT_SUPPORTED.
++  if (base::win::GetVersion() >= base::win::Version::WIN10) {
++    ConvertProcessMitigationsToComponentFilter(flags, &component_filter_);
++  }
+ }
+ 
+ void StartupInformationHelper::SetRestrictChildProcessCreation(bool restrict) {
+diff --git a/services/webnn/public/cpp/platform_functions_win.cc b/services/webnn/public/cpp/platform_functions_win.cc
+index e8a27ab..573873a 100644
+--- a/services/webnn/public/cpp/platform_functions_win.cc
++++ b/services/webnn/public/cpp/platform_functions_win.cc
+@@ -17,6 +17,22 @@ namespace webnn {
+ 
+ namespace {
+ 
++// Venetium RT 8.0: GetPackagePathByFullName is not in Windows 8.0's kernel32
++// (measured on 6.2.9200), so it is looked up at run time instead of imported;
++// without it every package counts as not found.
++LONG VenetiumGetPackagePathByFullName(PCWSTR package_full_name,
++                                      UINT32* path_length,
++                                      PWSTR path) {
++  using GetPackagePathByFullNameFunction =
++      LONG(WINAPI*)(PCWSTR, UINT32*, PWSTR);
++  static const GetPackagePathByFullNameFunction get_package_path =
++      reinterpret_cast<GetPackagePathByFullNameFunction>(::GetProcAddress(
++          ::GetModuleHandleW(L"kernel32.dll"), "GetPackagePathByFullName"));
++  return get_package_path
++             ? get_package_path(package_full_name, path_length, path)
++             : ERROR_NOT_SUPPORTED;
++}
++
+ struct ScopedWcharTypeTraits {
+   static wchar_t* InvalidValue() { return nullptr; }
+   static void Free(wchar_t* value) {
+@@ -32,14 +48,14 @@ base::FilePath GetPackagePath(const wchar_t* package_full_name) {
+ 
+   // Get the required path length.
+   LONG result =
+-      GetPackagePathByFullName(package_full_name, &path_length, nullptr);
++      VenetiumGetPackagePathByFullName(package_full_name, &path_length, nullptr);
+   if (result != ERROR_INSUFFICIENT_BUFFER) {
+     return base::FilePath();
+   }
+ 
+   // Get the actual path.
+   std::wstring path_buffer;
+-  result = GetPackagePathByFullName(package_full_name, &path_length,
++  result = VenetiumGetPackagePathByFullName(package_full_name, &path_length,
+                                     base::WriteInto(&path_buffer, path_length));
+   if (result != ERROR_SUCCESS) {
+     return base::FilePath();
+diff --git a/ui/gl/init/gl_initializer_win.cc b/ui/gl/init/gl_initializer_win.cc
+index 9824b14..aa4bb7a 100644
+--- a/ui/gl/init/gl_initializer_win.cc
++++ b/ui/gl/init/gl_initializer_win.cc
+@@ -57,7 +57,11 @@ bool LoadD3DCompiler() {
+   // Attempt to load the D3DX shader compiler using an absolute path. This is to
+   // ensure that we load the versions of these DLLs that we ship. If that fails,
+   // load the OS version.
+-  return LoadD3DXLibrary(module_path, kD3DCompiler);
++  // Venetium RT 8.0: the shipped D3DCompiler_47 is a Windows 8.1 build that
++  // needs 8.1 API sets; on 8.0 try D3DCompiler_46, which ANGLE also accepts
++  // once it is loaded (ANGLE_PRELOADED_D3DCOMPILER_MODULE_NAMES).
++  return LoadD3DXLibrary(module_path, kD3DCompiler) ||
++         LoadD3DXLibrary(module_path, L"D3DCompiler_46.dll");
+ }
+ 
+ bool InitializeStaticEGLInternalFromLibrary() {

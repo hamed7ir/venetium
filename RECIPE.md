@@ -44,7 +44,7 @@ tarball and apply the .222 -> .226 delta. confirm you are on it: `chrome/VERSION
 
 ## apply the patches
 
-apply `patches/0001` through `patches/0062` in order. they are plain `git apply` patches. apply them with
+apply `patches/0001` through `patches/0063` in order (`0064` is for the thumb2 build, see the end). they are plain `git apply` patches. apply them with
 `core.autocrlf=false` so the files stay byte-for-byte - arm32 is sensitive and i hash every file. the missing
 numbers (0009, 0024, 0031, 0034, 0038) are patches i dropped or replaced along the way; the old versions are kept
 under `patches/superseded/` for history, you do not apply those.
@@ -243,3 +243,21 @@ with word-at-a-time versions (`build/win/venetium_string_arm.c`, linked into eve
 step leaves vectorizing and unrolling to the link), archives arm32 bitcode with `llvm-ar` because `llvm-lib` cannot
 (it does not know the `thumbv7` triple, see `toolchain/rt21-lto/README.md`), and keeps 0061's string routines out of
 lto so they stay the device-tested native code. the profile is in `pgo/`, the linker fixes in `toolchain/rt21-lto/`.
+
+**0063 (v1.3)** - `Math.pow` on windows arm32 uses v8's own pow. v8 normally calls the c runtime's `pow`, and the arm32
+ucrt's `pow` returns 0 when the result is subnormal (`Math.pow(10, -310)` was 0 in every tier, jitless too). found by
+the thumb-2 v8 test run on a surface rt; the same change is device-tested there. other platforms are unchanged.
+
+## the thumb2 build (windows rt 8.0 / 8.1)
+
+windows rt 8.x only runs thumb-2 code, so this build has v8 ported to thumb-2 and a few windows 8 fixes. on top of
+0001-0063:
+
+1. apply `patches/0064-windows-rt-8.patch` (the chromium side: pe subsystem 6.02, run-time lookups for the 8.1/10-only
+   functions, version gates, delay-load stand-ins - details in the patch header).
+2. apply the v8 port from [v8-thumb2-rt](https://github.com/hamed7ir/v8-thumb2-rt):
+   `git -c core.autocrlf=false apply --directory=v8 v8-thumb2.patch`
+3. same args as the arm32 pgo build (`args/out-arm-pgo.gn`), then build `chrome`.
+
+the v1.3 thumb2 files were built incrementally from the arm32 pgo output dir, so they use the same pgo profile (v8's
+changed code just gets less profile benefit).
