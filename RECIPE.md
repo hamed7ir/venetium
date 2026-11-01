@@ -44,7 +44,7 @@ tarball and apply the .222 -> .226 delta. confirm you are on it: `chrome/VERSION
 
 ## apply the patches
 
-apply `patches/0001` through `patches/0063` in order (`0064` is for the thumb2 build, see the end). they are plain `git apply` patches. apply them with
+apply `patches/0001` through `patches/0066` in order, except `0064`, which is for the thumb2 build (see the end). they are plain `git apply` patches. apply them with
 `core.autocrlf=false` so the files stay byte-for-byte - arm32 is sensitive and i hash every file. the missing
 numbers (0009, 0024, 0031, 0034, 0038) are patches i dropped or replaced along the way; the old versions are kept
 under `patches/superseded/` for history, you do not apply those.
@@ -247,6 +247,16 @@ lto so they stay the device-tested native code. the profile is in `pgo/`, the li
 **0063 (v1.3)** - `Math.pow` on windows arm32 uses v8's own pow. v8 normally calls the c runtime's `pow`, and the arm32
 ucrt's `pow` returns 0 when the result is subnormal (`Math.pow(10, -310)` was 0 in every tier, jitless too). found by
 the thumb-2 v8 test run on a surface rt; the same change is device-tested there. other platforms are unchanged.
+
+**0065 (v1.3.1)** - angle's d3d11 backend works at feature level 9_3 (adreno / lumia): level-9 clear shaders and no
+point-sprite emulation there. 0045 already lets angle make its d3d11 device at 9_3, but the rest still assumed 10_0,
+and on qualcomm d3d11 at 9_x runs through the d3d9 driver, which is where the lumia 735's gpu process crashed. taken
+from [venetium-w10m](https://github.com/Computershik73/venetium-w10m) (its patch 0058, by ilya vysotsky, from
+gecko-w10m); its shaders recompile byte-identical with fxc. arm32 only, and the tegra stays on d3d9.
+
+**0066 (v1.3.1)** - 0055's codec steering at every resolution on arm32: vp9 / av1 codec strings with a level are
+reported unsupported at any level (not only 720p+ / 480p+), and decodingInfo() calls them not smooth until real stats
+exist, so youtube sends h.264 to the hardware decoder at 144p-480p too. level-less "vp9" / "av1" still play in software.
 
 ## the thumb2 build (windows rt 8.0 / 8.1)
 

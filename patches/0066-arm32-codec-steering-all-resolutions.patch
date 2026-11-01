@@ -1,0 +1,58 @@
+Venetium 0066 - 0055's ARM32 codec steering at every resolution: sites send H.264 to the hardware decoder at 144p-480p too.
+Asked for 2026-11-01, after a community patch that did this on every platform: 0055 steered only VP9 at level 3.1 and up
+(720p+) and AV1 at seq_level_idx 4 and up (480p+), so lower resolutions still decoded VP9/AV1 on the CPU while the
+Tegra / Adreno H.264 decoder sat idle. Now, with kVenetiumArm32CodecSteering (on by default, Windows ARM32 only):
+isTypeSupported/canPlayType report VP9 and AV1 codec strings that carry a level as unsupported at any level, and
+decodingInfo() reports VP9/AV1 of any size as not smooth and not power efficient until real decode stats exist.
+Level-less strings ("vp9", "av1", plain WebM) keep working, so VP9/AV1-only content still plays in software.
+--disable-features=VenetiumArm32CodecSteering turns it off; x86 is unchanged.
+
+diff --git a/media/base/supported_types.cc b/media/base/supported_types.cc
+index 94ec606..9fa4c5d 100644
+--- a/media/base/supported_types.cc
++++ b/media/base/supported_types.cc
+@@ -265,8 +265,9 @@ bool IsDecoderVp9ProfileSupported(const VideoType& type) {
+   if (base::FeatureList::IsEnabled(kVenetiumPreferH264)) {
+     return false;
+   }
+-  // Venetium 0055: VP9 level 3.1 and up is 720p and up (vp09.PP.LL.DD).
+-  if (type.level != kNoVideoCodecLevel && type.level >= 31 &&
++  // Venetium 0055/0066: VP9 with a level (vp09.PP.LL.DD), at every resolution, so
++  // sites that also offer H.264 send that to the hardware decoder.
++  if (type.level != kNoVideoCodecLevel &&
+       base::FeatureList::IsEnabled(kVenetiumArm32CodecSteering)) {
+     return false;
+   }
+@@ -305,8 +306,8 @@ bool IsDecoderAV1Supported(const VideoType& type) {
+       base::FeatureList::IsEnabled(kVenetiumNoAV1)) {
+     return false;
+   }
+-  // Venetium 0055: AV1 seq_level_idx 4 (level 3.0) and up is 480p and up.
+-  if (type.level != kNoVideoCodecLevel && type.level >= 4 &&
++  // Venetium 0055/0066: AV1 with a level (av01.P.LLT.DD), at every resolution.
++  if (type.level != kNoVideoCodecLevel &&
+       base::FeatureList::IsEnabled(kVenetiumArm32CodecSteering)) {
+     return false;
+   }
+diff --git a/media/mojo/services/video_decode_perf_history.cc b/media/mojo/services/video_decode_perf_history.cc
+index ada9fef..24a0d54 100644
+--- a/media/mojo/services/video_decode_perf_history.cc
++++ b/media/mojo/services/video_decode_perf_history.cc
+@@ -171,14 +171,11 @@ void VideoDecodePerfHistory::AssessStats(
+     bool is_sw_secure_decode = is_encrypted && !is_hw_secure;
+     *is_power_efficient = !is_sw_secure_decode;
+     *is_smooth = true;
+-    // Venetium 0055: without history, do not promise smooth software VP9/AV1
+-    // above 480p30 on Windows ARM32 (see kVenetiumArm32CodecSteering). Real
+-    // stats, once recorded, decide as usual.
++    // Venetium 0055/0066: without history, do not promise smooth software
++    // VP9/AV1 at any size on Windows ARM32 (see kVenetiumArm32CodecSteering).
++    // Real stats, once recorded, decide as usual.
+     const VideoCodec codec = VideoCodecProfileToVideoCodec(key.codec_profile);
+     if ((codec == VideoCodec::kVP9 || codec == VideoCodec::kAV1) &&
+-        static_cast<int64_t>(key.size.width()) * key.size.height() *
+-                key.frame_rate >
+-            int64_t{854} * 480 * 30 &&
+         base::FeatureList::IsEnabled(kVenetiumArm32CodecSteering)) {
+       *is_smooth = false;
+       *is_power_efficient = false;
