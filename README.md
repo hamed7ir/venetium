@@ -17,7 +17,8 @@ my own work.
 - surface rt (tegra 3) and surface 2 (tegra 4), arm32
 - windows 10 build 15035 (the arm build that boots on these tablets)
 - windows rt 8.1 with the thumb2 build (v8 ported to thumb-2). rt 8.0 should work too, not tested on a device yet
-- lumia 2520 / lumia 735 (qualcomm, rt 8.1): v1.3.1 is a test build for them. i don't have them, so it needs testers
+- lumia 2520 / lumia 735 and the other lumias (qualcomm adreno): v1.3.1.1 is a test build for them. i don't have
+  them, so it needs testers
 - graphics go through d3d9 / angle (gl es2) on the tegra, it has no d3d11. adreno (lumia) uses angle's d3d11 at
   feature level 9_3
 
@@ -33,7 +34,7 @@ my own work.
 ## how it is built
 
 this repo is a patch series on top of chromium 150, plus the build tooling and a
-device test kit. the patches are in `patches/` (0001–0066), the full build steps
+device test kit. the patches are in `patches/` (0001–0067), the full build steps
 are in `RECIPE.md`, and `VENETIUM-IDS.md` says what each patch does. the v8 thumb-2
 port is in its own repo: [v8-thumb2-rt](https://github.com/hamed7ir/v8-thumb2-rt).
 
@@ -42,8 +43,9 @@ port is in its own repo: [v8-thumb2-rt](https://github.com/hamed7ir/v8-thumb2-rt
 it works on a real device: pages load, the sandbox is on, video plays. i am still
 testing and tuning. v1.3 is pgo + thinlto (about 50% faster on the surface 2) and adds
 the thumb2 build for windows rt 8.x, with the jit on. v1.3.1 (prerelease) has fixes for qualcomm devices
-(lumia): the thumb2 build's crash at start and the gpu on adreno. not tested on them yet, it needs testers. next:
-test it on rt 8.0 and on 15035.
+(lumia): the thumb2 build's crash at start and the gpu on adreno. v1.3.1.1 (prerelease) fixes the gpu process crash
+on every lumia gpu (0067), so the gpu stays on there. not tested on them yet, it needs testers. next: test it on
+rt 8.0 and on 15035.
 
 ## license 
 

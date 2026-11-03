@@ -1,0 +1,135 @@
+Venetium 0067 - every Lumia GPU (Qualcomm Adreno): no GPU timer queries, ANGLE's D3D11 backend keeps to feature level 9_x, GPU raster on all Lumia ids.
+1. The Lumia 735's GPU process crashed 1-2 s after start in qcdx9um8974.dll (9.14.1140): 3 dumps out of 3 at the same
+   address, writing past the end of a buffer. The crashing thread's stack memory gives the caller: viz
+   SkiaOutputDeviceGL::Present -> GLSurfacePresentationHelper::PreSwapBuffers -> GPUTimer::QueryTimeStamp ->
+   glBeginQueryEXT(GL_TIME_ELAPSED_EXT) -> ANGLE Query11::resume -> ID3D11DeviceContext::Begin(D3D11_QUERY_
+   TIMESTAMP_DISJOINT) -> D3D10Level9 -> qcdx9um8974 (D3D11 at 9_x runs through the D3D9 user-mode driver), so the
+   first presented frame; after 3 crashes Chromium turns the GPU off. A new gpu_driver_bug_list entry (487) drops
+   GL_EXT_disjoint_timer_query for these GPUs, like upstream entry 112 for Android Adreno 3xx: the presentation helper
+   then uses a fence (a D3D11 event query) and WebGL stops offering the timer extensions.
+2. The 735's chrome://gpu also shows "Error allocating BlendState" (HRESULT 0x80070057) before every crash. ANGLE's
+   D3D11 backend offers EXT_blend_func_extended at every feature level and Skia blends LCD text and coverage with
+   dual-source factors whenever it is there, but 9_x has no dual-source blending. Checked against the D3D11 runtime
+   (WARP at 9_3 and 9_1): a 9_x device rejects blend states with D3D11_BLEND_SRC1_*, IndependentBlendEnable or
+   AlphaToCoverageEnable, and rasterizer states with DepthClipEnable FALSE. At 9_x ANGLE now offers neither
+   EXT_blend_func_extended nor EXT_depth_clamp, drops alpha-to-coverage, and leaves IndependentBlendEnable off when
+   the bound render targets share one blend description (per-buffer blend state needs 10_1 and is not offered
+   there). _M_ARM only, like 0065: only ARM32 builds change, and only a device at 9_x takes the new paths.
+3. The device ids come from the Lumia GPU drivers' INFs in github.com/WOA-Project/Lumia-Drivers: an ACPI display
+   adapter's DXGI ids are its ACPI hardware id read as little-endian fourccs, so ACPI\QCOM246F = vendor 0x4d4f4351 +
+   device 0x46363432, the id d3dprobe measured on the Adreno 330 and the 735's chrome://gpu shows for its Adreno
+   305. 246F is the GPU of every Lumia from Windows Phone 8.1 on (8974, 8x26, 8x12, 8909, 8992, 8994: the 2520,
+   1520, 930, 735, 830, 550, 650, 950, 950 XL ...), which 0051's GPU-raster exception already covered; the two
+   Windows Phone 8.0 chips are added to it: 8960 (QCOM2002 -> 0x32303032: 920, 1020) and 8930 / 8x27 (QCOM0300 ->
+   0x30303330: 520, 620, 720).
+
+diff --git a/gpu/config/gpu_driver_bug_list.json b/gpu/config/gpu_driver_bug_list.json
+--- a/gpu/config/gpu_driver_bug_list.json
++++ b/gpu/config/gpu_driver_bug_list.json
+@@ -3813,6 +3813,27 @@
+       "features": [
+         "dont_change_base_level_for_npot_immutable_textures"
+       ]
++    },
++    {
++      "id": 487,
++      "description": "GPU timer queries crash Lumia-era Qualcomm Adreno drivers on Windows",
++      "comment": "Venetium 0067: on the Lumia 735 (Windows RT 8.1, qcdx9um8974.dll 9.14.1140) the GPU process crashed 1-2 s after start, in all 3 dumps at qcdx9um8974+0x890f5, writing past the end of a buffer: viz::SkiaOutputDeviceGL::Present -> gl::GLSurfacePresentationHelper::PreSwapBuffers -> gl::GPUTimer::QueryTimeStamp -> glBeginQueryEXT(GL_TIME_ELAPSED_EXT) -> ANGLE rx::Query11::resume -> ID3D11DeviceContext::Begin(D3D11_QUERY_TIMESTAMP_DISJOINT) -> D3D10Level9 -> qcdx9um8974 (D3D11 at feature level 9_x runs through the D3D9 user-mode driver). After 3 crashes Chromium turns the GPU off and everything is software. Without GL_EXT_disjoint_timer_query the presentation helper uses a fence (a D3D11 event query) instead, and WebGL does not offer the timer extensions. Device ids: every Lumia GPU, from the driver INFs in github.com/WOA-Project/Lumia-Drivers (see software_rendering_list.json entry 122, Venetium 0051/0067).",
++      "os": {
++        "type": "win"
++      },
++      "vendor_id": "0x4d4f4351",
++      "device_id": ["0x46363432", "0x32303032", "0x30303330"],
++      "features": [
++        "disable_timestamp_queries"
++      ],
++      "disabled_extensions": [
++        "GL_EXT_disjoint_timer_query",
++        "GL_EXT_disjoint_timer_query_webgl2"
++      ],
++      "disabled_webgl_extensions": [
++        "EXT_disjoint_timer_query",
++        "EXT_disjoint_timer_query_webgl2"
++      ]
+     }
+   ]
+ }
+diff --git a/gpu/config/software_rendering_list.json b/gpu/config/software_rendering_list.json
+--- a/gpu/config/software_rendering_list.json
++++ b/gpu/config/software_rendering_list.json
+@@ -888,9 +888,9 @@
+           "gl_renderer": ".*Direct3D9.*"
+         },
+         {
+-          "comment": "Venetium 0051: Qualcomm Adreno 330 (Lumia 1520 / 640 XL) on Windows ARM32 renders through ANGLE's Direct3D11 backend at feature level 9_3 (Venetium 0045) - its D3D9 driver paints garbage, so D3D11 is the good path. d3dprobe (community report 2026-10-11): DXGI vendor 0x4D4F4351 ('QCOM'), device 0x46363432, D3D11 max FL 9_3, ps_4_0_level_9_3 accepted, NV12 vp in/out. Skia Ganesh rasters on its D3D11 backend here. Scoped to this Adreno device id: the 0x4d4f4351 exceptions above require driver >= 31.0.2.0, which this ~2014 Adreno driver predates; and x86 has no such GPU. The D3D11 FL9_3 render path itself is 0045 - this entry just lets it GPU-rasterize once it is up.",
++          "comment": "Venetium 0051/0067: Qualcomm Adreno on Windows ARM32 (the Lumia phones and the Lumia 2520) renders through ANGLE's Direct3D11 backend at feature level 9_3 (Venetium 0045, 0065) - its D3D9 driver paints garbage, so D3D11 is the good path. Skia Ganesh rasters on its D3D11 backend here. The device ids are the Lumia GPU drivers' own, from their INFs in github.com/WOA-Project/Lumia-Drivers: an ACPI display adapter's DXGI ids are its ACPI hardware id read as two little-endian fourccs, so ACPI QCOM246F = vendor 0x4d4f4351 ('QCOM') + device 0x46363432 ('246F'), which is what d3dprobe measured on the Adreno 330 (community reports 2026-10-11 and 2026-11-01). Every Lumia GPU from Windows Phone 8.1 on is QCOM246F: 8974 Adreno 330 (1520, 930, Icon, 2520), 8x26 Adreno 305 (730/735, 830), 8x12 Adreno 302, 8909 Adreno 304 (550, 650), 8992/8994 Adreno 418/430 (950, 950 XL). The Windows Phone 8.0 chips have their own ids: 8960 Adreno 225 (920, 1020; QCOM2002 = 0x32303032) and 8930/8x27 Adreno 305 (520, 620, 720; QCOM0300 = 0x30303330). The 0x4d4f4351 exceptions above require driver >= 31.0.2.0, which these 2013-2016 drivers predate; x86 has no such GPU.",
+           "vendor_id": "0x4d4f4351",
+-          "device_id": [ "0x46363432" ]
++          "device_id": [ "0x46363432", "0x32303032", "0x30303330" ]
+         }
+       ]
+     },
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/RenderStateCache.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/RenderStateCache.cpp
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/RenderStateCache.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/RenderStateCache.cpp
+@@ -184,6 +184,35 @@
+         rtDesc.RenderTargetWriteMask = blendStateExt.getColorMaskIndexed(i);
+     }
+ 
++#if defined(_M_ARM)
++    // Venetium 0067: feature level 9_x rejects a blend state with AlphaToCoverageEnable or
++    // IndependentBlendEnable set (checked against the D3D11 runtime on WARP at 9_3), so a draw
++    // with alpha-to-coverage on, or with more than one render target bound, failed on an Adreno at
++    // 9_3. Per-buffer blend state needs 10_1 and is not offered there, so the bound render targets
++    // normally share one description and RenderTarget[0] alone says it; alpha-to-coverage has no
++    // 9_x form and is dropped.
++    if (renderer->getRenderer11DeviceCaps().featureLevel <= D3D_FEATURE_LEVEL_9_3)
++    {
++        blendDesc.AlphaToCoverageEnable = FALSE;
++        const D3D11_RENDER_TARGET_BLEND_DESC &rt0 = blendDesc.RenderTarget[0];
++        bool sameForAll                           = true;
++        for (size_t i = 1; i < key.rtvMax; i++)
++        {
++            const D3D11_RENDER_TARGET_BLEND_DESC &rt = blendDesc.RenderTarget[i];
++            sameForAll = sameForAll && rt.BlendEnable == rt0.BlendEnable &&
++                         rt.SrcBlend == rt0.SrcBlend && rt.DestBlend == rt0.DestBlend &&
++                         rt.BlendOp == rt0.BlendOp && rt.SrcBlendAlpha == rt0.SrcBlendAlpha &&
++                         rt.DestBlendAlpha == rt0.DestBlendAlpha &&
++                         rt.BlendOpAlpha == rt0.BlendOpAlpha &&
++                         rt.RenderTargetWriteMask == rt0.RenderTargetWriteMask;
++        }
++        if (sameForAll)
++        {
++            blendDesc.IndependentBlendEnable = FALSE;
++        }
++    }
++#endif
++
+     d3d11::BlendState d3dBlendState;
+     ANGLE_TRY(renderer->allocateResource(GetImplAs<Context11>(context), blendDesc, &d3dBlendState));
+     const auto &iter = mBlendStateCache.Put(key, std::move(d3dBlendState));
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/renderer11_utils.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/renderer11_utils.cpp
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/renderer11_utils.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/renderer11_utils.cpp
+@@ -1666,6 +1666,21 @@
+     caps->maxCullDistances                = D3D11_CLIP_OR_CULL_DISTANCE_COUNT;
+     caps->maxCombinedClipAndCullDistances = D3D11_CLIP_OR_CULL_DISTANCE_COUNT;
+ 
++#if defined(_M_ARM)
++    // Venetium 0067: feature level 9_x (an Adreno / Lumia at 9_3) has no dual-source blending
++    // and no way to turn depth clipping off: the runtime rejects a blend state with
++    // D3D11_BLEND_SRC1_* and a rasterizer state with DepthClipEnable FALSE (checked against the
++    // D3D11 runtime on WARP at 9_3 and 9_1). Skia blends LCD text and coverage with dual-source
++    // whenever EXT_blend_func_extended is there, so on the Lumia 735 those draws failed with
++    // "Error allocating BlendState". Like polygonOffsetClampEXT, neither is offered below 10_0.
++    if (featureLevel <= D3D_FEATURE_LEVEL_9_3)
++    {
++        extensions->blendFuncExtendedEXT = false;
++        caps->maxDualSourceDrawBuffers   = 0;
++        extensions->depthClampEXT        = false;
++    }
++#endif
++
+     // GL_KHR_parallel_shader_compile
+     extensions->parallelShaderCompileKHR = true;
+ 

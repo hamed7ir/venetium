@@ -44,7 +44,7 @@ tarball and apply the .222 -> .226 delta. confirm you are on it: `chrome/VERSION
 
 ## apply the patches
 
-apply `patches/0001` through `patches/0066` in order, except `0064`, which is for the thumb2 build (see the end). they are plain `git apply` patches. apply them with
+apply `patches/0001` through `patches/0067` in order, except `0064`, which is for the thumb2 build (see the end). they are plain `git apply` patches. apply them with
 `core.autocrlf=false` so the files stay byte-for-byte - arm32 is sensitive and i hash every file. the missing
 numbers (0009, 0024, 0031, 0034, 0038) are patches i dropped or replaced along the way; the old versions are kept
 under `patches/superseded/` for history, you do not apply those.
@@ -258,10 +258,21 @@ gecko-w10m); its shaders recompile byte-identical with fxc. arm32 only, and the 
 reported unsupported at any level (not only 720p+ / 480p+), and decodingInfo() calls them not smooth until real stats
 exist, so youtube sends h.264 to the hardware decoder at 144p-480p too. level-less "vp9" / "av1" still play in software.
 
+**0067 (v1.3.1.1)** - every lumia gpu (qualcomm adreno). the lumia drivers crash on gpu timer queries: the 735's gpu process died
+1-2 s after start on its first frame (`glBeginQueryEXT(GL_TIME_ELAPSED_EXT)` from chromium's swap-time helper, through
+angle's d3d11 and the 9_x layer into `qcdx9um8974`), and after 3 crashes chromium switches the gpu off. a gpu driver bug
+list entry turns `GL_EXT_disjoint_timer_query` off for them, the same way upstream does for android adreno 3xx. angle's
+d3d11 backend also broke the d3d11 rules for feature level 9_x: it offered dual-source blending, which skia uses for lcd
+text (the 735's log: "Error allocating BlendState"), and depth clamp, and it set independent blend and alpha-to-coverage,
+all of which a 9_x device refuses (checked against the d3d11 runtime on warp at 9_3). at 9_x it no longer does; arm32
+only, like 0065. the device ids come from the lumia driver infs in [WOA-Project/Lumia-Drivers](https://github.com/WOA-Project/Lumia-Drivers):
+every lumia from windows phone 8.1 on is `QCOM246F` (dxgi device 0x46363432, the one d3dprobe measured on the 2520), and
+the gpu-raster exception now also has the two windows phone 8.0 chips, 8960 (`QCOM2002`) and 8930 (`QCOM0300`).
+
 ## the thumb2 build (windows rt 8.0 / 8.1)
 
 windows rt 8.x only runs thumb-2 code, so this build has v8 ported to thumb-2 and a few windows 8 fixes. on top of
-0001-0063:
+the other patches (0001-0067 except 0064):
 
 1. apply `patches/0064-windows-rt-8.patch` (the chromium side: pe subsystem 6.02, run-time lookups for the 8.1/10-only
    functions, version gates, delay-load stand-ins - details in the patch header).
