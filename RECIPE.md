@@ -44,7 +44,7 @@ tarball and apply the .222 -> .226 delta. confirm you are on it: `chrome/VERSION
 
 ## apply the patches
 
-apply `patches/0001` through `patches/0067` in order, except `0064`, which is for the thumb2 build (see the end). they are plain `git apply` patches. apply them with
+apply `patches/0001` through `patches/0068` in order, except `0064`, which is for the thumb2 build (see the end). they are plain `git apply` patches. apply them with
 `core.autocrlf=false` so the files stay byte-for-byte - arm32 is sensitive and i hash every file. the missing
 numbers (0009, 0024, 0031, 0034, 0038) are patches i dropped or replaced along the way; the old versions are kept
 under `patches/superseded/` for history, you do not apply those.
@@ -269,10 +269,23 @@ only, like 0065. the device ids come from the lumia driver infs in [WOA-Project/
 every lumia from windows phone 8.1 on is `QCOM246F` (dxgi device 0x46363432, the one d3dprobe measured on the 2520), and
 the gpu-raster exception now also has the two windows phone 8.0 chips, 8960 (`QCOM2002`) and 8930 (`QCOM0300`).
 
+**0068 (v1.3.1.2)** - shader limits at feature level 9_x. with 0067 the 735 got past its first frame, but its gpu process still
+exited on context loss 11-17 s in, three times, each right after one `error X5615: Compiled shader code uses too many
+instruction slots (466). Max. allowed by the target (vs_2_x) is 256`. reproduced on the server with x86 angle forced
+to warp at 9_3: it is skia's stroke tessellation shader (467 slots). angle retries a failed compile with "skip
+validation", and at 9_x that is the step that enforces the 9_x limits, so the retry hands the driver a shader that is
+over them. angle no longer retries that way at 9_x (an over-limit shader is now an ordinary failed draw, also for
+webgl pages), and skia turns its tessellation path renderer off on angle d3d11 at 9_x, as it already does on angle
+d3d9 (the tegra path), so strokes use the other path renderers. that makes a failed draw routine at 9_x, and angle's
+d3d11 draw path had two holes there (found in review, reproduced with a webgl page): the draw after a failed one
+skipped the program and crashed the gpu process on a null shader, and every failed draw was logged twice. now the
+shaders stay dirty after a failure, a null shader is refused, and only the first 8 failures are reported. the
+compile change and the skia rule only apply at 9_x; the draw-path fixes only run when a shader is missing.
+
 ## the thumb2 build (windows rt 8.0 / 8.1)
 
 windows rt 8.x only runs thumb-2 code, so this build has v8 ported to thumb-2 and a few windows 8 fixes. on top of
-the other patches (0001-0067 except 0064):
+the other patches (0001-0068 except 0064):
 
 1. apply `patches/0064-windows-rt-8.patch` (the chromium side: pe subsystem 6.02, run-time lookups for the 8.1/10-only
    functions, version gates, delay-load stand-ins - details in the patch header).

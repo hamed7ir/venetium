@@ -1,0 +1,200 @@
+Venetium 0068 - feature level 9_x shader limits: no "skip validation" retry in ANGLE's D3D11 backend, a safe failed draw, no Skia path tessellation.
+1. With 0067 the Lumia 735 (Adreno 305, qcdx9um8974 9.14.1140, ANGLE D3D11 at vs_4_0_level_9_3) gets past its first
+   frame, but 11-17 s later the GPU process exits with RESULT_CODE_GPU_EXIT_ON_CONTEXT_LOST, three times, and Chromium
+   turns the GPU off. Just before each exit ANGLE logs one "C:\fakepath(136,14): error X5615: Compiled shader code
+   uses too many instruction slots (466). Max. allowed by the target (vs_2_x) is 256." At 9_x the D3D11 backend
+   compiles vs_4_0_level_9_3, whose level-9 part is vs_2_x: 256 instruction slots. Upstream ANGLE never creates a
+   D3D11 device below 10_0 (0045 adds 9_3 on ARM32), so neither ANGLE nor Skia has a rule for it.
+2. Reproduced on the server with the x86 ANGLE forced to WARP at 9_3 (a test-only hook, not in this patch): the same
+   error at the same place, (136,14), 467 slots. The HLSL is Skia's stroke tessellation shader (tessControlArgs =
+   radial segments per radian, join type, stroke radius; per-instance curve points), drawn by
+   TessellationPathRenderer / StrokeTessellateOp: 467 slots optimized, 988 with skip optimization, 538 with avoid
+   flow control, so it can never compile at 9_x.
+3. ANGLE compile: Renderer11::compileToExecutable retries a failed compile with "skip validation", "skip
+   optimization" and "avoid flow control". Validation is the step that holds a level-9 shader to the 9_x limits, so
+   at 9_x the "skip validation" retry compiles the over-limit shader (checked with D3DCompile on WARP: a shader that
+   fails "default" with X5615 at 402 slots compiles with D3DCOMPILE_SKIP_VALIDATION, 402 slots, and the device takes
+   it). That is the single X5615 per GPU process in the 735's log; the context loss follows. At 9_x there is no "skip
+   validation" retry now. The D3D backend still links a program whose executable failed (link status true, the
+   compiler message in the info log); each draw that needs the executable fails instead, whichever program it is
+   (Skia's, the compositor's or a WebGL page's).
+4. ANGLE draw path: that makes a failed draw routine at 9_x, which exposed two holes in it (found in review,
+   reproduced on WARP at 9_3 with a WebGL page that draws an over-limit vertex shader again and again with the same
+   program and buffers, changing only a uniform). StateManager11::updateState resets each dirty bit before it syncs
+   it, so after a failed program sync the next draw skipped the program and built an input layout from the missing
+   vertex executable: the second draw crashed the GPU process (STATUS_ACCESS_VIOLATION). The shaders now stay dirty
+   after a failed sync, and InputLayoutCache fails the draw rather than dereference a null executable. And every
+   failed draw logged an ERR line plus a GL error (which ANGLE logs again), while such a program is drawn every
+   frame: the first 8 per GPU process are reported, the rest fail quietly, as the D3D9 path treats a failed program
+   (0032/0053). With this, on WARP at 9_3: 20 draws, 8 GL errors, no crash, the context kept. These three only run
+   when an executable is missing, which is routine at 9_x and rare elsewhere.
+5. Skia: GrGLCaps already turns the tessellation path renderer off on ANGLE's D3D9 backend (the Tegra: "D3D9 conic
+   strokes fail") and on native Adreno 3xx. At 9_3 it stayed on, because the backend is D3D11 and instancing is
+   there. It is now also off when the ANGLE renderer string says "_level_9_" ("Direct3D11 vs_4_0_level_9_3 ..."), so
+   strokes and fills take the other path renderers, as on the Tegra. The tessellator only ever took non-antialiased
+   draws (coverage AA never used it), so that is all this changes. On WARP at 9_3, a page of crisp-edge strokes,
+   dashes, concave even-odd and nonzero fills and clip paths draws none of its strokes while the tessellator is on,
+   and draws the same as at full feature level with it off and stencil on (checked with instanced arrays turned off,
+   which takes the tessellator out too): no X5615, no failed draw, no depth-stencil error.
+   The compile change and the Skia rule change behavior only at feature level 9_x, which only ARM32 builds create
+   (0045), so neither is _M_ARM-only.
+
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Context11.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Context11.cpp
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Context11.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Context11.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "libANGLE/renderer/d3d/d3d11/Context11.h"
+ 
++#include <atomic>
+ #include <utility>
+ 
+ #include "common/entry_points_enum_autogen.h"
+@@ -46,6 +47,19 @@
+ 
+ namespace
+ {
++// Venetium 0068: an executable that failed to compile (at feature level 9_x: over the shader-model limits) fails every
++// draw that needs it, and a program like that is usually drawn again every frame. Report the first few (an ERR line
++// plus a GL error, which ANGLE logs too) and fail the rest quietly, as the D3D9 path treats a failed program
++// (0032/0053). The info log can be empty: a signature that already failed, at link time or on an earlier draw,
++// returns no executable without compiling again (0053).
++bool ReportFailedDrawExecutable()
++{
++    constexpr unsigned int kMaxReports = 8;
++    static std::atomic<unsigned int> sReported{0};
++    return sReported.load(std::memory_order_relaxed) < kMaxReports &&
++           sReported.fetch_add(1, std::memory_order_relaxed) < kMaxReports;
++}
++
+ ANGLE_INLINE bool DrawCallHasDynamicAttribs(const gl::Context *context)
+ {
+     VertexArray11 *vertexArray11 = GetImplAs<VertexArray11>(context->getState().getVertexArray());
+@@ -996,9 +1010,13 @@
+                                                                          &vertexExe, &infoLog));
+         if (!executableD3D->hasVertexExecutableForCachedInputLayout())
+         {
+-            ASSERT(infoLog.getLength() > 0);
+-            ERR() << "Error compiling dynamic vertex executable: " << infoLog.str();
+-            ANGLE_TRY_HR(this, E_FAIL, "Error compiling dynamic vertex executable");
++            // Venetium 0068: see ReportFailedDrawExecutable.
++            if (ReportFailedDrawExecutable())
++            {
++                ERR() << "Error compiling dynamic vertex executable: " << infoLog.str();
++                ANGLE_TRY_HR(this, E_FAIL, "Error compiling dynamic vertex executable");
++            }
++            return angle::Result::Stop;
+         }
+     }
+ 
+@@ -1023,9 +1041,13 @@
+                                                                          &infoLog));
+         if (!executableD3D->hasPixelExecutableForCachedOutputLayout())
+         {
+-            ASSERT(infoLog.getLength() > 0);
+-            ERR() << "Error compiling dynamic pixel executable: " << infoLog.str();
+-            ANGLE_TRY_HR(this, E_FAIL, "Error compiling dynamic pixel executable");
++            // Venetium 0068: see ReportFailedDrawExecutable.
++            if (ReportFailedDrawExecutable())
++            {
++                ERR() << "Error compiling dynamic pixel executable: " << infoLog.str();
++                ANGLE_TRY_HR(this, E_FAIL, "Error compiling dynamic pixel executable");
++            }
++            return angle::Result::Stop;
+         }
+     }
+ 
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/InputLayoutCache.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/InputLayoutCache.cpp
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/InputLayoutCache.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/InputLayoutCache.cpp
+@@ -214,6 +214,9 @@
+     ShaderExecutableD3D *shader = nullptr;
+     ANGLE_TRY(executableD3D->getVertexExecutableForCachedInputLayout(context11, renderer, &shader,
+                                                                      nullptr));
++    // Venetium 0068: no input layout without a vertex executable (its compile failed). StateManager11::updateState
++    // fails such a draw before it gets here; this keeps a missed case from dereferencing null.
++    ANGLE_CHECK_HR(context11, shader != nullptr, "No vertex executable for the input layout", E_FAIL);
+ 
+     ShaderExecutableD3D *shader11 = GetAs<ShaderExecutable11>(shader);
+ 
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/Renderer11.cpp
+@@ -2375,6 +2375,7 @@
+     if (mD3d12Module)
+         rendererString << "on12";
+ 
++    // Venetium 0068: Skia's GrGLCaps keys its feature level 9_x rule on the "_level_9_" this suffix puts here.
+     rendererString << " vs_" << getMajorShaderModel() << "_" << getMinorShaderModel()
+                    << getShaderModelSuffix();
+     rendererString << " ps_" << getMajorShaderModel() << "_" << getMinorShaderModel()
+@@ -3200,7 +3201,15 @@
+     // Try the default flags first and if compilation fails, try some alternatives.
+     std::vector<CompileConfig> configs;
+     configs.push_back(CompileConfig(flags, "default"));
+-    configs.push_back(CompileConfig(flags | D3DCOMPILE_SKIP_VALIDATION, "skip validation"));
++    // Venetium 0068: no "skip validation" retry at feature level 9_x. Validation is what holds a level-9 shader to the
++    // 9_x limits (vs_2_x: 256 instruction slots); a shader that compiles only with it skipped is over them, and on the
++    // Adreno 305's 9_3 driver the context is lost right after one is used (the GPU process exits on context loss,
++    // three times, and the GPU is disabled). Failing here leaves the executable missing instead: the link still
++    // succeeds and each draw that needs it fails (Context11::triggerDrawCallProgramRecompilation).
++    if (getShaderModelSuffix().empty())
++    {
++        configs.push_back(CompileConfig(flags | D3DCOMPILE_SKIP_VALIDATION, "skip validation"));
++    }
+     configs.push_back(CompileConfig(flags | D3DCOMPILE_SKIP_OPTIMIZATION, "skip optimization"));
+ 
+     if (getMajorShaderModel() == 4 && getShaderModelSuffix() != "")
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/StateManager11.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/StateManager11.cpp
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/StateManager11.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/StateManager11.cpp
+@@ -2099,8 +2099,19 @@
+                 ANGLE_TRY(syncUniformBuffers(context));
+                 break;
+             case DIRTY_BIT_SHADERS:
+-                ANGLE_TRY(syncProgram(context, mode));
+-                break;
++            {
++                // Venetium 0068: keep the shaders dirty when the sync fails (an executable that failed to compile,
++                // routine at feature level 9_x). The bit was reset above and the loop stops here, so the bits after it
++                // stay set; without this the next draw with the same program skips the program and builds an input
++                // layout from the missing vertex executable (a null dereference, the GPU process crashes).
++                angle::Result result = syncProgram(context, mode);
++                if (result != angle::Result::Continue)
++                {
++                    invalidateShaders();
++                    return result;
++                }
++                break;
++            }
+             case DIRTY_BIT_CURRENT_VALUE_ATTRIBS:
+                 ANGLE_TRY(syncCurrentValueAttribs(context, glState.getVertexAttribCurrentValues()));
+                 break;
+diff --git a/third_party/skia/src/gpu/ganesh/gl/GrGLCaps.cpp b/third_party/skia/src/gpu/ganesh/gl/GrGLCaps.cpp
+--- a/third_party/skia/src/gpu/ganesh/gl/GrGLCaps.cpp
++++ b/third_party/skia/src/gpu/ganesh/gl/GrGLCaps.cpp
+@@ -44,6 +44,7 @@
+ 
+ #include <algorithm>
+ #include <cstddef>
++#include <cstring>
+ #include <initializer_list>
+ #include <memory>
+ 
+@@ -4590,6 +4591,16 @@
+         ctxInfo.renderer() == GrGLRenderer::kAdreno4xx_other ||  // We get garbage on Adreno405.
+         ctxInfo.angleBackend() == GrGLANGLEBackend::kD3D9) {  // D3D9 conic strokes fail.
+         fDisableTessellationPathRenderer = true;
++    }
++    // Venetium 0068: ANGLE's D3D11 backend at feature level 9_x (Windows ARM32 Adreno: "... Direct3D11
++    // vs_4_0_level_9_3 ...") builds vertex shaders for vs_2_x, which allows 256 instruction slots; the stroke
++    // tessellation shader needs 467. Draw paths without the tessellator there, as on ANGLE's D3D9 backend above.
++    if (ctxInfo.angleBackend() == GrGLANGLEBackend::kD3D11) {
++        const GrGLubyte* rendererString;
++        GR_GL_CALL_RET(glInterface, rendererString, GetString(GR_GL_RENDERER));
++        if (rendererString && strstr(reinterpret_cast<const char*>(rendererString), "_level_9_")) {
++            fDisableTessellationPathRenderer = true;
++        }
+     }
+     // We found that on Wembley devices (PowerVR GE8320) that using tessellation path renderer would
+     // cause lots of rendering errors where it seemed like vertices were in the wrong place. This

@@ -34,7 +34,7 @@ my own work.
 ## how it is built
 
 this repo is a patch series on top of chromium 150, plus the build tooling and a
-device test kit. the patches are in `patches/` (0001–0067), the full build steps
+device test kit. the patches are in `patches/` (0001–0068), the full build steps
 are in `RECIPE.md`, and `VENETIUM-IDS.md` says what each patch does. the v8 thumb-2
 port is in its own repo: [v8-thumb2-rt](https://github.com/hamed7ir/v8-thumb2-rt).
 
@@ -44,8 +44,8 @@ it works on a real device: pages load, the sandbox is on, video plays. i am stil
 testing and tuning. v1.3 is pgo + thinlto (about 50% faster on the surface 2) and adds
 the thumb2 build for windows rt 8.x, with the jit on. v1.3.1 (prerelease) has fixes for qualcomm devices
 (lumia): the thumb2 build's crash at start and the gpu on adreno. v1.3.1.1 (prerelease) fixes the gpu process crash
-on every lumia gpu (0067), so the gpu stays on there. not tested on them yet, it needs testers. next: test it on
-rt 8.0 and on 15035.
+on every lumia gpu (0067), and v1.3.1.2 (prerelease) the gpu process shutting down a few seconds later at feature
+level 9_3 (0068), so the gpu stays on there. it needs more testers. next: test it on rt 8.0 and on 15035.
 
 ## license 
 
