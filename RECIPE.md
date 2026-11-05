@@ -44,7 +44,7 @@ tarball and apply the .222 -> .226 delta. confirm you are on it: `chrome/VERSION
 
 ## apply the patches
 
-apply `patches/0001` through `patches/0068` in order, except `0064`, which is for the thumb2 build (see the end). they are plain `git apply` patches. apply them with
+apply `patches/0001` through `patches/0070` in order, except `0064`, which is for the thumb2 build (see the end). they are plain `git apply` patches. apply them with
 `core.autocrlf=false` so the files stay byte-for-byte - arm32 is sensitive and i hash every file. the missing
 numbers (0009, 0024, 0031, 0034, 0038) are patches i dropped or replaced along the way; the old versions are kept
 under `patches/superseded/` for history, you do not apply those.
@@ -282,10 +282,30 @@ skipped the program and crashed the gpu process on a null shader, and every fail
 shaders stay dirty after a failure, a null shader is refused, and only the first 8 failures are reported. the
 compile change and the skia rule only apply at 9_x; the draw-path fixes only run when a shader is missing.
 
+**0069 (v1.3.1.3)** - no depth textures at feature level 9_x. on the 735 the webgl field sample (webglsamples.org/field)
+showed only its blue background, and its `chrome://gpu` log had "Error allocating ShaderResourceView" (0x80070057) on
+every frame; warp at 9_3 with the arm32 9_3 paths on gives the same error. at 9_x angle's format table has no shader
+resource view format for the depth formats (a 9_x gpu cannot sample depth), but angle still counted them as textures
+and offered `GL_ANGLE_depth_texture`, and with it `WEBGL_depth_texture`. the field sample renders its depth into one
+and samples it for depth of field, so that draw failed every frame. at 9_x the extension is no longer offered and
+pages take their fallback: the field sample then draws correctly on warp at 9_3. a sweep of every other webgl texture
+format at 9_3 found nothing else that fails. arm32 only, like 0065.
+
+**0070 (v1.3.1.3)** - the lumias rasterize on the cpu again. on the 735, scrolling drew text from two scroll positions
+over each other, and a tab switch cleaned it up until the next scroll. it does not happen on warp at 9_3, so it is the
+driver. in a device test of five switches, `--disable-gpu-rasterization` fixed it on every page,
+`--flush_on_framebuffer_change` only on text-only pages, and `--disable_discard_framebuffer`, `--disable-partial-raster`
+and `--ui-disable-partial-swap` changed nothing. the lumias only rastered on the gpu because 0051 (widened by 0067)
+exempted their ids from software rendering list entry 122, which turns gpu rasterization off for windows gpus below
+ps_5.0 + direct3d11. 0070 removes that exception, so they fall under entry 122 again, the same as the switch.
+compositing, webgl, video and canvas stay on the gpu, the shader disk cache stays on (0036), and
+`--enable-gpu-rasterization` turns it back on for testing. the note on the lumia gpu ids moved to driver bug list
+entry 487.
+
 ## the thumb2 build (windows rt 8.0 / 8.1)
 
 windows rt 8.x only runs thumb-2 code, so this build has v8 ported to thumb-2 and a few windows 8 fixes. on top of
-the other patches (0001-0068 except 0064):
+the other patches (0001-0070 except 0064):
 
 1. apply `patches/0064-windows-rt-8.patch` (the chromium side: pe subsystem 6.02, run-time lookups for the 8.1/10-only
    functions, version gates, delay-load stand-ins - details in the patch header).

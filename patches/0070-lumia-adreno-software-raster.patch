@@ -1,0 +1,45 @@
+Venetium 0070 - Lumia Adreno: tile rasterization back on the CPU (scrolling drew old text over the page).
+1. With v1.3.1.2 on the Lumia 735 (Adreno 305, driver 9.14.1140, D3D11 feature level 9_3), scrolling drew text from
+   two scroll positions over each other; a tab switch, which rasters every tile again into fresh textures, cleaned it
+   up until the next scroll. It does not happen on WARP at 9_3 (headless or in a real window, with the ARM32 9_3
+   paths on), so it is this driver.
+2. Device test of five switches on v1.3.1.2 (community report 2026-11-04): --disable-gpu-rasterization fixes it on
+   every page; --flush_on_framebuffer_change fixes text-only pages (chrome://gpu) but not Google search;
+   --disable_discard_framebuffer, --disable-partial-raster and --ui-disable-partial-swap change nothing. So the fault
+   is GPU tile rasterization on this driver (the tab-switch cure points at reused tile textures keeping old content);
+   GPU compositing, which stayed on in that test, is fine.
+3. The Lumias rastered on the GPU only because of the exception 0051 added to software_rendering_list.json entry 122
+   (0067 widened it to every Lumia GPU id); upstream, that entry blocklists GPU tile rasterization on Windows GPUs
+   below ps_5.0 + Direct3D11. This patch removes the exception, so the Lumias fall under entry 122 again, which is
+   what --disable-gpu-rasterization did in the test. Nothing else changes: the Gr shader disk cache stays on (0036),
+   and --enable-gpu-rasterization still turns GPU rasterization back on for testing. The exception's note on the
+   Lumia GPU ids moves to gpu_driver_bug_list.json entry 487, which uses the same ids and pointed at it (comment
+   only: the generated driver bug list code is unchanged).
+
+diff --git a/gpu/config/gpu_driver_bug_list.json b/gpu/config/gpu_driver_bug_list.json
+--- a/gpu/config/gpu_driver_bug_list.json
++++ b/gpu/config/gpu_driver_bug_list.json
+@@ -3817,7 +3817,7 @@
+     {
+       "id": 487,
+       "description": "GPU timer queries crash Lumia-era Qualcomm Adreno drivers on Windows",
+-      "comment": "Venetium 0067: on the Lumia 735 (Windows RT 8.1, qcdx9um8974.dll 9.14.1140) the GPU process crashed 1-2 s after start, in all 3 dumps at qcdx9um8974+0x890f5, writing past the end of a buffer: viz::SkiaOutputDeviceGL::Present -> gl::GLSurfacePresentationHelper::PreSwapBuffers -> gl::GPUTimer::QueryTimeStamp -> glBeginQueryEXT(GL_TIME_ELAPSED_EXT) -> ANGLE rx::Query11::resume -> ID3D11DeviceContext::Begin(D3D11_QUERY_TIMESTAMP_DISJOINT) -> D3D10Level9 -> qcdx9um8974 (D3D11 at feature level 9_x runs through the D3D9 user-mode driver). After 3 crashes Chromium turns the GPU off and everything is software. Without GL_EXT_disjoint_timer_query the presentation helper uses a fence (a D3D11 event query) instead, and WebGL does not offer the timer extensions. Device ids: every Lumia GPU, from the driver INFs in github.com/WOA-Project/Lumia-Drivers (see software_rendering_list.json entry 122, Venetium 0051/0067).",
++      "comment": "Venetium 0067: on the Lumia 735 (Windows RT 8.1, qcdx9um8974.dll 9.14.1140) the GPU process crashed 1-2 s after start, in all 3 dumps at qcdx9um8974+0x890f5, writing past the end of a buffer: viz::SkiaOutputDeviceGL::Present -> gl::GLSurfacePresentationHelper::PreSwapBuffers -> gl::GPUTimer::QueryTimeStamp -> glBeginQueryEXT(GL_TIME_ELAPSED_EXT) -> ANGLE rx::Query11::resume -> ID3D11DeviceContext::Begin(D3D11_QUERY_TIMESTAMP_DISJOINT) -> D3D10Level9 -> qcdx9um8974 (D3D11 at feature level 9_x runs through the D3D9 user-mode driver). After 3 crashes Chromium turns the GPU off and everything is software. Without GL_EXT_disjoint_timer_query the presentation helper uses a fence (a D3D11 event query) instead, and WebGL does not offer the timer extensions. Device ids: the Lumia GPU drivers' own, from their INFs in github.com/WOA-Project/Lumia-Drivers: an ACPI display adapter's DXGI ids are its ACPI hardware id read as two little-endian fourccs, so ACPI QCOM246F = vendor 0x4d4f4351 ('QCOM') + device 0x46363432 ('246F'), which is what d3dprobe measured on the Adreno 330 (community reports 2026-10-11 and 2026-11-01). Every Lumia GPU from Windows Phone 8.1 on is QCOM246F: 8974 Adreno 330 (1520, 930, Icon, 2520), 8x26 Adreno 305 (730/735, 830), 8x12 Adreno 302, 8909 Adreno 304 (550, 650), 8992/8994 Adreno 418/430 (950, 950 XL). The Windows Phone 8.0 chips have their own ids: 8960 Adreno 225 (920, 1020; QCOM2002 = 0x32303032) and 8930/8x27 Adreno 305 (520, 620, 720; QCOM0300 = 0x30303330). Venetium 0070 moved this note here from software_rendering_list.json entry 122 when it removed the 0051/0067 GPU rasterization exception for these ids.",
+       "os": {
+         "type": "win"
+       },
+diff --git a/gpu/config/software_rendering_list.json b/gpu/config/software_rendering_list.json
+--- a/gpu/config/software_rendering_list.json
++++ b/gpu/config/software_rendering_list.json
+@@ -886,11 +886,6 @@
+           "comment": "Venetium 0053: the Qualcomm Adreno half of the exception above (DXGI vendor 'QCOM' 0x4d4f4351) - an Adreno whose ANGLE runs on D3D9. Same reasoning; ARM32-only by vendor.",
+           "vendor_id": "0x4d4f4351",
+           "gl_renderer": ".*Direct3D9.*"
+-        },
+-        {
+-          "comment": "Venetium 0051/0067: Qualcomm Adreno on Windows ARM32 (the Lumia phones and the Lumia 2520) renders through ANGLE's Direct3D11 backend at feature level 9_3 (Venetium 0045, 0065) - its D3D9 driver paints garbage, so D3D11 is the good path. Skia Ganesh rasters on its D3D11 backend here. The device ids are the Lumia GPU drivers' own, from their INFs in github.com/WOA-Project/Lumia-Drivers: an ACPI display adapter's DXGI ids are its ACPI hardware id read as two little-endian fourccs, so ACPI QCOM246F = vendor 0x4d4f4351 ('QCOM') + device 0x46363432 ('246F'), which is what d3dprobe measured on the Adreno 330 (community reports 2026-10-11 and 2026-11-01). Every Lumia GPU from Windows Phone 8.1 on is QCOM246F: 8974 Adreno 330 (1520, 930, Icon, 2520), 8x26 Adreno 305 (730/735, 830), 8x12 Adreno 302, 8909 Adreno 304 (550, 650), 8992/8994 Adreno 418/430 (950, 950 XL). The Windows Phone 8.0 chips have their own ids: 8960 Adreno 225 (920, 1020; QCOM2002 = 0x32303032) and 8930/8x27 Adreno 305 (520, 620, 720; QCOM0300 = 0x30303330). The 0x4d4f4351 exceptions above require driver >= 31.0.2.0, which these 2013-2016 drivers predate; x86 has no such GPU.",
+-          "vendor_id": "0x4d4f4351",
+-          "device_id": [ "0x46363432", "0x32303032", "0x30303330" ]
+         }
+       ]
+     },

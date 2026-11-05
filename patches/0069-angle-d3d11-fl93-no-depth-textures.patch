@@ -1,0 +1,29 @@
+Venetium 0069 - feature level 9_x: no depth textures (WebGL pages that sample one drew nothing).
+1. With v1.3.1.2 on the Lumia 735, webglsamples.org/field showed only its blue clear color. Reproduced on WARP at 9_3
+   with the x86 build running the ARM32 9_3 paths (0065, 0067; test-only switches, not in this patch): every frame
+   logged "Error allocating ShaderResourceView" (HRESULT 0x80070057), and a test-only probe showed the view: format
+   UNKNOWN on a 1024x1024 D24_UNORM_S8_UINT texture bound only as a depth-stencil target.
+2. At 9_x ANGLE's format table gives the depth formats no shader resource view format (srvFormat UNKNOWN below 10_0:
+   a 9_x device cannot sample depth), but GenerateTextureFormatCaps still counts them texturable (a depth-stencil
+   Texture2D can be created), so GL_ANGLE_depth_texture, and with it WEBGL_depth_texture, was offered. The field
+   sample renders its scene depth into one and samples it for depth of field; that draw failed every frame. At 9_x
+   the extension is no longer offered (0067's 9_x block), so pages take their fallback: the field sample then encodes
+   depth in alpha and draws correctly on WARP at 9_3, with no errors. A sweep of every other WebGL texture format at
+   9_3 (upload, nearest / linear / mipmapped sampling, render target) found nothing else that fails. _M_ARM only.
+
+diff --git a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/renderer11_utils.cpp b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/renderer11_utils.cpp
+--- a/third_party/angle/src/libANGLE/renderer/d3d/d3d11/renderer11_utils.cpp
++++ b/third_party/angle/src/libANGLE/renderer/d3d/d3d11/renderer11_utils.cpp
+@@ -1678,6 +1678,12 @@
+         extensions->blendFuncExtendedEXT = false;
+         caps->maxDualSourceDrawBuffers   = 0;
+         extensions->depthClampEXT        = false;
++        // Venetium 0069: and no depth textures. At 9_x the depth formats have no shader resource view format
++        // (texture_format_table: srvFormat UNKNOWN below 10_0), but they still count as texturable, so ANGLE offered
++        // GL_ANGLE_depth_texture (WEBGL_depth_texture): rendering to one worked and every draw that sampled it
++        // failed with "Error allocating ShaderResourceView" (E_INVALIDARG). The WebGL field sample took that path
++        // and drew nothing; without the extension it encodes depth in alpha.
++        extensions->depthTextureANGLE    = false;
+     }
+ #endif
+ 
