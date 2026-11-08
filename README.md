@@ -17,8 +17,8 @@ my own work.
 - surface rt (tegra 3) and surface 2 (tegra 4), arm32
 - windows 10 build 15035 (the arm build that boots on these tablets)
 - windows rt 8.1 with the thumb2 build (v8 ported to thumb-2). rt 8.0 should work too, not tested on a device yet
-- lumia 2520 / lumia 735 and the other lumias (qualcomm adreno): v1.3.1.1 is a test build for them. i don't have
-  them, so it needs testers
+- lumia 2520 / lumia 735 and the other lumias (qualcomm adreno): v1.3.2 has the fixes of the v1.3.1.x test builds,
+  tested on a lumia 735 by aimul. i don't have them, so it still needs testers
 - graphics go through d3d9 / angle (gl es2) on the tegra, it has no d3d11. adreno (lumia) uses angle's d3d11 at
   feature level 9_3
 
@@ -46,8 +46,10 @@ the thumb2 build for windows rt 8.x, with the jit on. v1.3.1 (prerelease) has fi
 (lumia): the thumb2 build's crash at start and the gpu on adreno. v1.3.1.1 (prerelease) fixes the gpu process crash
 on every lumia gpu (0067), and v1.3.1.2 (prerelease) the gpu process shutting down a few seconds later at feature
 level 9_3 (0068), so the gpu stays on there. v1.3.1.3 (prerelease) fixes webgl pages that use depth textures (0069)
-and old text drawn over the page when scrolling on the lumias, which rasterize on the cpu again (0070). it needs
-more testers. next: test it on rt 8.0 and on 15035.
+and old text drawn over the page when scrolling on the lumias, which rasterize on the cpu again (0070). v1.3.2 is
+the stable release with all of that, and the thumb2 build no longer crashes on telegram web and discord (the jit ran
+out of scratch registers on 64-bit shifts, fixed in v8-thumb2-rt). it needs more testers. next: test it on rt 8.0 and
+on 15035.
 
 ## license 
 
