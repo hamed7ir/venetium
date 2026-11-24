@@ -14,17 +14,19 @@ toolchain. everything else is normal chromium plus my patches.
 
 **the fixed toolchain (this is the important part):**
 
-- **llvm-rt2.1** - my patched llvm / clang / lld. stock llvm has real arm32-windows codegen bugs: the control-flow
-  guard tables, the c++ exception unwind tables, and the integer-division helpers all come out wrong, and chrome
-  crashes on the device from them. llvm-rt2.1 fixes all three. point `clang_base_path` at it. do not use stock
-  clang for the arm32 build - it will compile fine and then crash on the device.
+- **llvm-rt2.4** (v1.4; v1.3 used rt2.1) - my patched llvm / clang / lld. stock llvm has real arm32-windows codegen
+  bugs: the control-flow guard tables, the c++ exception unwind tables, and the integer-division helpers all come out
+  wrong, and chrome crashes on the device from them. rt2.4 fixes those, its lld links windows arm32 thinlto (rt2.1
+  needed the lld fixes in `toolchain/rt21-lto/` for that), and it ships the arm32 profile runtime that a pgo
+  instrumented build needs. point `clang_base_path` at it. do not use stock clang for the arm32 build - it will
+  compile fine and then crash on the device.
 
-- **rustc built with llvm-rt2.1.** chromium 150 has rust code in it, and that rust has to go through the same fixed
-  llvm, or the rust objects get the same arm32 miscompiles. so build rustc from source against llvm-rt2.1, build a
-  `thumbv7a-pc-windows-msvc` std for it, and point `rust_sysroot_absolute` at that sysroot. build bindgen the same
-  way (it is an x64 host tool) and point `rust_bindgen_root` at it.
-  
-https://github.com/hamed7ir/llvm-rt1/releases/tag/rt2.1-23.1.1
+- **rustc built with llvm-rt2.4.** chromium 150 has rust code in it, and that rust has to go through the same fixed
+  llvm, or the rust objects get the same arm32 miscompiles. so build rustc from source against llvm-rt2.4, build a
+  `thumbv7a-pc-windows-msvc` std for it, and point `rust_sysroot_absolute` at that sysroot (the rt2.4 release has a
+  ready one). build bindgen the same way (it is an x64 host tool) and point `rust_bindgen_root` at it.
+
+https://github.com/hamed7ir/llvm-rt1/releases/tag/rt2.4-23.1.1 (rt2.1: https://github.com/hamed7ir/llvm-rt1/releases/tag/rt2.1-23.1.1)
 
 
 **visual studio 2022 build tools** - the msvc headers and libs, the windows sdk, and `csc` (used by the installer).
@@ -44,7 +46,7 @@ tarball and apply the .222 -> .226 delta. confirm you are on it: `chrome/VERSION
 
 ## apply the patches
 
-apply `patches/0001` through `patches/0070` in order, except `0064`, which is for the thumb2 build (see the end). they are plain `git apply` patches. apply them with
+apply `patches/0001` through `patches/0076` in order, except `0064`, which is for the thumb2 build (see the end). they are plain `git apply` patches. apply them with
 `core.autocrlf=false` so the files stay byte-for-byte - arm32 is sensitive and i hash every file. the missing
 numbers (0009, 0024, 0031, 0034, 0038) are patches i dropped or replaced along the way; the old versions are kept
 under `patches/superseded/` for history, you do not apply those.
@@ -55,8 +57,8 @@ make your output directory with `args/out-arm-rt21.gn` as its `args.gn` (that fi
 `args/venetium.gn`). edit the toolchain paths in it to your own, then `gn gen out\arm-rt21`. the parts that matter:
 
 - `target_cpu = "arm"`
-- `clang_base_path` -> your llvm-rt2.1
-- `rust_sysroot_absolute` -> your rustc-rt2.1 sysroot; `rust_bindgen_root` -> your bindgen
+- `clang_base_path` -> your llvm-rt2.4
+- `rust_sysroot_absolute` -> your rustc-rt2.4 sysroot; `rust_bindgen_root` -> your bindgen
 - arm32 renders through angle on d3d9 (the tegras, feature level 9_1) or on d3d11 at feature level 9_3 (adreno,
   0045), so: `enable_swiftshader=false`, `angle_enable_wgpu=false`, `dawn_use_swiftshader=false`,
   `dawn_use_built_dxc=false`. there is no d3d12/webgpu on these gpus, and the windows sdk ships no 32-bit-arm
@@ -64,20 +66,25 @@ make your output directory with `args/out-arm-rt21.gn` as its `args.gn` (that fi
 - codecs on: `proprietary_codecs=true`, `ffmpeg_branding="Chrome"` (so h.264 / aac work). both come from
   `args/venetium.gn`, so the x86 build gets them too.
 - `is_official_build = true` (in `args/venetium.gn`): a real release build, the way google builds chrome -
-  `chrome://version` says "official build". the out-dir files keep their own `use_thin_lto = false`,
-  `chrome_pgo_phase` and `symbol_level = 1`, which win over what official turns on.
+  `chrome://version` says "official build". the out-dir files keep their own `use_thin_lto`, `chrome_pgo_phase`
+  and `symbol_level = 1` lines, which win over what official turns on.
+- `venetium_release_tag` (in `args/venetium.gn`, 0073): the tag of the release you are building, like `"v1.4"`.
+  the browser compares it with the latest stable release on github every 7 days. change it for every release, or
+  the new build tells its own users about itself. empty (`""`) = no update check, for test builds.
 - arm32: `v8_enable_builtins_optimization = true` - v8's own builtins profile. google has no chrome pgo profile for
   arm32, so `out-arm-rt21.gn` has `chrome_pgo_phase = 0`.
-- **arm32 release build (v1.3): `args/out-arm-pgo.gn`** = `out-arm-rt21.gn` with pgo + thinlto: `use_thin_lto =
-  true`, `chrome_pgo_phase = 2` with my own arm32 profile (`pgo_data_path`, see `pgo/README.md` - unpack it into
-  `chrome/build/pgo_profiles/` first), `win_thin_lto_jobs` (0062) and `toolchain_supports_rust_thin_lto = false`
-  (rust stays native). its `clang_base_path` must be llvm-rt2.1 with the lld fixes in `toolchain/rt21-lto/` - the
-  unfixed lld cannot link windows arm32 thinlto at all. on a surface 2 this build scores about 50% higher in
-  speedometer than the same code without pgo/lto. `out-arm-rt21.gn` stays the quick build for testing patches.
-- x86: `chrome_pgo_phase = 2` - google's profile-guided optimization data for chrome on 32-bit windows. the file
-  name is in `chrome/build/win32.pgo.txt`; put that file into `chrome/build/pgo_profiles/` before `gn gen`
-  (download `https://storage.googleapis.com/chromium-optimization-profiles/pgo_profiles/<that name>`, or let
-  depot_tools' pgo hook fetch it). it is about 480 mb, and rt2.1's llvm-profdata reads it.
+- **arm32 release build (v1.3, v1.4): `args/out-arm-pgo.gn`** = `out-arm-rt21.gn` with pgo + thinlto: `use_thin_lto =
+  true`, `chrome_pgo_phase = 2` with my own arm32 profile (`pgo_data_path`; v1.4 uses
+  `venetium-arm32-20261122.profdata`, see `pgo/README.md` - unpack it into `chrome/build/pgo_profiles/` first),
+  `win_thin_lto_jobs` (0062) and `toolchain_supports_rust_thin_lto = false` (rust stays native). with rt2.1 its
+  `clang_base_path` needed the lld fixes in `toolchain/rt21-lto/` (the unfixed lld cannot link windows arm32 thinlto
+  at all); rt2.4's lld has them. on a surface 2 this build scored about 50% higher in speedometer than the same code
+  without pgo/lto (v1.3). `out-arm-rt21.gn` stays the quick build for testing patches.
+- x86 (`args/out-x86-rt21.gn`): `chrome_pgo_phase = 2` - google's profile-guided optimization data for chrome on
+  32-bit windows - and, since v1.4, `use_thin_lto = true`. the profile's file name is in `chrome/build/win32.pgo.txt`;
+  put that file into `chrome/build/pgo_profiles/` before `gn gen` (download
+  `https://storage.googleapis.com/chromium-optimization-profiles/pgo_profiles/<that name>`, or let depot_tools' pgo
+  hook fetch it). it is about 480 mb, and rt2.4's clang reads it.
 
 ## build
 
@@ -91,7 +98,8 @@ that gives you the whole browser: `venetium.exe`, `chrome.dll`, the angle dlls, 
 
 the pgo + thinlto build is the same command on `out\arm-pgo`. with thinlto the compile step only writes bitcode and
 all of chrome.dll's machine code is made in its final link, so that one link takes a long time and a lot of memory;
-`win_thin_lto_jobs` sets its threads. on my build server the whole build took about 21 hours at -j8.
+`win_thin_lto_jobs` sets its threads. on my build server the whole arm32 build takes about 21 hours at -j8, the x86
+build with thinlto about 19.
 
 **one gotcha with the official build from the source tarball:** near the end, the build makes a resource allowlist
 from `chrome.dll.pdb` with `third_party/llvm-build/Release+Asserts/bin/llvm-pdbutil`. in the tarball that file is a
@@ -116,11 +124,16 @@ them up. no folder = no blocking, everything else works.
 
 ## package
 
-(the commands use `out\arm-rt21`; for the v1.3 release build use `out\arm-pgo`.)
+(the commands use `out\arm-rt21`; for the arm32 release builds use `out\arm-pgo`, for x86 `out\x86-rt21` and `x86`.)
 
 - **portable zip:** `package/portable.py zip out\arm-rt21 arm32 venetium-arm32.zip --kit tests/kit --v8-config out\arm-rt21\clang_x86_v8_arm\v8_build_config.json`
 - **installer:** `installer/build-installer.ps1 -OutDir out\arm-rt21` builds `Venetium-Setup-<ver>-arm32.exe` - one
   self-contained exe that runs on arm32 windows / rt (see `installer/` for how it does that).
+
+both also take the icon files (0074): `venetium.VisualElementsManifest.xml` from the out dir and everything in
+`package/icons/` (the tile xmls, the winrt-style `.ico` and the venetium w10m `.ico` with their tile pngs), plus `set-icon.exe`, which
+`installer/build-set-icon.ps1` builds into the out dir (`build-installer.ps1` runs it itself). `portable.py` refuses to
+package if one is missing.
 
 ## the patches - what they do and why
 
@@ -238,11 +251,12 @@ subresource_filter with an all-sites preset and the list from `venetium_filters\
 intrinsics, libwebp dsp). 0061 replaces the arm32 crt's byte-at-a-time memchr / memcmp / strlen / strchr / strcmp
 with word-at-a-time versions (`build/win/venetium_string_arm.c`, linked into every arm32 binary).
 
-**0062 (v1.3)** - only build files, for the arm32 pgo + thinlto build; non-lto builds do not change. it adds the
+**0062 (v1.3, v2 since v1.4)** - only build files, for the thinlto builds; non-lto builds do not change. it adds the
 `win_thin_lto_jobs` arg, gives every arm32 binary the full post-link optimization (lto level 2: the thinlto compile
-step leaves vectorizing and unrolling to the link), archives arm32 bitcode with `llvm-ar` because `llvm-lib` cannot
-(it does not know the `thumbv7` triple, see `toolchain/rt21-lto/README.md`), and keeps 0061's string routines out of
-lto so they stay the device-tested native code. the profile is in `pgo/`, the linker fixes in `toolchain/rt21-lto/`.
+step leaves vectorizing and unrolling to the link), and keeps 0061's string routines out of lto so they stay the
+device-tested native code. v1 also archived arm32 bitcode with `llvm-ar`, because rt2.1's `llvm-lib` did not know the
+`thumbv7` triple (see `toolchain/rt21-lto/README.md`); rt2.2 and later fixed that, so v2 dropped it (v1 is in
+`patches/superseded/`). the profile is in `pgo/`.
 
 **0063 (v1.3)** - `Math.pow` on windows arm32 uses v8's own pow. v8 normally calls the c runtime's `pow`, and the arm32
 ucrt's `pow` returns 0 when the result is subnormal (`Math.pow(10, -310)` was 0 in every tier, jitless too). found by
@@ -302,10 +316,56 @@ compositing, webgl, video and canvas stay on the gpu, the shader disk cache stay
 `--enable-gpu-rasterization` turns it back on for testing. the note on the lumia gpu ids moved to driver bug list
 entry 487.
 
+**0071 (v1.4)** - liftoff (wasm) no longer runs out of scratch registers in a tagged store. `StoreTaggedPointer` took the only
+scratch register (ip) for offset + immediate when the offset register was still in use, and kept it through the write
+barrier, whose `CheckPageFlag` takes a scratch register of its own: v8 then stops the renderer. a wasm-gc array.set of
+a reference does that while the index is still live. it is upstream code, the same in both arm32 builds; the 2026-11-08
+check of every scratch register user for the thumb2 crash on telegram and discord (v8-thumb2-rt v1.3.2) found it. ip
+is now held for the store only, and the slot offset is formed again right before the write barrier stub call, the
+same order the atomic tagged stores already use.
+
+**0072 (v1.4)** - no "to get future venetium updates, you'll need windows 10 or later" banner. chromium shows it on windows
+8 / 8.1, plus the same note in settings and the about page, but venetium supports 8.x: the thumb2 build is for
+windows rt 8.0 / 8.1. `IsObsoleteNowOrSoon()` now always says no.
+
+**0073 (v1.4)** - a small update check. once every 7 days, a minute after the browser starts, it asks github for the latest
+stable venetium release (`api.github.com/repos/hamed7ir/venetium/releases/latest`, no cookies) and compares its tag
+with this build's `venetium_release_tag`. if github has a newer one, an infobar says so, with a link to the release
+page. nothing is downloaded or installed by itself. a failed check (offline, github down) is tried again at the next
+start, and so is a newer release that found no browser window to show the infobar in. `--disable-venetium-update-check`
+turns it off. for testing: `--venetium-update-check-now` checks 3 seconds after the start whatever the 7 days say, and
+`--venetium-update-check-tag=v1.0` makes the build pretend to be v1.0.
+
+**0074 (v1.4)** - choose the browser icon, and a proper start tile. if a `venetium-icon.ico` sits next to `venetium.exe`,
+venetium uses it for its windows and taskbar button (`chrome/browser/win/app_icon.cc`; no file or a broken file =
+the normal icon). the installer has an icon row (venetium / venetium winrt style / venetium w10m / your own .ico, silent:
+`--icon=venetium|winrt|w10m|<path.ico>`) and points the shortcuts and the uninstall entry at the same icon; for the
+portable zip (and installed copies), `set-icon.exe` in the venetium folder does the same, and also points existing
+shortcuts and taskbar pins at the icon. the patch also gives the start tile venetium's
+color (`venetium.VisualElementsManifest.xml`; windows 8.1 / 10 read it for the tile of a pinned desktop app), and
+the winrt-style choice switches the tile to the flat blue one. with your own .ico, setup (and set-icon.exe) draws start tile pictures from its largest frame on a tile color taken from the icon, so the start tile
+and the windows 10 app list show it too; an icon with no frame of at least 96 px gets no manifest, and windows draws
+the tile from the icon itself. a real live tile is not possible: windows only gives
+those to store (packaged) apps.
+both are plain .net 4.0 + shell com, no powershell (powershell is in constrained language mode on
+most windows rt devices; `installer/IconTools.cs` holds the shared code). the winrt-style icon is made from my flat drawing of the logo (white chromium-style disc, the knot cut into it);
+the w10m icon is the logo of [venetium for windows 10 mobile](https://github.com/Computershik73/venetium-w10m) (gpl-3.0),
+drawn at every size from its `tools/make-assets.py`, on its tile color `#1C1B22`.
+
+**0075 (v1.4)** - fixes 0066: on arm32, vp9 and av1 files did not play at all (webm, `<video src>`, local files, wikimedia,
+webm clips on sites). the file demuxer has to guess a level for every vp9/av1 track (a file does not say one), and
+0066's steering refuses anything with a level, so every track was dropped. a file's track now counts as level-less,
+so it plays (in software); sites that ask with a codec string, like youtube, are still sent to h.264. x86 is unchanged,
+and `--disable-features=VenetiumArm32CodecSteering` still turns the whole steering off.
+
+**0076 (v1.4)** - arm32 pgo builds: angle (libGLESv2 / libEGL) is built without the profile. the gpu process never
+writes angle's counters, so with the profile on, the compiler treated all of angle as cold and built it for size.
+now it gets the normal -O2 build (thinlto stays on). x86 is unchanged.
+
 ## the thumb2 build (windows rt 8.0 / 8.1)
 
 windows rt 8.x only runs thumb-2 code, so this build has v8 ported to thumb-2 and a few windows 8 fixes. on top of
-the other patches (0001-0070 except 0064):
+the other patches (0001-0076 except 0064):
 
 1. apply `patches/0064-windows-rt-8.patch` (the chromium side: pe subsystem 6.02, run-time lookups for the 8.1/10-only
    functions, version gates, delay-load stand-ins - details in the patch header).
@@ -313,5 +373,6 @@ the other patches (0001-0070 except 0064):
    `git -c core.autocrlf=false apply --directory=v8 v8-thumb2.patch`
 3. same args as the arm32 pgo build (`args/out-arm-pgo.gn`), then build `chrome`.
 
-the v1.3 thumb2 files were built incrementally from the arm32 pgo output dir, so they use the same pgo profile (v8's
-changed code just gets less profile benefit).
+the thumb2 files (v1.3 and v1.4) are built incrementally in a copy of the arm32 pgo output dir, so they use the same
+pgo profile. v1.3's profile had arm32 counts only (v8's thumb-2 code just got less profile benefit); v1.4's also has
+counts from the thumb2 profiling kit.

@@ -1,0 +1,429 @@
+Venetium 0073 - a GitHub update check every 7 days.
+At browser start, when the last successful check is 7 days old or more, Venetium waits a minute and then asks GitHub's
+public releases API for the latest stable release of hamed7ir/venetium (one GET, no cookies; prereleases are not
+"latest"). If its tag (like v1.5) is newer than this build's, an infobar says "Venetium v1.5 is available (you have
+v1.4)." with a Download link to the release page; it stays until closed. Offline or rate limited: try again at the next
+start. This build's tag comes from the GN arg venetium_release_tag (set in the venetium args; empty = no check), via a
+small generated header, so a new tag rebuilds one file. Switches: --disable-venetium-update-check (off),
+--venetium-update-check-now (ignore the 7 days, check after 3 s), --venetium-update-check-tag=vX.Y (compare as if this
+build were vX.Y, to see the infobar). The infobar reuses the Windows 10 banner's id, which 0072 retired.
+
+diff --git a/chrome/browser/prefs/browser_prefs.cc b/chrome/browser/prefs/browser_prefs.cc
+index e2f470d..b5f6d81 100644
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -315,6 +315,7 @@
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_bubble.h"
+ #include "chrome/browser/ui/side_panel/side_panel_prefs.h"
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
++#include "chrome/browser/ui/startup/venetium_update_check.h"
+ #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_pref_names.h"
+ #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
+@@ -1431,6 +1432,7 @@ void RegisterLocalState(PrefRegistrySimple* registry) {
+   RegisterBrowserPrefs(registry);
+   speech::SodaInstaller::RegisterLocalStatePrefs(registry);
+   StartupBrowserCreator::RegisterLocalStatePrefs(registry);
++  venetium::RegisterUpdateCheckPrefs(registry);  // Venetium 0073
+   task_manager::TaskManagerInterface::RegisterPrefs(registry);
+   UpgradeDetector::RegisterPrefs(registry);
+   registry->RegisterIntegerPref(prefs::kLastWhatsNewVersion, 0);
+diff --git a/chrome/browser/ui/startup/BUILD.gn b/chrome/browser/ui/startup/BUILD.gn
+index 7279eb4..7d613f3 100644
+--- a/chrome/browser/ui/startup/BUILD.gn
++++ b/chrome/browser/ui/startup/BUILD.gn
+@@ -20,6 +20,18 @@ buildflag_header("buildflags") {
+   flags = [ "CAN_TEST_GCPW_SIGNIN_STARTUP=$can_test_gcpw_signin_startup" ]
+ }
+ 
++declare_args() {
++  # Venetium 0073: this build's release tag (like "v1.4", set in the
++  # venetium args), compared with GitHub's latest stable Venetium release by
++  # venetium_update_check.cc every 7 days. Empty: no update check.
++  venetium_release_tag = ""
++}
++
++buildflag_header("venetium_release") {
++  header = "venetium_release.h"
++  flags = [ "VENETIUM_RELEASE_TAG=\"$venetium_release_tag\"" ]
++}
++
+ # TODO(crbug.com/369883710): modularize all the rest.
+ source_set("startup_tab") {
+   sources = [
+@@ -50,6 +62,7 @@ source_set("startup") {
+       "infobar_utils.h",
+       "launch_mode_recorder.h",
+       "obsolete_system_infobar_delegate.h",
++      "venetium_update_check.h",
+       "oscryptasync_availability_infobar_delegate.h",
+       "profile_launch_observer.h",
+       "startup_browser_creator.h",
+@@ -207,9 +220,14 @@ source_set("impl") {
+       "startup_browser_creator_impl.cc",
+       "startup_infobar_observer.cc",
+       "startup_tab_provider.cc",
++      "venetium_update_check.cc",
+     ]
+     deps += [
+       ":startup_tab",
++      ":venetium_release",
++      "//net",
++      "//services/data_decoder/public/cpp",
++      "//services/network/public/cpp",
+       "//apps",
+       "//base:i18n",
+       "//build:branding_buildflags",
+diff --git a/chrome/browser/ui/startup/infobar_utils.cc b/chrome/browser/ui/startup/infobar_utils.cc
+index dc220b2..41dedee 100644
+--- a/chrome/browser/ui/startup/infobar_utils.cc
++++ b/chrome/browser/ui/startup/infobar_utils.cc
+@@ -22,6 +22,7 @@
+ #include "chrome/browser/ui/startup/bidding_and_auction_consented_debugging_infobar_delegate.h"
+ #include "chrome/browser/ui/startup/google_api_keys_infobar_delegate.h"
+ #include "chrome/browser/ui/startup/obsolete_system_infobar_delegate.h"
++#include "chrome/browser/ui/startup/venetium_update_check.h"
+ #include "chrome/browser/ui/startup/oscryptasync_availability_infobar_delegate.h"
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
+ #include "chrome/browser/ui/startup/startup_types.h"
+@@ -209,6 +210,12 @@ void AddInfoBarsIfNecessary(BrowserWindowInterface* browser,
+     }
+   }
+ 
++  // Venetium 0073: the weekly GitHub update check (its infobar comes later),
++  // from normal browser launches only (web app launches come here too).
++  if (!is_web_app) {
++    venetium::MaybeCheckForUpdate();
++  }
++
+   OSCryptAsyncAvailabilityInfoBarDelegate::MaybeCreate(browser);
+ 
+ #if BUILDFLAG(IS_WIN)
+diff --git a/chrome/browser/ui/startup/venetium_update_check.cc b/chrome/browser/ui/startup/venetium_update_check.cc
+new file mode 100644
+index 0000000..8d32bfe
+--- /dev/null
++++ b/chrome/browser/ui/startup/venetium_update_check.cc
+@@ -0,0 +1,283 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/startup/venetium_update_check.h"
++
++#include <algorithm>
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/time/time.h"
++#include "base/values.h"
++#include "build/buildflag.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/infobars/confirm_infobar_creator.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "chrome/browser/ui/startup/venetium_release.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/infobars/content/content_infobar_manager.h"
++#include "components/infobars/core/confirm_infobar_delegate.h"
++#include "components/infobars/core/infobar.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/browser_thread.h"
++#include "net/http/http_response_headers.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/data_decoder/public/cpp/data_decoder.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/fetch_api.mojom-shared.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++#include "url/gurl.h"
++
++namespace venetium {
++namespace {
++
++constexpr char kLastCheckPref[] = "venetium.update_check.last_success";
++constexpr char kLatestReleaseApi[] =
++    "https://api.github.com/repos/hamed7ir/venetium/releases/latest";
++constexpr char kReleasePagePrefix[] =
++    "https://github.com/hamed7ir/venetium/releases/";
++constexpr base::TimeDelta kInterval = base::Days(7);
++constexpr size_t kMaxBodyBytes = 1024 * 1024;
++
++// --disable-venetium-update-check: no check. --venetium-update-check-now:
++// ignore the 7 days (and check after 3 s, not 60). --venetium-update-check-tag=
++// vX.Y: compare as if this build were vX.Y (for testing the infobar).
++constexpr char kDisableSwitch[] = "disable-venetium-update-check";
++constexpr char kNowSwitch[] = "venetium-update-check-now";
++constexpr char kTagSwitch[] = "venetium-update-check-tag";
++
++constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("venetium_update_check", R"(
++        semantics {
++          sender: "Venetium update check"
++          description:
++            "At most once every 7 days, asks GitHub for the latest stable "
++            "Venetium release, to tell the user when a newer version is out."
++          trigger: "Browser start, when the last check is 7 days old or more."
++          data:
++            "A plain GET of GitHub's public releases API: no cookies and no "
++            "user data, only what any request carries (IP address, user "
++            "agent, languages)."
++          destination: OTHER
++          destination_other: "api.github.com"
++        }
++        policy {
++          cookies_allowed: NO
++          setting: "Start Venetium with --disable-venetium-update-check."
++          policy_exception_justification: "Venetium only, no policy."
++        })");
++
++std::string CurrentTag() {
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  if (command_line->HasSwitch(kTagSwitch)) {
++    return command_line->GetSwitchValueASCII(kTagSwitch);
++  }
++  return BUILDFLAG(VENETIUM_RELEASE_TAG);
++}
++
++// "v1.3.2" -> {1, 3, 2}; parsing stops at the first part that is not a number
++// ("1.4-rc1" -> {1, 4}).
++std::vector<int> ParseTag(std::string_view tag) {
++  if (!tag.empty() && (tag[0] == 'v' || tag[0] == 'V')) {
++    tag.remove_prefix(1);
++  }
++  std::vector<int> parts;
++  for (std::string_view piece : base::SplitStringPiece(
++           tag, ".", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL)) {
++    size_t digits = 0;
++    while (digits < piece.size() && base::IsAsciiDigit(piece[digits])) {
++      ++digits;
++    }
++    int value = 0;
++    if (digits == 0 || !base::StringToInt(piece.substr(0, digits), &value)) {
++      break;
++    }
++    parts.push_back(value);
++    if (digits != piece.size()) {
++      break;
++    }
++  }
++  return parts;
++}
++
++class UpdateInfoBarDelegate : public ConfirmInfoBarDelegate {
++ public:
++  UpdateInfoBarDelegate(std::u16string latest,
++                        std::u16string current,
++                        GURL page)
++      : latest_(std::move(latest)),
++        current_(std::move(current)),
++        page_(std::move(page)) {}
++  UpdateInfoBarDelegate(const UpdateInfoBarDelegate&) = delete;
++  UpdateInfoBarDelegate& operator=(const UpdateInfoBarDelegate&) = delete;
++  ~UpdateInfoBarDelegate() override = default;
++
++ private:
++  infobars::InfoBarDelegate::InfoBarIdentifier GetIdentifier() const override {
++    // Venetium 0072 never shows the Windows 10 banner, so its id is free.
++    return OBSOLETE_SYSTEM_INFOBAR_DELEGATE;
++  }
++  std::u16string GetMessageText() const override {
++    return u"Venetium " + latest_ + u" is available (you have " + current_ +
++           u").";
++  }
++  std::u16string GetLinkText() const override { return u"Download"; }
++  GURL GetLinkURL() const override { return page_; }
++  int GetButtons() const override { return BUTTON_NONE; }
++  // Stays until the user closes it, like the banner it replaces.
++  bool ShouldExpire(const NavigationDetails& details) const override {
++    return false;
++  }
++
++  const std::u16string latest_;
++  const std::u16string current_;
++  const GURL page_;
++};
++
++// Returns false when there is no normal browser tab to show the infobar in.
++bool ShowInfoBar(const std::string& latest, const GURL& page) {
++  BrowserWindowInterface* browser =
++      GetLastActiveBrowserWindowInterfaceWithAnyProfile();
++  if (!browser || browser->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
++    return false;
++  }
++  content::WebContents* web_contents =
++      browser->GetTabStripModel()->GetActiveWebContents();
++  if (!web_contents) {
++    return false;
++  }
++  infobars::ContentInfoBarManager* infobar_manager =
++      infobars::ContentInfoBarManager::FromWebContents(web_contents);
++  if (!infobar_manager) {
++    return false;
++  }
++  return infobar_manager->AddInfoBar(
++             CreateConfirmInfoBar(std::make_unique<UpdateInfoBarDelegate>(
++                 base::UTF8ToUTF16(latest), base::UTF8ToUTF16(CurrentTag()),
++                 page))) != nullptr;
++}
++
++void OnParsed(data_decoder::DataDecoder::ValueOrError result) {
++  if (!result.has_value() || !result->is_dict()) {
++    return;
++  }
++  const auto& release = result->GetDict();
++  const std::string* tag = release.FindString("tag_name");
++  const std::string* url = release.FindString("html_url");
++  if (!tag || !url) {
++    return;
++  }
++  // The next check is in 7 days if there is nothing to show (no newer
++  // release, or not our release page) or the infobar is shown; a newer
++  // release with no browser tab to show it in is tried again next start.
++  GURL page(*url);
++  bool done = true;
++  if (page.is_valid() && base::StartsWith(page.spec(), kReleasePagePrefix) &&
++      IsNewerRelease(*tag, CurrentTag())) {
++    done = ShowInfoBar(*tag, page);
++  }
++  if (done) {
++    if (PrefService* local_state = g_browser_process->local_state()) {
++      local_state->SetTime(kLastCheckPref, base::Time::Now());
++    }
++  }
++}
++
++void OnFetched(std::unique_ptr<network::SimpleURLLoader> loader,
++               std::optional<std::string> body) {
++  int response_code = 0;
++  if (loader->ResponseInfo() && loader->ResponseInfo()->headers) {
++    response_code = loader->ResponseInfo()->headers->response_code();
++  }
++  // Offline or rate limited: try again at the next start.
++  if (!body || response_code != 200) {
++    return;
++  }
++  data_decoder::DataDecoder::ParseJsonIsolated(*body,
++                                               base::BindOnce(&OnParsed));
++}
++
++void StartFetch() {
++  if (!g_browser_process || g_browser_process->IsShuttingDown()) {
++    return;
++  }
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = GURL(kLatestReleaseApi);
++  request->method = "GET";
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  request->headers.SetHeader("Accept", "application/vnd.github+json");
++  std::unique_ptr<network::SimpleURLLoader> loader =
++      network::SimpleURLLoader::Create(std::move(request), kTrafficAnnotation);
++  loader->SetTimeoutDuration(base::Seconds(30));
++  network::SimpleURLLoader* raw_loader = loader.get();
++  raw_loader->DownloadToString(
++      g_browser_process->shared_url_loader_factory().get(),
++      base::BindOnce(&OnFetched, std::move(loader)), kMaxBodyBytes);
++}
++
++}  // namespace
++
++void RegisterUpdateCheckPrefs(PrefRegistrySimple* registry) {
++  registry->RegisterTimePref(kLastCheckPref, base::Time());
++}
++
++void MaybeCheckForUpdate() {
++  static bool started = false;
++  if (started) {
++    return;
++  }
++  started = true;
++  if (CurrentTag().empty()) {
++    return;  // a build without a release tag
++  }
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  if (command_line->HasSwitch(kDisableSwitch)) {
++    return;
++  }
++  PrefService* local_state = g_browser_process->local_state();
++  if (!local_state) {
++    return;
++  }
++  const bool now = command_line->HasSwitch(kNowSwitch);
++  const base::Time last = local_state->GetTime(kLastCheckPref);
++  const base::Time time_now = base::Time::Now();
++  if (!now && last <= time_now && time_now - last < kInterval) {
++    return;
++  }
++  // Leave the first minute to the pages the user opens (the tablets are slow).
++  content::GetUIThreadTaskRunner({})->PostDelayedTask(
++      FROM_HERE, base::BindOnce(&StartFetch),
++      now ? base::Seconds(3) : base::Seconds(60));
++}
++
++bool IsNewerRelease(std::string_view a, std::string_view b) {
++  std::vector<int> x = ParseTag(a);
++  std::vector<int> y = ParseTag(b);
++  if (x.empty() || y.empty()) {
++    return false;
++  }
++  const size_t n = std::max(x.size(), y.size());
++  x.resize(n, 0);
++  y.resize(n, 0);
++  return x > y;
++}
++
++}  // namespace venetium
+diff --git a/chrome/browser/ui/startup/venetium_update_check.h b/chrome/browser/ui/startup/venetium_update_check.h
+new file mode 100644
+index 0000000..dc79202
+--- /dev/null
++++ b/chrome/browser/ui/startup/venetium_update_check.h
+@@ -0,0 +1,33 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Venetium 0073: the GitHub update check. At most once every 7 days the browser
++// asks GitHub for the latest stable Venetium release and, when it is newer than
++// this build (BUILDFLAG(VENETIUM_RELEASE_TAG), from the GN arg
++// venetium_release_tag), shows an infobar with a link to the release page.
++// Off with --disable-venetium-update-check, and in builds without a tag.
++
++#ifndef CHROME_BROWSER_UI_STARTUP_VENETIUM_UPDATE_CHECK_H_
++#define CHROME_BROWSER_UI_STARTUP_VENETIUM_UPDATE_CHECK_H_
++
++#include <string_view>
++
++class PrefRegistrySimple;
++
++namespace venetium {
++
++// Registers the local state pref that keeps the time of the last successful
++// check.
++void RegisterUpdateCheckPrefs(PrefRegistrySimple* registry);
++
++// Starts the check once per browser process, if it is enabled and the last
++// successful check is 7 days old or more.
++void MaybeCheckForUpdate();
++
++// True when release tag `a` (like "v1.4" or "v1.3.2") is newer than `b`.
++bool IsNewerRelease(std::string_view a, std::string_view b);
++
++}  // namespace venetium
++
++#endif  // CHROME_BROWSER_UI_STARTUP_VENETIUM_UPDATE_CHECK_H_

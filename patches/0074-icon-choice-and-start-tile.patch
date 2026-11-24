@@ -1,0 +1,135 @@
+Venetium 0074 - choose the browser icon (Venetium, its WinRT-style icon or your own .ico) and a real Start tile.
+
+Asked for 2026-11-10: users wanted other icons, including other browsers' ones. The Chrome and Edge logos are their
+owners' trademarks, so Venetium ships its own two icons and lets users bring any .ico of their own. 2 files:
+- chrome/browser/win/app_icon.cc: when venetium-icon.ico lies beside venetium.exe and is a valid icon, GetAppIcon,
+  GetSmallAppIcon and GetAppIconImageFamily load it instead of the built-in icon resource, so the browser windows, the
+  taskbar button, the tray icon and the profile shortcut badges all show the chosen icon. The handles are new and owned
+  by the caller (the callers already destroy them; the resource icon was shared, so destroying it was a no-op). The
+  file is looked up once per run; without it nothing changes. The installer's icon page and set-icon.cmd write it, and
+  point the Start / desktop shortcuts at it.
+- chrome/app/visual_elements_resources/venetium.VisualElementsManifest.xml: the Start tile (Windows 8.1 and 10) in
+  Venetium's navy, #182A4B, sampled from the icon's frame. Chromium only wrote this file from its own installer, so
+  Venetium's zips shipped the tile pictures without it and Windows showed a plain default tile; the package now
+  ships it beside venetium.exe. True live tiles need a Store app identity, which a desktop browser cannot have.
+
+diff --git a/a/chrome/app/visual_elements_resources/venetium.VisualElementsManifest.xml b/b/chrome/app/visual_elements_resources/venetium.VisualElementsManifest.xml
+index a7bb10b..0ab4891 100644
+--- a/a/chrome/app/visual_elements_resources/venetium.VisualElementsManifest.xml
++++ b/b/chrome/app/visual_elements_resources/venetium.VisualElementsManifest.xml
+@@ -1,7 +1,8 @@
+-<!-- This is only meant to be copied by chrome.exe in developer builds. -->
++<!-- Venetium 0074: the Windows 8.1 / 10 Start tile in Venetium's colours. Ships beside venetium.exe; the
++     installer's icon choice and set-icon.cmd switch it to the WinRT-style tile (icons\). -->
+ <Application xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+   <VisualElements
+-    BackgroundColor="#212121"
++    BackgroundColor="#182A4B"
+     ShowNameOnSquare150x150Logo="on"
+     ForegroundText="light"
+     Square150x150Logo="Logo.png"
+diff --git a/a/chrome/browser/win/app_icon.cc b/b/chrome/browser/win/app_icon.cc
+index 103b731..5d4c5aa 100644
+--- a/a/chrome/browser/win/app_icon.cc
++++ b/b/chrome/browser/win/app_icon.cc
+@@ -4,10 +4,15 @@
+ 
+ #include "chrome/browser/win/app_icon.h"
+ 
++#include "base/base_paths.h"
++#include "base/files/file_path.h"
++#include "base/no_destructor.h"
++#include "base/path_service.h"
+ #include "chrome/common/chrome_constants.h"
+ #include "chrome/install_static/install_details.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+ #include "ui/gfx/geometry/size.h"
++#include "ui/gfx/image/image.h"
+ #include "ui/gfx/image/image_family.h"
+ #include "ui/gfx/win/icon_util.h"
+ 
+@@ -18,9 +23,49 @@ int GetAppIconResourceId() {
+   return install_static::InstallDetails::Get().app_icon_resource_id();
+ }
+ 
++// Venetium 0074: an icon file beside venetium.exe, venetium-icon.ico, replaces the built-in
++// application icon for the browser windows, the taskbar button, the tray icon and the profile
++// shortcut icons. The installer's icon choice (Venetium's icon, its WinRT-style icon or the
++// user's own .ico) and set-icon.cmd in portable copies write it; without the file (or with one
++// that is not a valid icon) nothing changes. Looked up once per browser run.
++const base::FilePath& VenetiumIconOverride() {
++  static const base::NoDestructor<base::FilePath> path([] {
++    base::FilePath exe_dir;
++    if (!base::PathService::Get(base::DIR_EXE, &exe_dir)) {
++      return base::FilePath();
++    }
++    base::FilePath icon =
++        exe_dir.Append(FILE_PATH_LITERAL("venetium-icon.ico"));
++    HICON probe = static_cast<HICON>(::LoadImageW(
++        nullptr, icon.value().c_str(), IMAGE_ICON, 32, 32, LR_LOADFROMFILE));
++    if (!probe) {
++      return base::FilePath();
++    }
++    ::DestroyIcon(probe);
++    return icon;
++  }());
++  return *path;
++}
++
++// A new icon handle of the override at this size, owned by the caller (callers destroy what
++// GetAppIcon and GetSmallAppIcon return), or null when there is no override.
++HICON LoadVenetiumIconOverride(int width, int height) {
++  const base::FilePath& icon = VenetiumIconOverride();
++  if (icon.empty()) {
++    return nullptr;
++  }
++  return static_cast<HICON>(::LoadImageW(nullptr, icon.value().c_str(),
++                                         IMAGE_ICON, width, height,
++                                         LR_LOADFROMFILE));
++}
++
+ }  // namespace
+ 
+ HICON GetAppIcon() {
++  if (HICON icon = LoadVenetiumIconOverride(GetSystemMetrics(SM_CXICON),
++                                            GetSystemMetrics(SM_CYICON))) {
++    return icon;
++  }
+   // TODO(mgiuca): Use GetAppIconImageFamily/CreateExact instead of LoadIcon, to
+   // get correct scaling. (See http://crbug.com/40443246)
+   const int icon_id = GetAppIconResourceId();
+@@ -30,6 +75,10 @@ HICON GetAppIcon() {
+ }
+ 
+ HICON GetSmallAppIcon() {
++  if (HICON icon = LoadVenetiumIconOverride(GetSystemMetrics(SM_CXSMICON),
++                                            GetSystemMetrics(SM_CYSMICON))) {
++    return icon;
++  }
+   // TODO(mgiuca): Use GetAppIconImageFamily/CreateExact instead of LoadIcon, to
+   // get correct scaling. (See http://crbug.com/40443246)
+   const int icon_id = GetAppIconResourceId();
+@@ -50,6 +99,23 @@ gfx::Size GetSmallAppIconSize() {
+ }
+ 
+ std::unique_ptr<gfx::ImageFamily> GetAppIconImageFamily() {
++  if (!VenetiumIconOverride().empty()) {
++    auto family = std::make_unique<gfx::ImageFamily>();
++    for (int size : {16, 20, 24, 32, 40, 48, 64, 96, 128, 256}) {
++      HICON icon = LoadVenetiumIconOverride(size, size);
++      if (!icon) {
++        continue;
++      }
++      SkBitmap bitmap = IconUtil::CreateSkBitmapFromHICON(icon);
++      ::DestroyIcon(icon);
++      if (!bitmap.isNull()) {
++        family->Add(gfx::Image::CreateFrom1xBitmap(bitmap));
++      }
++    }
++    if (!family->empty()) {
++      return family;
++    }
++  }
+   const int icon_id = GetAppIconResourceId();
+   // Get the icon from chrome.dll (not chrome.exe, which has different resource
+   // IDs). If chrome.dll is not loaded, we are probably in a unit test, so fall

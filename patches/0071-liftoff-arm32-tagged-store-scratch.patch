@@ -1,0 +1,89 @@
+Venetium 0071 - Liftoff ARM32: StoreTaggedPointer frees the scratch register before its write barrier.
+LiftoffAssembler::StoreTaggedPointer (wasm/baseline/arm) takes the only scratch register (ip) for offset + imm when the
+offset register is still live, and kept it to the end of the function. Its write barrier calls CheckPageFlag twice,
+and CheckPageFlag takes a scratch register of its own: with ip held, UseScratchRegisterScope::Acquire() finds the list
+empty and RegList::first() CHECK-fails (the renderer stops). Reached by a wasm-gc array.set of a reference (offset
+register = the index, imm = the array header) while the index is still used; --verify-write-barriers C calls the same.
+Upstream code, latent in both ARM32 builds; the Thumb-2 build got it fixed with the 2026-11-08 census of every scratch
+register user (v8-thumb2-rt v1.3.2, rule 082). Now ip is held for the store only, and the slot offset is formed again
+(offset_reg is live and untouched) right before CallRecordWriteStubSaveRegisters, which reads it before anything else
+uses ip - the same order AtomicExchangeTaggedPointer and AtomicCompareExchangeTaggedPointer already use.
+
+diff --git a/v8/src/wasm/baseline/arm/liftoff-assembler-arm-inl.h b/v8/src/wasm/baseline/arm/liftoff-assembler-arm-inl.h
+index dbcd436..751f924 100644
+--- a/v8/src/wasm/baseline/arm/liftoff-assembler-arm-inl.h
++++ b/v8/src/wasm/baseline/arm/liftoff-assembler-arm-inl.h
+@@ -943,25 +943,32 @@ void LiftoffAssembler::StoreTaggedPointer(
+     LiftoffRegList pinned, uint32_t* trapping_store_pc,
+     compiler::WriteBarrierKind write_barrier) {
+   static_assert(kTaggedSize == kInt32Size);
+-  UseScratchRegisterScope temps{this};
+   Register actual_offset_reg = offset_reg;
+-  if (offset_reg != no_reg && offset_imm != 0) {
+-    if (cache_state()->is_used(LiftoffRegister(offset_reg))) {
+-      // The code below only needs a scratch register if the {MemOperand} given
+-      // to {str} has an offset outside the uint12 range. After doing the
+-      // addition below we will not pass an immediate offset to {str} though, so
+-      // we can use the scratch register here.
+-      actual_offset_reg = temps.Acquire();
++  // ip is held for the store only: the write barrier below needs it free
++  // (CheckPageFlag and C calls take a scratch register of their own), so the
++  // slot offset is formed again there when it lived in ip.
++  bool offset_in_scratch = false;
++  {
++    UseScratchRegisterScope temps{this};
++    if (offset_reg != no_reg && offset_imm != 0) {
++      if (cache_state()->is_used(LiftoffRegister(offset_reg))) {
++        // The code below only needs a scratch register if the {MemOperand}
++        // given to {str} has an offset outside the uint12 range. After doing
++        // the addition below we will not pass an immediate offset to {str}
++        // though, so we can use the scratch register here.
++        actual_offset_reg = temps.Acquire();
++        offset_in_scratch = true;
++      }
++      add(actual_offset_reg, offset_reg, Operand(offset_imm));
+     }
+-    add(actual_offset_reg, offset_reg, Operand(offset_imm));
+-  }
+-  MemOperand dst_op = actual_offset_reg == no_reg
+-                          ? MemOperand(dst_addr, offset_imm)
+-                          : MemOperand(dst_addr, actual_offset_reg);
++    MemOperand dst_op = actual_offset_reg == no_reg
++                            ? MemOperand(dst_addr, offset_imm)
++                            : MemOperand(dst_addr, actual_offset_reg);
+ 
+-  if (trapping_store_pc) *trapping_store_pc = pc_offset();
++    if (trapping_store_pc) *trapping_store_pc = pc_offset();
+ 
+-  str(src, dst_op);
++    str(src, dst_op);
++  }
+ 
+   if (v8_flags.disable_write_barriers) return;
+ 
+@@ -980,11 +987,20 @@ void LiftoffAssembler::StoreTaggedPointer(
+                 kZero, &exit);
+   CheckPageFlag(src, MemoryChunk::kPointersToHereAreInterestingMask, kZero,
+                 &exit);
+-  CallRecordWriteStubSaveRegisters(
+-      dst_addr,
+-      actual_offset_reg == no_reg ? Operand(offset_imm)
+-                                  : Operand(actual_offset_reg),
+-      SaveFPRegsMode::kSave, StubCallMode::kCallWasmRuntimeStub);
++  if (offset_in_scratch) {
++    UseScratchRegisterScope temps{this};
++    Register slot_offset = temps.Acquire();
++    add(slot_offset, offset_reg, Operand(offset_imm));
++    CallRecordWriteStubSaveRegisters(dst_addr, Operand(slot_offset),
++                                     SaveFPRegsMode::kSave,
++                                     StubCallMode::kCallWasmRuntimeStub);
++  } else {
++    CallRecordWriteStubSaveRegisters(
++        dst_addr,
++        actual_offset_reg == no_reg ? Operand(offset_imm)
++                                    : Operand(actual_offset_reg),
++        SaveFPRegsMode::kSave, StubCallMode::kCallWasmRuntimeStub);
++  }
+   bind(&exit);
+ }
+ 

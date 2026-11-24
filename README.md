@@ -6,6 +6,10 @@ venetium is chromium 150 running on old arm windows tablets. i made it because i
 wanted a real modern browser on my surface rt and surface 2, and nothing new runs
 on them anymore.
 
+**big thanks to jwa4.** for v1.4 he ran 36 profiling sessions on his surface 2 with both
+profiling builds and sent his test reports and crash dumps. most of v1.4's speed
+profile (pgo) is his work.
+
 it is built on top of supermium (which brings modern chromium back to old
 windows), but supermium is x86/x64 only, so the whole arm32 (armnt) port here is
 my own work.
@@ -34,7 +38,7 @@ my own work.
 ## how it is built
 
 this repo is a patch series on top of chromium 150, plus the build tooling and a
-device test kit. the patches are in `patches/` (0001–0070), the full build steps
+device test kit. the patches are in `patches/` (0001–0076), the full build steps
 are in `RECIPE.md`, and `VENETIUM-IDS.md` says what each patch does. the v8 thumb-2
 port is in its own repo: [v8-thumb2-rt](https://github.com/hamed7ir/v8-thumb2-rt).
 
@@ -48,7 +52,11 @@ on every lumia gpu (0067), and v1.3.1.2 (prerelease) the gpu process shutting do
 level 9_3 (0068), so the gpu stays on there. v1.3.1.3 (prerelease) fixes webgl pages that use depth textures (0069)
 and old text drawn over the page when scrolling on the lumias, which rasterize on the cpu again (0070). v1.3.2 is
 the stable release with all of that, and the thumb2 build no longer crashes on telegram web and discord (the jit ran
-out of scratch registers on 64-bit shifts, fixed in v8-thumb2-rt). it needs more testers. next: test it on rt 8.0 and
+out of scratch registers on 64-bit shifts, fixed in v8-thumb2-rt). v1.4 is built with a new pgo profile from far more
+browsing (jwa4's 36 sessions and mine, both builds: 304,237 functions with counts, v1.3 had 79,335) and with angle
+built for speed (0076). webm files play again (0075), big webassembly apps work on the thumb2 build (branch islands
+in v8-thumb2-rt), there is a weekly update check (0073), no windows 10 banner on 8.x (0072), an icon choice and a
+real start tile (0074), and the x86 build is back, now with thinlto. it needs more testers. next: test it on rt 8.0 and
 on 15035.
 
 ## license 

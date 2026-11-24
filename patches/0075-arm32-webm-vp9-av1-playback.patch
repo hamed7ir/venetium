@@ -1,0 +1,47 @@
+Venetium 0075 - VP9 and AV1 files play again on Windows ARM32 (a fix for 0066).
+Found 2026-11-21: WebM (VP9 / AV1) files did not play at all on ARM32 - local files, <video src>, Wikimedia, WebM clips
+on sites. FFmpegDemuxerStream::Create() checks every track with IsDecoderSupportedVideoType(VideoType::FromDecoderConfig()),
+and FromDecoderConfig() has to guess a level because a file does not declare one: it picks the lowest (VP9 10, AV1 20).
+The ARM32 codec steering (0055/0066) refuses every VP9 / AV1 type that carries a level, so each file track looked like a
+codec string with a level and was dropped ("skipping invalid or unsupported video track"). Sites that use MSE (YouTube)
+were not affected: their codec strings go through isTypeSupported / canPlayType, which is what the steering is for.
+Now a demuxed VP9 / AV1 track counts as level-less while kVenetiumArm32CodecSteering is on, as 0066 intended, so files
+play (in software); the steering of the codec strings that sites ask about is unchanged. x86 is unchanged
+(the feature is off there), and --disable-features=VenetiumArm32CodecSteering still turns the whole steering off.
+
+diff --git a/media/filters/ffmpeg_demuxer.cc b/media/filters/ffmpeg_demuxer.cc
+index 45d82a3..7896ada 100644
+--- a/media/filters/ffmpeg_demuxer.cc
++++ b/media/filters/ffmpeg_demuxer.cc
+@@ -87,6 +87,22 @@
+   return stream->disposition & AV_DISPOSITION_DEFAULT;
+ }
+ 
++// Venetium 0075: VideoType::FromDecoderConfig() has to guess a level (a file
++// does not declare one) and picks the lowest, so every demuxed VP9 / AV1 track
++// looked like a codec string with a level. The Windows ARM32 codec steering
++// (0055/0066) refuses those so that sites pick H.264 - and so every VP9 / AV1
++// file (<video src>, local files, WebM clips) failed to play. A file's track
++// counts as level-less here, as 0066 intended; the steering of the codec
++// strings that sites ask about (isTypeSupported / canPlayType) is unchanged.
++VideoType VenetiumDemuxedVideoType(const VideoDecoderConfig& config) {
++  VideoType type = VideoType::FromDecoderConfig(config);
++  if ((type.codec == VideoCodec::kVP9 || type.codec == VideoCodec::kAV1) &&
++      base::FeatureList::IsEnabled(kVenetiumArm32CodecSteering)) {
++    type.level = kNoVideoCodecLevel;
++  }
++  return type;
++}
++
+ }  // namespace
+ 
+ static base::Time ExtractTimelineOffset(
+@@ -236,7 +252,7 @@
+     if (!AVStreamToVideoDecoderConfig(stream, video_config.get()) ||
+         !video_config->IsValidConfig() ||
+         !IsDecoderSupportedVideoType(
+-            VideoType::FromDecoderConfig(*video_config))) {
++            VenetiumDemuxedVideoType(*video_config))) {
+       MEDIA_LOG(DEBUG, media_log) << "Warning, FFmpegDemuxer failed to create "
+                                      "a valid/supported video decoder "
+                                      "configuration from muxed stream, config:"

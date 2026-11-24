@@ -19,3 +19,7 @@ use_dummy_lastchange = false
 # directory keeps its explicit use_thin_lto / chrome_pgo_phase / symbol_level / dcheck_always_on lines, which official
 # would otherwise default to ThinLTO on, PGO on and full symbols.
 is_official_build = true
+# Venetium 0073 (his decision 2026-11-08): this build's release tag, compared with GitHub's latest stable
+# release every 7 days (chrome/browser/ui/startup/venetium_update_check.cc). Set it to the tag of the
+# release being built; empty = no update check.
+venetium_release_tag = "v1.4"

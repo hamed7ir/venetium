@@ -79,6 +79,10 @@ try {
     $diff = $installed | Where-Object {
         $rel = $_.FullName.Substring($dir.Length + 1)
         $srcf = Join-Path $OutDir $rel
+        # Venetium 0074: icons\ ships from package\icons (not the build output), and Setup writes the Start tile manifest
+        # from the chosen icon's template - the default icon (Venetium) = icons\tile-classic.xml
+        if ($rel -like 'icons\*') { $srcf = Join-Path $root ('package\' + $rel) }
+        elseif ($rel -eq 'venetium.VisualElementsManifest.xml') { $srcf = Join-Path $root 'package\icons\tile-classic.xml' }
         (-not (Test-Path $srcf)) -or ((Get-FileHash $_.FullName).Hash -ne (Get-FileHash $srcf).Hash)
     }
     Check 'installed files byte-identical to the build output' ($diff.Count -eq 0) (($diff | Select-Object -First 3 | ForEach-Object Name) -join ', ')

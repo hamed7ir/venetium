@@ -2,7 +2,7 @@
 # The x86 control's settings (out\x86-rt21\args.gn as generated, 2026-10-02) with target_cpu = "arm"; the server recreates the
 # directory from this file alone: `gn gen out\arm-rt21` with it as args.gn, after `source venetium/env/build-env.sh`.
 # (venetium\args\venetium.gn is appended below it, as the build batches merge it.)
-# Needs Venetium 0016 (the Windows ARM32 toolchain) and clang_rt.builtins-arm.lib in rt21-cr (s9\crt-arm).
+# Needs Venetium 0016 (the Windows ARM32 toolchain); rt2.4 ships clang_rt.builtins-arm.lib and the profile runtimes.
 
 # --- the build (his decisions 2026-09-28/29; ARM-1) ---
 target_cpu = "arm"
@@ -13,11 +13,11 @@ symbol_level = 1                 # line tables in the PDBs for crash stacks; the
 generate_about_credits = true    # chrome://credits carries Supermium's credit
 # is_official_build = true comes from venetium.gn (v1.2).
 
-# --- toolchain: rt2.1 and rustc-rt2.1 (the sysroot has the thumbv7a-pc-windows-msvc std since RUSTC-2, 21 rlibs) ---
-clang_base_path = "F:/cr/rt21-cr"   # fixed rt2.1 (BATCH-RT21-FIX-1: clang-cl d572c493… lld-link 6e203038… llvm-lib 9e197c48…); clean clang_rt.builtins-arm.lib 6be30eaa… (no __rt_* shim — B5/LLVM 0015)
+# --- toolchain: rt2.4 and rustc-rt2.4 (2026-11-16; the sysroot has the thumbv7a-pc-windows-msvc std, 21 rlibs) ---
+clang_base_path = "F:/cr/rt24-cr"   # rt2.4 (= rt2.1 + LLVM 0021-0034 + B01-B08, static zlib): clang-cl f24b35ac… lld-link 2f4ab430…; clean clang_rt.builtins-arm.lib 8a2e1ee1… (no __rt_* shim — B5/LLVM 0015)
 clang_version = "23"
-rust_sysroot_absolute = "F:/cr/rustc-rt21"
-rustc_version = "rustc-1.100.0-nightly-bba531001-2026-09-20-rt2.1-31b4bac5e615"
+rust_sysroot_absolute = "F:/cr/rustc-rt24"
+rustc_version = "rustc-1.100.0-nightly-bba531001-2026-09-20-rt2.4-7f107cb28346"
 added_rust_stdlib_libs = [ "windows_link", "rustc_literal_escaper" ]
 removed_rust_stdlib_libs = []
 rust_bindgen_root = "F:/cr/bindgen-rt"   # host tool (x64)
@@ -71,3 +71,7 @@ use_dummy_lastchange = false
 # directory keeps its explicit use_thin_lto / chrome_pgo_phase / symbol_level / dcheck_always_on lines, which official
 # would otherwise default to ThinLTO on, PGO on and full symbols.
 is_official_build = true
+# Venetium 0073 (his decision 2026-11-08): this build's release tag, compared with GitHub's latest stable
+# release every 7 days (chrome/browser/ui/startup/venetium_update_check.cc). Set it to the tag of the
+# release being built; empty = no update check.
+venetium_release_tag = "v1.4"

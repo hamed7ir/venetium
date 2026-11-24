@@ -12,6 +12,31 @@ import hashlib, json, os, re, subprocess, sys, zipfile
 READOBJ = r"F:\cr\rt21-cr\bin\llvm-readobj.exe"
 
 
+def is_il_anycpu(path):
+    """True for a .NET assembly built AnyCPU: a CLR header whose flags say IL only (0x1) and not 32BITREQUIRED (0x2).
+    Such a PE carries machine I386 but the ARM32 CLR runs it as is (Venetium 0074's set-icon.exe)."""
+    import struct
+    d = open(path, "rb").read()
+    if len(d) < 0x40 or d[:2] != b"MZ":
+        return False
+    pe = struct.unpack_from("<I", d, 0x3C)[0]
+    if d[pe:pe + 4] != b"PE\0\0":
+        return False
+    nsec, opt_size = struct.unpack_from("<H", d, pe + 6)[0], struct.unpack_from("<H", d, pe + 20)[0]
+    opt = pe + 24
+    magic = struct.unpack_from("<H", d, opt)[0]
+    dirs = opt + (96 if magic == 0x10B else 112)
+    clr_rva = struct.unpack_from("<I", d, dirs + 14 * 8)[0]
+    if not clr_rva:
+        return False
+    for i in range(nsec):
+        vsize, va, rsize, raw = struct.unpack_from("<IIII", d, opt + opt_size + i * 40 + 8)
+        if va <= clr_rva < va + max(vsize, rsize):
+            flags = struct.unpack_from("<I", d, raw + clr_rva - va + 16)[0]
+            return bool(flags & 0x1) and not flags & 0x2
+    return False
+
+
 def main():
     zarm, zx86, setp, ext = sys.argv[1:5]
     fails = []
@@ -52,10 +77,13 @@ def main():
         t = subprocess.run([READOBJ, "--file-headers", dst], capture_output=True, text=True).stdout
         m = re.search(r"Machine: IMAGE_FILE_MACHINE_(\w+)", t)
         machines[p] = m.group(1) if m else "?"
-    not_arm = {p: m for p, m in machines.items() if m != "ARMNT"}
+    # Venetium 0074: set-icon.exe is a .NET AnyCPU assembly (machine field I386, IL only) that runs on ARM32 as is
+    anycpu = sorted(p for p, m in machines.items()
+                    if m != "ARMNT" and is_il_anycpu(os.path.join(ext, p.replace("/", os.sep))))
+    not_arm = {p: m for p, m in machines.items() if m != "ARMNT" and p not in anycpu}
     if not_arm:
         fails.append(f"PEs that are not ARMNT: {not_arm}")
-    print(f"2. PEs: {len(pes)}, machine types {sorted(set(machines.values()))}")
+    print(f"2. PEs: {len(pes)}, machine types {sorted(set(machines.values()))}; .NET AnyCPU (IL only): {anycpu}")
     # 3. SwiftShader
     sw = [n for n in names_a if "swiftshader" in n.lower()]
     if sw:

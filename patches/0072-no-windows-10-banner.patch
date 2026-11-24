@@ -1,0 +1,31 @@
+Venetium 0072 - no "you'll need Windows 10" banner on Windows 8 / 8.1.
+Chromium 150 calls every Windows below 10 obsolete (ObsoleteSystem::IsObsoleteNowOrSoon, Windows kernel32 version) and
+then shows "To get future Venetium updates, you'll need Windows 10 or later. This computer is using Windows 8.1." under
+the toolbar at every start, a note on the settings About page, and an upgrade-detector hint. Venetium runs on Windows
+RT 8.0 / 8.1 (the thumb2 build) and keeps updating it, so the check is always false. Windows 10 never saw the banner.
+
+diff --git a/chrome/browser/obsolete_system/obsolete_system_win.cc b/chrome/browser/obsolete_system/obsolete_system_win.cc
+index 689026a..536d21d 100644
+--- a/chrome/browser/obsolete_system/obsolete_system_win.cc
++++ b/chrome/browser/obsolete_system/obsolete_system_win.cc
+@@ -22,16 +22,15 @@ base::win::Version GetRealOSVersion() {
+   return base::win::OSInfo::Kernel32Version();
+ }
+ 
+-bool IsObsoleteOsVersion() {
+-  return GetRealOSVersion() < base::win::Version::WIN10;
+-}
+-
+ }  // namespace
+ 
+ namespace ObsoleteSystem {
+ 
+ bool IsObsoleteNowOrSoon() {
+-  return IsObsoleteOsVersion();
++  // Venetium 0072: Windows 8 / 8.1 are supported (the thumb2 build for Windows
++  // RT 8.x gets Venetium's updates), so no "you'll need Windows 10" banner,
++  // settings note or upgrade-detector hint.
++  return false;
+ }
+ 
+ std::u16string LocalizedObsoleteString() {

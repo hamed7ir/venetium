@@ -9,6 +9,7 @@ Venetium run so far used); the installer's %(VersionDir)s split is not used (chr
 
   python portable.py set   <out-dir> <arch-label> <report.tsv>          -> the resolved set + findings (no zip)
   python portable.py zip   <out-dir> <arch-label> <zip> [--kit <dir>]   -> the zip (root folder = zip name without .zip)
+  python portable.py extras <out-dir> <tsv>                             -> Venetium 0074's extra files, for the installer
 Exit 3 if a SwiftShader file would be packaged for arch 'arm32' (the 0021/0025 SwiftShader-off gate)."""
 import configparser, fnmatch, glob, hashlib, json, os, re, subprocess, sys, zipfile
 
@@ -90,6 +91,25 @@ def resolve(out_dir, arch):
     return a, use, files, findings
 
 
+def venetium_extras(out_dir):
+    """Venetium 0074: files the zip AND the installer ship beyond Chromium's ship list - the Start tile manifest
+    (Chromium's own installer wrote it, so chrome.release leaves it out), the icon switcher set-icon.exe (built into the
+    out dir by installer/build-set-icon.ps1), and the icons folder (the WinRT-style icon and the Venetium W10M icon with
+    their tiles, the tile manifests). (source path, packaged relative path); refuses when one is missing."""
+    icons = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+    extras = [(os.path.join(out_dir, "venetium.VisualElementsManifest.xml"), "venetium.VisualElementsManifest.xml"),
+              (os.path.join(out_dir, "set-icon.exe"), "set-icon.exe")]
+    extras += [(os.path.join(icons, f), "icons/" + f) for f in
+               ("README.txt", "tile-classic.xml", "tile-winrt.xml", "venetium-winrt.ico", "winrt-logo.png",
+                "winrt-smalllogo.png", "tile-w10m.xml", "venetium-w10m.ico", "w10m-logo.png",
+                "w10m-smalllogo.png")]
+    missing = [p for p, _ in extras if not os.path.isfile(p)]
+    if missing:
+        hint = " (run installer/build-set-icon.ps1 -OutDir <out dir> first)" if any(p.endswith("set-icon.exe") for p in missing) else ""
+        raise SystemExit(f"REFUSING: 0074 extras missing: {missing}{hint}")
+    return extras
+
+
 def sha(p):
     h = hashlib.sha256()
     with open(p, "rb") as f:
@@ -107,6 +127,11 @@ def machine(p):
 
 
 def main():
+    if sys.argv[1] == "extras":  # python portable.py extras <out-dir> <tsv>: "rel<TAB>source" per 0074 extra (installer)
+        with open(sys.argv[3], "w", encoding="utf-8", newline="\n") as f:
+            for p, rel in venetium_extras(sys.argv[2]):
+                f.write(rel + "\t" + p + "\n")
+        return
     mode, out_dir, arch = sys.argv[1], sys.argv[2], sys.argv[3]
     a, use, files, findings = resolve(out_dir, arch)
     swift = [r for r in files if "swiftshader" in r.lower()]
@@ -168,6 +193,7 @@ def main():
             if bad:
                 raise SystemExit(f"REFUSING: {len(bad)} kit files do not match kit\\MANIFEST.tsv: {bad[:10]}")
             print(f"kit: {len(kit_files)} files, all match MANIFEST.tsv; build.js = {facts}")
+        extras = venetium_extras(out_dir)
         n = 0
         with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
             for r in rows:
@@ -178,6 +204,9 @@ def main():
                     z.writestr(f"{root}/kit/{rel}", build_js)
                 else:
                     z.write(p, f"{root}/kit/{rel}")
+                n += 1
+            for p, rel in extras:
+                z.write(p, f"{root}/{rel}")
                 n += 1
         print(f"{zpath}: {n} entries, {os.path.getsize(zpath):,} B, sha256 {sha(zpath)}")
 

@@ -26,6 +26,10 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 function Sha256([string]$p) { (Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant() }
 
+# ── 0. Venetium 0074: set-icon.exe into the out dir (portable.py's extras ship it, so the zip has it too) ─────
+& (Join-Path $PSScriptRoot 'build-set-icon.ps1') -OutDir $OutDir
+if ($LASTEXITCODE -ne 0) { throw "set-icon.exe build failed ($LASTEXITCODE)" }
+
 # ── 1. resolve the shipped browser set (no kit) with portable.py ─────────────────────────────────────────────
 if (Test-Path $Work) { Remove-Item $Work -Recurse -Force }
 New-Item -ItemType Directory -Force $Work | Out-Null
@@ -47,6 +51,21 @@ foreach ($rel in $files) {
     if (-not (Test-Path $srcf)) { throw "payload file missing: $srcf" }
     $relf = ($rel -replace '\\', '/')                         # forward slashes in list + resource name
     $gz   = Join-Path $setupDir ('payload\' + ($relf -replace '/', '\') + '.gz')
+    New-Item -ItemType Directory -Force (Split-Path $gz) | Out-Null
+    $in = [System.IO.File]::OpenRead($srcf); $out = [System.IO.File]::Create($gz)
+    $z  = New-Object System.IO.Compression.GZipStream($out, [System.IO.Compression.CompressionMode]::Compress)
+    $in.CopyTo($z); $z.Dispose(); $out.Dispose(); $in.Dispose()
+    $list.Add((Sha256 $srcf) + "`t" + (Get-Item $srcf).Length + "`t" + $relf)
+    $res.Add('/resource:"' + $gz + '",payload/' + $relf + '.gz')
+}
+# Venetium 0074: the Start tile manifest, set-icon.exe and the icons folder (portable.py extras = the zip's same files)
+$extrasTsv = Join-Path $Work "extras-$Flavor.tsv"
+& $py $portable extras $OutDir $extrasTsv | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "portable.py extras failed ($LASTEXITCODE)" }
+foreach ($line in (Get-Content $extrasTsv | Where-Object { $_ })) {
+    $relf, $srcf = $line -split "`t", 2
+    if (-not (Test-Path $srcf)) { throw "extra file missing: $srcf" }
+    $gz = Join-Path $setupDir ('payload\' + ($relf -replace '/', '\') + '.gz')
     New-Item -ItemType Directory -Force (Split-Path $gz) | Out-Null
     $in = [System.IO.File]::OpenRead($srcf); $out = [System.IO.File]::Create($gz)
     $z  = New-Object System.IO.Compression.GZipStream($out, [System.IO.Compression.CompressionMode]::Compress)
@@ -78,39 +97,8 @@ namespace VenetiumSetup
 "@
 [System.IO.File]::WriteAllText((Join-Path $setupDir 'SetupInfo.cs'), $info, (New-Object System.Text.UTF8Encoding($false)))
 
-# ── 4. compile with Roslyn csc against .NET 4.0 reference assemblies ─────────────────────────────────────────
-# Roslyn csc (needs C# 7.3). $env:VENETIUM_CSC overrides; else a VS 2022 build-tools install; else vswhere.
-$csc = $env:VENETIUM_CSC
-if (-not $csc -or -not (Test-Path $csc)) {
-    $csc = $null
-    foreach ($c in @(
-        'D:\Program Files\vs22buildtools\MSBuild\Current\Bin\Roslyn\csc.exe',
-        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\Roslyn\csc.exe'),
-        (Join-Path ${env:ProgramFiles} 'Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\Roslyn\csc.exe'))) {
-        if (Test-Path $c) { $csc = $c; break }
-    }
-}
-if (-not $csc) {
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-    if (Test-Path $vswhere) { $csc = & $vswhere -version '[17.0,18.0)' -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\Roslyn\csc.exe' | Select-Object -First 1 }
-}
-if (-not $csc -or -not (Test-Path $csc)) { throw 'Roslyn csc.exe not found. Set VENETIUM_CSC to a VS 2022 csc.exe.' }
-"csc: $csc"
-
-# .NET Framework 4.x reference set: prefer a targeting pack (4.0 Client is best - it keeps the build to APIs that
-# run on a bare .NET 4.0 / Windows RT); fall back to the installed 4.x runtime assemblies when no pack is present.
-$refs = $null
-$raRoot = Join-Path ${env:ProgramFiles(x86)} 'Reference Assemblies\Microsoft\Framework\.NETFramework'
-foreach ($cand in @('v4.0\Profile\Client', 'v4.0', 'v4.5', 'v4.5.1', 'v4.5.2', 'v4.6', 'v4.6.1', 'v4.6.2', 'v4.7.2', 'v4.8')) {
-    $d = Join-Path $raRoot $cand
-    if (Test-Path (Join-Path $d 'mscorlib.dll')) { $refs = $d; "reference assemblies: $refs (targeting pack)"; break }
-}
-if (-not $refs) {
-    foreach ($d in @("$env:windir\Microsoft.NET\Framework64\v4.0.30319", "$env:windir\Microsoft.NET\Framework\v4.0.30319")) {
-        if (Test-Path (Join-Path $d 'mscorlib.dll')) { $refs = $d; "reference assemblies: $refs (runtime 4.x - no targeting pack installed)"; break }
-    }
-}
-if (-not $refs) { throw 'no .NET Framework 4.x reference assemblies or runtime assemblies found' }
+# ── 4. compile with Roslyn csc against .NET 4.0 reference assemblies ($csc, $refs: csc-common.ps1) ─────────────
+. (Join-Path $PSScriptRoot 'csc-common.ps1')
 
 $setupExe = Join-Path $setupDir ("Venetium-Setup-$Version-$Flavor.exe")
 $rsp = New-Object System.Collections.Generic.List[string]
@@ -127,6 +115,7 @@ $rsp.AddRange([string[]]@(
     ('/r:"' + (Join-Path $refs 'System.Windows.Forms.dll') + '"')))
 $rsp.AddRange([string[]]$res)
 $rsp.Add('"' + $setupCs + '"')
+$rsp.Add('"' + (Join-Path $repo 'installer\IconTools.cs') + '"')   # Venetium 0074, shared with set-icon.exe
 $rsp.Add('"' + (Join-Path $setupDir 'SetupInfo.cs') + '"')
 $rspFile = Join-Path $setupDir 'csc.rsp'
 [System.IO.File]::WriteAllLines($rspFile, $rsp, (New-Object System.Text.UTF8Encoding($false)))

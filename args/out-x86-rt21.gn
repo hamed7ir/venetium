@@ -17,17 +17,19 @@ symbol_level = 1                 # line tables in the PDBs for crash stacks; the
 generate_about_credits = true    # chrome://credits carries Supermium's credit
 # is_official_build = true comes from venetium.gn (v1.2).
 
-# --- toolchain (V8SIM-1 §0.3): rt2.1 and rustc-rt2.1, whose sysroot has the i686 std since RUSTC-3 ---
-clang_base_path = "F:/cr/rt21-cr"   # fixed rt2.1 (BATCH-RT21-FIX-1): clang-cl d572c493…, lld-link 6e203038…, llvm-lib 9e197c48…
-clang_version = "23"                 # rt2.1's lib/clang/23
-rust_sysroot_absolute = "F:/cr/rustc-rt21"   # 158/158 = RUSTC-3-SYSROOT-MANIFEST.txt; on F: (find_std_rlibs.py relpath)
-rustc_version = "rustc-1.100.0-nightly-bba531001-2026-09-20-rt2.1-31b4bac5e615"   # RUSTC-3 §3.1; new rustc_driver (Part R); no spaces
+# --- toolchain (V8SIM-1 §0.3): rt2.4 and rustc-rt2.4 (2026-11-16), whose sysroot has the i686 std ---
+clang_base_path = "F:/cr/rt24-cr"   # rt2.4 (= rt2.1 + LLVM 0021-0034 + B01-B08, static zlib): clang-cl f24b35ac…, lld-link 2f4ab430…
+clang_version = "23"                 # rt2.4's lib/clang/23
+rust_sysroot_absolute = "F:/cr/rustc-rt24"   # rustc-rt2.4: i686, x86_64 and thumbv7a std, 21 rlibs each; on F:
+rustc_version = "rustc-1.100.0-nightly-bba531001-2026-09-20-rt2.4-7f107cb28346"   # rt2.4's rustc_driver 7f107cb2…; no spaces
 added_rust_stdlib_libs = [ "windows_link", "rustc_literal_escaper" ]   # same library lists as the x64 control
 removed_rust_stdlib_libs = []
 rust_bindgen_root = "F:/cr/bindgen-rt"   # the x64 control's Windows bindgen
 
 # --- carried from the x64 control (out\x64-rt2) because they concern the toolchain, not the product ---
-use_thin_lto = false
+use_thin_lto = true   # his decision 2026-11-20: ThinLTO for the x86 PGO build too (Chromium's official Windows default)
+win_thin_lto_jobs = "8"   # as out-arm-pgo.gn: ThinLTO codegen threads per link on this shared-vCPU server
+toolchain_supports_rust_thin_lto = false   # Rust stays native objects, as on ARM
 # v1.2: Chrome's own win32 PGO profile for this branch (chrome/build/win32.pgo.txt; fetch it into
 # chrome/build/pgo_profiles/ first, see RECIPE.md). Also turns on V8 builtins PGO and call-graph-sorted linking.
 chrome_pgo_phase = 2
@@ -61,3 +63,7 @@ use_dummy_lastchange = false
 # directory keeps its explicit use_thin_lto / chrome_pgo_phase / symbol_level / dcheck_always_on lines, which official
 # would otherwise default to ThinLTO on, PGO on and full symbols.
 is_official_build = true
+# Venetium 0073 (his decision 2026-11-08): this build's release tag, compared with GitHub's latest stable
+# release every 7 days (chrome/browser/ui/startup/venetium_update_check.cc). Set it to the tag of the
+# release being built; empty = no update check.
+venetium_release_tag = "v1.4"

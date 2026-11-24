@@ -1,0 +1,101 @@
+Venetium 0062 v2 - the build edits for the Windows ARM32 PGO + ThinLTO build (v1.3, args/out-arm-pgo.gn).
+Two build files; nothing changes for a non-LTO build (out-arm-rt21, out-x86-rt21 build exactly as before).
+A. build/config/compiler/BUILD.gn - new arg win_thin_lto_jobs (default "all" = upstream's /opt:lldltojobs=all). The ARM32
+   PGO build sets "8": all of chrome.dll's code generation runs inside its one lld-link, and one thread per hardware
+   thread oversubscribes a shared-vCPU build box.
+B. build/config/compiler/BUILD.gn, thinlto_optimize_default - lto_opt_level 2 instead of 0 for Windows ARM32 targets
+   (libGLESv2/libEGL, chrome_elf, ...). ThinLTO's compile step leaves the loop and SLP vectorizers and late unrolling
+   to the link, so level 0 would make those binaries slower on the Tegra than the non-LTO -O2 build. chrome.dll already
+   uses thinlto_optimize_max (2).
+C. (v1 only, removed in v2: see the end.)
+D. build/win/BUILD.gn - 0061's word-at-a-time string routines stay native code (config venetium_string_arm_no_lto:
+   -fno-lto -fno-whole-program-vtables -fno-split-lto-unit). Their -fno-vectorize / -fno-slp-vectorize are compile-time
+   pipeline options the LTO backend never sees, and LTO could import and inline the bodies into callers, where the
+   in-word read past the NUL becomes visible to the optimizer; the native object is the device-verified code. It has to
+   be a config: a target's own cflags come before the compiler config's -flto=thin, and the last one wins.
+v2 (rt2.2): v1's part C is gone. It made the ARM32 LTO static libraries with `llvm-ar rcsT --format=gnu` because
+rt2.1's llvm-lib could not archive thumb bitcode ("unknown arch in target triple: thumbv7-unknown-windows-msvc");
+rt2.2 fixed that (rt2.2 0023), so build/toolchain/win/toolchain.gni is upstream again (lld-link /lib /llvmlibthin).
+rt2.2's lld also has the three Windows ARM32 ThinLTO fixes rt21-lto carried (0021, 0022, 0024), so the build uses
+rt2.2 as it is; the profile is pgo/. v1 is patches/superseded/0062-arm32-thinlto-build-v1.patch.
+
+--- a/build/config/compiler/BUILD.gn
++++ b/build/config/compiler/BUILD.gn
+@@ -130,6 +130,11 @@
+   # See: https://clang.llvm.org/docs/ThinLTO.html#incremental
+   # The cache can lead to non-determinism: https://crbug.com/1486045
+   thin_lto_enable_cache = true
++
++  # Venetium: ThinLTO backend jobs per lld-link invocation on Windows
++  # (/opt:lldltojobs=). Upstream hard-codes "all" (one per hardware thread);
++  # set a number where hardware threads outnumber real cores or RAM is tight.
++  win_thin_lto_jobs = "all"
+ 
+   # Initialize all local variables with a pattern. This flag will fill
+   # uninitialized floating-point types (and 32-bit pointers) with 0xFF and the
+@@ -806,7 +811,7 @@
+ 
+     if (is_win) {
+       ldflags += [
+-        "/opt:lldltojobs=all",
++        "/opt:lldltojobs=$win_thin_lto_jobs",
+         "-mllvm:-import-instr-limit=$import_instr_limit",
+         "-mllvm:-disable-auto-upgrade-debug-info",
+       ]
+@@ -1261,6 +1266,14 @@
+ config("thinlto_optimize_default") {
+   if (!is_debug && use_thin_lto && is_a_target_toolchain) {
+     lto_opt_level = 0
++
++    # Venetium: every shipped Windows ARM32 binary (ANGLE's libGLESv2/libEGL,
++    # chrome_elf, ...) gets the full post-link optimization. The ThinLTO
++    # compile step leaves out the loop/SLP vectorizers and late unrolling, so
++    # level 0 would make them slower than the non-LTO -O2 build on the Tegra.
++    if (is_win && current_cpu == "arm" && thin_lto_enable_optimizations) {
++      lto_opt_level = 2
++    }
+ 
+     if (is_win) {
+       ldflags = [ "/opt:lldlto=" + lto_opt_level ]
+--- a/build/win/BUILD.gn
++++ b/build/win/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//build/config/clang/clang.gni")
++import("//build/config/compiler/compiler.gni")
+ import("//build/config/sanitizers/sanitizers.gni")
+ import("//build/config/win/manifest.gni")
+ 
+@@ -21,6 +22,23 @@
+          "Windows cross-builds from Mac must be 64-bit.")
+ 
+   if (current_cpu == "arm") {
++    # Venetium: keep 0061 out of ThinLTO. Its -fno-vectorize/-fno-slp-vectorize
++    # are compile-time pipeline options that the LTO backend never sees, and
++    # LTO could import and inline the word-at-a-time bodies into callers, where
++    # the in-word read past the NUL becomes visible to the optimizer. A native
++    # object keeps the device-verified code. A config, so these flags come
++    # after the compiler config's -flto=thin (a target's own cflags come
++    # first); -fwhole-program-vtables is rejected without LTO.
++    config("venetium_string_arm_no_lto") {
++      if (use_thin_lto) {
++        cflags = [
++          "-fno-lto",
++          "-fno-whole-program-vtables",
++          "-fno-split-lto-unit",
++        ]
++      }
++    }
++
+     # Venetium 0061: replaces the static CRT's byte-at-a-time ARM32 memchr,
+     # memcmp, strchr, strcmp and strlen (see the source). A source_set, so its
+     # object is linked directly into each binary and wins over the CRT
+@@ -34,6 +52,7 @@
+         "/clang:-fno-vectorize",
+         "/clang:-fno-slp-vectorize",
+       ]
++      configs += [ ":venetium_string_arm_no_lto" ]
+     }
+   }
+ 

@@ -88,15 +88,26 @@ namespace VenetiumSetup
                 {
                     string dir = DefaultDir();
                     bool desktop = true;
+                    IconChoice icon = IconChoice.Venetium;   // Venetium 0074: --icon=venetium | winrt | w10m | <path to an .ico>
+                    string ownIcon = null;
                     for (int i = 1; i < args.Length; i++)
                     {
                         if (Eq(args[i], "--no-desktop")) desktop = false;
+                        else if (args[i].StartsWith("--icon=", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string v = args[i].Substring(7).Trim('"');
+                            if (Eq(v, "venetium")) icon = IconChoice.Venetium;
+                            else if (Eq(v, "winrt")) icon = IconChoice.WinRT;
+                            else if (Eq(v, "w10m")) icon = IconChoice.W10M;
+                            else if (IconFiles.IsIco(v)) { icon = IconChoice.Own; ownIcon = Path.GetFullPath(v); }
+                            else return 2;   // not a valid .ico
+                        }
                         else if (args[i].StartsWith("-") || args[i].StartsWith("/")) return 2;   // e.g. /S: an unknown switch, not a folder
                         else dir = args[i];
                     }
                     if (SafeTarget.Problem(dir) != null) return 5;
                     if (InUse.Check(dir) != null) return 4;
-                    Installer.Install(dir, desktop, null);
+                    Installer.Install(dir, desktop, icon, ownIcon, null);
                     return 0;
                 }
 
@@ -635,7 +646,7 @@ namespace VenetiumSetup
 
     internal static class Installer
     {
-        internal static void Install(string targetDir, bool desktopShortcut, Action<string> progress)
+        internal static void Install(string targetDir, bool desktopShortcut, IconChoice icon, string ownIcon, Action<string> progress)
         {
             Report(progress, "Preparing...");
             string refused = SafeTarget.Problem(targetDir);
@@ -700,22 +711,29 @@ namespace VenetiumSetup
             string exe = Path.Combine(targetDir, Program.ExeName);
             string uninst = Path.Combine(targetDir, "uninstall.exe");
 
+            // Venetium 0074: the icon choice. venetium-icon.ico beside the exe is what the browser shows for its windows and
+            // taskbar button (and the shortcuts below point at it); the Start tile manifest follows the choice. Written
+            // before the shortcuts, because Windows reads the tile manifest when a Start shortcut is created.
+            Report(progress, "Setting the icon...");
+            string shortcutIcon = IconFiles.Apply(targetDir, icon, ownIcon);   // IconTools.cs
+
             Report(progress, "Creating shortcuts...");
             File.Copy(Application.ExecutablePath, uninst, true);   // uninstall.exe = this Setup (uninstall mode only)
             string programs = Environment.GetFolderPath(Environment.SpecialFolder.Programs);
-            Shortcut.Create(Path.Combine(programs, Program.AppName + ".lnk"), exe, null, targetDir, exe, Program.ShortcutDesc);
+            Shortcut.Create(Path.Combine(programs, Program.AppName + ".lnk"), exe, null, targetDir, shortcutIcon, Program.ShortcutDesc);
             if (desktopShortcut)
             {
                 string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-                Shortcut.Create(Path.Combine(desktop, Program.AppName + ".lnk"), exe, null, targetDir, exe, Program.ShortcutDesc);
+                Shortcut.Create(Path.Combine(desktop, Program.AppName + ".lnk"), exe, null, targetDir, shortcutIcon, Program.ShortcutDesc);
             }
+            IconFiles.UpdateShortcuts(exe, shortcutIcon);   // pins and other shortcuts to this venetium.exe get the icon too
 
             Report(progress, "Registering...");
-            RegisterUninstall(targetDir, exe, uninst);
+            RegisterUninstall(targetDir, shortcutIcon, uninst);
             Report(progress, "Done.");
         }
 
-        private static void RegisterUninstall(string dir, string exe, string uninst)
+        private static void RegisterUninstall(string dir, string displayIcon, string uninst)
         {
             try
             {
@@ -726,7 +744,7 @@ namespace VenetiumSetup
                     k.SetValue("DisplayVersion", Info.AppVersion);
                     k.SetValue("Publisher", Program.Publisher);
                     k.SetValue("Comments", Info.Flavor + " package");
-                    k.SetValue("DisplayIcon", exe);
+                    k.SetValue("DisplayIcon", displayIcon);
                     k.SetValue("InstallLocation", dir);
                     k.SetValue("UninstallString", "\"" + uninst + "\" --uninstall \"" + dir + "\"");
                     k.SetValue("QuietUninstallString", "\"" + uninst + "\" --uninstall \"" + dir + "\" --silent");
@@ -758,6 +776,10 @@ namespace VenetiumSetup
         // future build drops a file, so an upgrade cleans it up.
         private static readonly string[] Retired = { };
 
+        // Venetium 0074: the icon file Setup (or set-icon.exe) writes from the user's icon choice; not in the payload,
+        // owned all the same, so uninstall removes it.
+        internal const string IconOverride = IconFiles.IconOverride;
+
         internal static void RemoveRetired(string dir, List<PayloadFile> files)   // after an upgrade
         {
             foreach (var name in Retired)
@@ -768,6 +790,8 @@ namespace VenetiumSetup
         {
             foreach (var f in files) { Del(Path.Combine(dir, f.Name)); Del(Path.Combine(dir, f.Name + ".new")); }   // .new: an install cut off mid-swap
             foreach (var name in Retired) Del(Path.Combine(dir, name));
+            Del(Path.Combine(dir, IconOverride));
+            OwnTile.Clean(Path.Combine(dir, "icons"));
             RemoveEmptySubdirs(dir, files);
         }
 
@@ -866,84 +890,16 @@ namespace VenetiumSetup
         }
     }
 
-    /// <summary>Creates a .lnk via the shell's IShellLink COM object (works on RT desktop). Finestra's, unchanged.</summary>
-    internal static class Shortcut
-    {
-        internal static void Create(string lnkPath, string target, string args, string workDir, string iconPath, string desc)
-        {
-            try
-            {
-                var link = (IShellLinkW)new CShellLink();
-                link.SetPath(target);
-                if (!string.IsNullOrEmpty(args)) link.SetArguments(args);
-                if (!string.IsNullOrEmpty(workDir)) link.SetWorkingDirectory(workDir);
-                if (!string.IsNullOrEmpty(iconPath)) link.SetIconLocation(iconPath, 0);
-                if (!string.IsNullOrEmpty(desc)) link.SetDescription(desc);
-                ((IPersistFile)link).Save(lnkPath, true);
-            }
-            catch { /* shortcut is best-effort */ }
-        }
-
-        /// <summary>The target path a .lnk points at, or null when it cannot be read.</summary>
-        internal static string TargetOf(string lnkPath)
-        {
-            try
-            {
-                var link = (IShellLinkW)new CShellLink();
-                ((IPersistFile)link).Load(lnkPath, 0);
-                var sb = new StringBuilder(1024);
-                link.GetPath(sb, sb.Capacity, IntPtr.Zero, 0);
-                return sb.Length > 0 ? sb.ToString() : null;
-            }
-            catch { return null; }
-        }
-
-        [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
-        private class CShellLink { }
-
-        [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("000214F9-0000-0000-C000-000000000046")]
-        private interface IShellLinkW
-        {
-            void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszFile, int cch, IntPtr pfd, int fFlags);
-            void GetIDList(out IntPtr ppidl);
-            void SetIDList(IntPtr pidl);
-            void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszName, int cch);
-            void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string pszName);
-            void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszDir, int cch);
-            void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string pszDir);
-            void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszArgs, int cch);
-            void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string pszArgs);
-            void GetHotkey(out short pwHotkey);
-            void SetHotkey(short wHotkey);
-            void GetShowCmd(out int piShowCmd);
-            void SetShowCmd(int iShowCmd);
-            void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszIconPath, int cch, out int piIcon);
-            void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string pszIconPath, int iIcon);
-            void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string pszPathRel, int dwReserved);
-            void Resolve(IntPtr hwnd, int fFlags);
-            void SetPath([MarshalAs(UnmanagedType.LPWStr)] string pszFile);
-        }
-
-        [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("0000010b-0000-0000-C000-000000000046")]
-        private interface IPersistFile
-        {
-            void GetClassID(out Guid pClassID);
-            [PreserveSig] int IsDirty();
-            void Load([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, int dwMode);
-            void Save([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, [MarshalAs(UnmanagedType.Bool)] bool fRemember);
-            void SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string pszFileName);
-            void GetCurFile([MarshalAs(UnmanagedType.LPWStr)] out string ppszFileName);
-        }
-    }
-
     /// <summary>Finestra's install wizard, plus a "Check requirements" button. The check only informs: Install is
     /// always enabled and never runs it.</summary>
     internal sealed class InstallForm : Form
     {
         private readonly TextBox _path, _reqs;
         private readonly CheckBox _desktop;
-        private readonly Button _install, _cancel, _browse, _check;
-        private readonly Label _status;
+        private readonly RadioButton _iconVenetium, _iconWinrt, _iconW10m, _iconOwn;   // Venetium 0074
+        private readonly Button _install, _cancel, _browse, _check, _iconPick;
+        private readonly Label _status, _iconFile;
+        private string _ownIcon;
         private readonly ProgressBar _bar;
         private readonly FlowLayoutPanel _links;
         private static readonly Color Accent = Color.FromArgb(32, 102, 148);   // Venetium accent
@@ -955,7 +911,7 @@ namespace VenetiumSetup
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false; MinimizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(560, 470);
+            ClientSize = new Size(560, 548);
             BackColor = Color.White;
             Font = new Font("Segoe UI", 9f);
 
@@ -969,22 +925,39 @@ namespace VenetiumSetup
             _browse.Click += (s, e) => { using (var d = new FolderBrowserDialog()) { try { d.SelectedPath = _path.Text; } catch { } if (d.ShowDialog(this) == DialogResult.OK) _path.Text = Path.Combine(d.SelectedPath, Program.InstallFolderName); } };
             _desktop = new CheckBox { Left = 18, Top = 132, Width = 300, Text = "Create a desktop shortcut", Checked = true };
 
-            var rl = new Label { Left = 18, Top = 164, Width = 524, Height = 18, Text = "Requirements (optional check - installing does not depend on it):" };
-            _reqs = new TextBox { Left = 18, Top = 184, Width = 524, Height = 150, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, BackColor = Color.White, Font = new Font("Consolas", 8.5f),
-                                  Text = "Press \"Check requirements\" to see whether this PC has what " + Program.AppName + " needs:\r\nthe runtimes and Windows components it uses (for example Media Foundation, for video)." };
-            _links = new FlowLayoutPanel { Left = 18, Top = 338, Width = 524, Height = 44, FlowDirection = FlowDirection.TopDown, WrapContents = false };
+            // Venetium 0074: the icon (windows, taskbar, shortcuts) and the Start tile that goes with it
+            var il = new Label { Left = 18, Top = 164, Width = 40, Height = 18, Text = "Icon:" };
+            _iconVenetium = new RadioButton { Left = 60, Top = 160, Width = 88, Text = "Venetium", Checked = true };
+            _iconWinrt = new RadioButton { Left = 150, Top = 160, Width = 160, Text = "Venetium, WinRT style" };
+            _iconW10m = new RadioButton { Left = 312, Top = 160, Width = 230, Text = "Venetium W10M" };
+            _iconOwn = new RadioButton { Left = 60, Top = 186, Width = 110, Text = "My own .ico" };
+            _iconPick = new Button { Left = 172, Top = 184, Width = 118, Height = 26, Text = "Choose .ico...", Enabled = false };
+            _iconFile = new Label { Left = 296, Top = 190, Width = 246, Height = 18, ForeColor = Color.Gray, AutoEllipsis = true, Visible = false, Text = "No icon file chosen yet." };
+            _iconOwn.CheckedChanged += (s, e) =>
+            {
+                _iconPick.Enabled = _iconOwn.Checked;
+                _iconFile.Visible = _iconOwn.Checked;
+                if (_iconOwn.Checked && _ownIcon == null) PickIcon();
+            };
+            _iconPick.Click += (s, e) => PickIcon();
 
-            _status = new Label { Left = 18, Top = 386, Width = 524, Height = 18, ForeColor = Color.Gray, Text = "" };
-            _bar = new ProgressBar { Left = 18, Top = 406, Width = 524, Height = 14, Style = ProgressBarStyle.Marquee, Visible = false, MarqueeAnimationSpeed = 30 };
-            _check = new Button { Left = 18, Top = 430, Width = 150, Height = 28, Text = "Check requirements" };
-            _install = new Button { Left = 380, Top = 430, Width = 84, Height = 28, Text = "Install" };
-            _cancel = new Button { Left = 468, Top = 430, Width = 74, Height = 28, Text = "Cancel" };
+            var rl = new Label { Left = 18, Top = 242, Width = 524, Height = 18, Text = "Requirements (optional check - installing does not depend on it):" };
+            _reqs = new TextBox { Left = 18, Top = 262, Width = 524, Height = 150, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, BackColor = Color.White, Font = new Font("Consolas", 8.5f),
+                                  Text = "Press \"Check requirements\" to see whether this PC has what " + Program.AppName + " needs:\r\nthe runtimes and Windows components it uses (for example Media Foundation, for video)." };
+            _links = new FlowLayoutPanel { Left = 18, Top = 416, Width = 524, Height = 44, FlowDirection = FlowDirection.TopDown, WrapContents = false };
+
+            _status = new Label { Left = 18, Top = 464, Width = 524, Height = 18, ForeColor = Color.Gray, Text = "" };
+            _bar = new ProgressBar { Left = 18, Top = 484, Width = 524, Height = 14, Style = ProgressBarStyle.Marquee, Visible = false, MarqueeAnimationSpeed = 30 };
+            _check = new Button { Left = 18, Top = 508, Width = 150, Height = 28, Text = "Check requirements" };
+            _install = new Button { Left = 380, Top = 508, Width = 84, Height = 28, Text = "Install" };
+            _cancel = new Button { Left = 468, Top = 508, Width = 74, Height = 28, Text = "Cancel" };
             _check.Click += (s, e) => RunCheck();
             _install.Click += OnInstall;
             _cancel.Click += (s, e) => Close();
 
             Controls.Add(header);
             Controls.Add(lbl); Controls.Add(_path); Controls.Add(_browse); Controls.Add(_desktop);
+            Controls.Add(il); Controls.Add(_iconVenetium); Controls.Add(_iconWinrt); Controls.Add(_iconW10m); Controls.Add(_iconOwn); Controls.Add(_iconPick); Controls.Add(_iconFile);
             Controls.Add(rl); Controls.Add(_reqs); Controls.Add(_links);
             Controls.Add(_status); Controls.Add(_bar); Controls.Add(_check); Controls.Add(_install); Controls.Add(_cancel);
             AcceptButton = _install; CancelButton = _cancel;
@@ -993,6 +966,17 @@ namespace VenetiumSetup
         }
 
         private bool _busy;
+
+        private void PickIcon()
+        {
+            using (var d = new OpenFileDialog { Filter = "Icons (*.ico)|*.ico", Title = "Choose an icon for " + Program.AppName })
+            {
+                if (d.ShowDialog(this) != DialogResult.OK) return;
+                if (!IconFiles.IsIco(d.FileName)) { MessageBox.Show(this, "That file is not a valid .ico icon.", "Setup", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                _ownIcon = d.FileName;
+                _iconFile.Text = "Your icon: " + _ownIcon;
+            }
+        }
 
         private void RunCheck()
         {
@@ -1048,11 +1032,15 @@ namespace VenetiumSetup
                 if (MessageBox.Show(this, busy + "\n\nClose all its windows, then press Retry.", "Setup", MessageBoxButtons.RetryCancel, MessageBoxIcon.Warning) != DialogResult.Retry) return;
 
             bool desktop = _desktop.Checked;
+            IconChoice icon = _iconWinrt.Checked ? IconChoice.WinRT : _iconW10m.Checked ? IconChoice.W10M
+                            : _iconOwn.Checked ? IconChoice.Own : IconChoice.Venetium;
+            string ownIcon = _ownIcon;
+            if (icon == IconChoice.Own && ownIcon == null) { MessageBox.Show(this, "Choose your .ico file first (Choose .ico...)."); return; }
             SetBusy(true);
             var t = new Thread(() =>
             {
                 Exception err = null;
-                try { Installer.Install(dir, desktop, msg => { try { BeginInvoke((Action)(() => _status.Text = msg)); } catch { } }); }
+                try { Installer.Install(dir, desktop, icon, ownIcon, msg => { try { BeginInvoke((Action)(() => _status.Text = msg)); } catch { } }); }
                 catch (Exception ex) { err = ex; }
                 try { BeginInvoke((Action)(() => Finished(dir, err))); } catch { }
             }) { IsBackground = true };
@@ -1079,6 +1067,8 @@ namespace VenetiumSetup
         {
             _busy = busy;
             _install.Enabled = _cancel.Enabled = _browse.Enabled = _path.Enabled = _desktop.Enabled = _check.Enabled = !busy;
+            _iconVenetium.Enabled = _iconWinrt.Enabled = _iconW10m.Enabled = _iconOwn.Enabled = !busy;
+            _iconPick.Enabled = !busy && _iconOwn.Checked;
             _bar.Visible = busy;
         }
     }

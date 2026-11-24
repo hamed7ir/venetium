@@ -1,0 +1,32 @@
+Venetium 0076 - ANGLE without PGO in the Windows ARM32 PGO builds (his decision 2026-11-22).
+libGLESv2.dll / libEGL.dll never wrote a profile in any profiling session (the GPU process ends without their own
+.profraw; the 10-26 profile had no gl:: / rx:: functions either), and once a translation unit is compiled with a profile,
+LLVM's profile-guided size optimization (SizeOpts.h shouldFuncOptimizeForSizeImpl) treats every function without a record
+as cold and optimizes it for size - so all of ANGLE (validation, the D3D9 / D3D11 renderers, texture and vertex
+conversion) was built for size in v1.3. Now the ANGLE targets drop //build/config/compiler/pgo:default_pgo_flags in the
+PGO phase on Windows ARM32 and are built like a non-PGO optimize_max build (ThinLTO stays on). x86 is unchanged (it uses
+Chromium's own Windows profile).
+
+diff --git a/third_party/angle/gni/angle.gni b/third_party/angle/gni/angle.gni
+index 795a09d..c410f18 100644
+--- a/third_party/angle/gni/angle.gni
++++ b/third_party/angle/gni/angle.gni
+@@ -406,6 +406,18 @@
+   }
+ }
+ 
++# Venetium 0076: on Windows ARM32 ANGLE never writes a PGO profile (the GPU
++# process ends without libGLESv2 / libEGL counters in every profiling session),
++# and with a profile in use LLVM size-optimizes every function that has no
++# profile record as cold - so all of ANGLE would be built for size. Build it
++# without the PGO flags instead (plain optimize_max, as above).
++if (is_win && current_cpu == "arm") {
++  import("//build/config/compiler/pgo/pgo.gni")
++  if (chrome_pgo_phase == 2) {
++    angle_remove_configs += [ "//build/config/compiler/pgo:default_pgo_flags" ]
++  }
++}
++
+ # Enable max lto optimization
+ if (is_android && angle_enable_vulkan) {
+   angle_common_configs += [ "//build/config/compiler:thinlto_optimize_max" ]

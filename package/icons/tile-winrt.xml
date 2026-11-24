@@ -1,0 +1,10 @@
+<!-- Venetium Start tile, WinRT style (Windows 8.1 / 10). Setup / set-icon.exe copy this over venetium.VisualElementsManifest.xml. -->
+<Application xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <VisualElements
+    BackgroundColor="#1F5FD6"
+    ShowNameOnSquare150x150Logo="on"
+    ForegroundText="light"
+    Square150x150Logo="icons\winrt-logo.png"
+    Square70x70Logo="icons\winrt-smalllogo.png"
+    Square44x44Logo="icons\winrt-smalllogo.png"/>
+</Application>
