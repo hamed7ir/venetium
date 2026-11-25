@@ -1,6 +1,6 @@
 # venetium
 
-![venetium 1.3](branding/poster-v1.3.png)
+![venetium 1.4](branding/poster-v1.4.png)
 
 venetium is chromium 150 running on old arm windows tablets. i made it because i
 wanted a real modern browser on my surface rt and surface 2, and nothing new runs

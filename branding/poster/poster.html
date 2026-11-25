@@ -1,0 +1,111 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Venetium 1.4</title>
+<!-- venetium poster v1.4: the Kodi RT / 7-Zip RT / MDM RT poster layout (1920x800 CSS, rendered at 1.5x = 2880x1200),
+     in v1.3's blues. The three screenshots are the device shots of the v1.3 poster, cut out of ../poster-v1.3.png at
+     their frames (inner box at CSS x 64 / 792, y 206 / 471.333), so the pixels are the same. Render: ../make-poster.py -->
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1920px; height: 800px; overflow: hidden; }
+  body {
+    font-family: "Segoe UI", "Segoe UI Variable", system-ui, sans-serif; color: #fff;
+    background:
+      radial-gradient(ellipse 820px 460px at 14% 100%, rgba(40, 105, 235, .55), transparent 70%),
+      radial-gradient(ellipse 700px 400px at 86% 14%, rgba(30, 85, 210, .42), transparent 70%),
+      radial-gradient(ellipse 1000px 560px at 55% 72%, rgba(18, 66, 190, .55), transparent 75%),
+      linear-gradient(160deg, #040a26 0%, #0a1d5a 45%, #0f2f86 75%, #0b2468 100%);
+  }
+  .head { display: flex; align-items: center; justify-content: center; gap: 26px; padding-top: 36px; }
+  .head img { width: 96px; height: 96px; filter: drop-shadow(0 6px 18px rgba(0, 0, 0, .45)); }
+  .head h1 { font-size: 58px; font-weight: 600; letter-spacing: .5px; }
+  .sub { text-align: center; font-size: 21px; color: #cfe0ff; margin-top: 14px; }
+  .grid { display: grid; grid-template-columns: repeat(5, 340px); gap: 30px 24px; justify-content: center; margin-top: 30px; }
+  .frame {
+    position: relative; height: 196px; border-radius: 12px; overflow: hidden; border: 2px solid rgba(255, 255, 255, .85);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, .45); background: #0b1638;
+  }
+  .frame img.crop { position: absolute; width: 1920px; height: auto; max-width: none; }
+  .cap { display: flex; align-items: center; gap: 12px; margin-top: 13px; font-size: 19.5px; font-weight: 500; white-space: nowrap; }
+  .cap::before { content: ""; width: 5px; height: 24px; border-radius: 3px; background: #5fb0ff; flex: none; }
+  .panel { height: 100%; padding: 18px 22px; background: linear-gradient(160deg, #12265e, #0b1638); }
+  .label { font-size: 13px; color: #9cc3ff; letter-spacing: .4px; text-transform: uppercase; white-space: nowrap; }
+  .bars { margin-top: 16px; display: grid; gap: 12px; }
+  .bar { display: grid; grid-template-columns: 46px 1fr 96px; align-items: center; gap: 10px; font-size: 16px; color: #cfe0ff; }
+  .bar i { height: 22px; border-radius: 5px; background: rgba(255, 255, 255, .07); overflow: hidden; }
+  .bar em { display: block; height: 100%; border-radius: 5px; background: linear-gradient(90deg, #2f6fe0, #5fb0ff); }
+  .bar b { text-align: right; font-size: 21px; font-weight: 700; color: #fff; }
+  .big { margin-top: 12px; font-size: 30px; font-weight: 700; white-space: nowrap; }
+  .note { margin-top: 12px; font-size: 14px; line-height: 1.35; color: #c3d6f7; }
+  .stats { margin-top: 14px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .stat { padding: 9px 14px; border-radius: 10px; background: rgba(95, 176, 255, .13); border: 1px solid rgba(95, 176, 255, .45); }
+  .stat b { display: block; font-size: 23px; font-weight: 700; line-height: 1.15; white-space: nowrap; }
+  .stat span { font-size: 14px; color: #cfe0ff; }
+  .chips { margin-top: 13px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .chips span { padding: 6px 11px; border-radius: 16px; background: rgba(95, 176, 255, .15); border: 1px solid rgba(95, 176, 255, .5); font-size: 13.5px; }
+  .file { display: flex; justify-content: space-between; align-items: baseline; margin-top: 9px; padding: 7px 14px; border-radius: 9px;
+          background: rgba(255, 255, 255, .06); border: 1px solid rgba(255, 255, 255, .14); }
+  .file b { font-size: 16px; } .file span { font-size: 13px; color: #c3d6f7; }
+  .icons { margin-top: 13px; display: grid; grid-template-columns: repeat(4, 1fr); text-align: center; }
+  .icons img, .icons i { display: block; width: 54px; height: 54px; margin: 0 auto; }
+  .icons i { border: 2px dashed rgba(255, 255, 255, .55); border-radius: 12px; font-style: normal; font-size: 15px; font-weight: 600;
+             line-height: 50px; color: #cfe0ff; }
+  .icons span { display: block; margin-top: 6px; font-size: 12.5px; color: #cfe0ff; white-space: nowrap; }
+  .foot { text-align: center; margin-top: 30px; font-size: 19px; color: #cfe0ff; }
+  .foot b { color: #fff; font-weight: 600; } .dot { color: #5fb0ff; margin: 0 12px; }
+</style></head>
+<body>
+  <div class="head"><img src="../Venetium.png" alt=""><h1>Venetium 1.4</h1></div>
+  <div class="sub">Chromium 150 for Surface RT and Surface 2 on Windows RT 8 / 8.1 and Windows 10 (15035), and for x86 PCs</div>
+  <div class="grid">
+    <div><div class="frame"><img class="crop" src="../poster-v1.3.png" style="left: -64px; top: -206px" alt=""></div><div class="cap">Windows RT 8.1, with the JIT on</div></div>
+    <div><div class="frame"><div class="panel">
+      <div class="label">PGO profile &middot; functions with counts</div>
+      <div class="bars">
+        <div class="bar"><span>v1.3</span><i><em style="width: 26.1%"></em></i><b>79,335</b></div>
+        <div class="bar"><span>v1.4</span><i><em style="width: 100%"></em></i><b>304,237</b></div>
+      </div>
+      <div class="note">From jwa4's 36 sessions on his Surface 2, and mine. Both ARM builds.</div>
+    </div></div><div class="cap">New PGO profile, thanks to jwa4</div></div>
+    <div><div class="frame"><div class="panel">
+      <div class="label">V8 Thumb-2 &middot; WebAssembly</div>
+      <div class="big">Branch islands</div>
+      <div class="note">A far jump in a big function goes through an island. JetStream 3's ONNX Runtime and huge Liftoff functions run on RT 8.1.</div>
+    </div></div><div class="cap">Big WebAssembly apps on RT 8.x</div></div>
+    <div><div class="frame"><img class="crop" src="../poster-v1.3.png" style="left: -792px; top: -206px" alt=""></div><div class="cap">YouTube with hardware H.264</div></div>
+    <div><div class="frame"><div class="panel">
+      <div class="label">ANGLE &middot; libGLESv2 + libEGL</div>
+      <div class="stats">
+        <div class="stat"><b>v1.3</b><span>built for size</span></div>
+        <div class="stat"><b>v1.4</b><span>built for speed</span></div>
+      </div>
+      <div class="note">The GPU process never writes ANGLE's profile, so v1.3 treated all of it as cold code.</div>
+    </div></div><div class="cap">ANGLE built for speed</div></div>
+    <div><div class="frame"><div class="panel">
+      <div class="label">VP9 &middot; AV1 &middot; WebM</div>
+      <div class="chips"><span>&lt;video&gt; files</span><span>Local files</span><span>Wikimedia</span><span>Both ARM builds</span></div>
+      <div class="note">Broken since v1.3.1, fixed. YouTube still gets hardware H.264.</div>
+    </div></div><div class="cap">WebM files play again</div></div>
+    <div><div class="frame"><div class="panel">
+      <div class="label">Icon and Start tile</div>
+      <div class="icons">
+        <div><img src="../Venetium.png" alt=""><span>Venetium</span></div>
+        <div><img src="../../package/icons/venetium-winrt.ico" alt=""><span>WinRT style</span></div>
+        <div><img src="../../package/icons/venetium-w10m.ico" alt=""><span>W10M</span></div>
+        <div><i>.ico</i><span>Your own</span></div>
+      </div>
+      <div class="note" style="margin-top: 10px">Taskbar, shortcuts and a real Start tile.</div>
+    </div></div><div class="cap">Choose your icon and tile</div></div>
+    <div><div class="frame"><img class="crop" src="../poster-v1.3.png" style="left: -792px; top: -471.333px" alt=""></div><div class="cap">Extensions from the Web Store</div></div>
+    <div><div class="frame"><div class="panel">
+      <div class="label">Update check</div>
+      <div class="big">Every 7 days</div>
+      <div class="note">Venetium asks GitHub for a newer release and shows a bar with a Download link. Nothing installs by itself.</div>
+    </div></div><div class="cap">Tells you about new releases</div></div>
+    <div><div class="frame"><div class="panel">
+      <div class="label">Three builds</div>
+      <div class="file"><b>arm32</b><span>Windows 10 build 15035</span></div>
+      <div class="file"><b>arm32-thumb2</b><span>Windows RT 8 / 8.1</span></div>
+      <div class="file"><b>x86</b><span>Windows 10 / 11 PCs</span></div>
+    </div></div><div class="cap">Three builds, x86 is back</div></div>
+  </div>
+  <div class="foot">Free and open source<span class="dot">&#9679;</span><b>github.com/hamed7ir/venetium</b></div>
+</body></html>
