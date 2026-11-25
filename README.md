@@ -26,6 +26,14 @@ my own work.
 - graphics go through d3d9 / angle (gl es2) on the tegra, it has no d3d11. adreno (lumia) uses angle's d3d11 at
   feature level 9_3
 
+## windows 10 mobile: venetium w10m
+
+for lumia phones on windows 10 mobile there is **venetium w10m** by **ilya vysotsky
+(computershik73)**: [github.com/Computershik73/venetium-w10m](https://github.com/Computershik73/venetium-w10m).
+it is venetium (chromium 150) for windows 10 mobile, with chrome's interface laid out like chrome for android, gpu
+compositing and hardware video on lumia-era phones. big thanks to him: venetium's first lumia gpu fixes (0065, in
+v1.3.1) come from his fork, and the venetium w10m icon you can pick since v1.4 is his logo.
+
 ## what works
 
 - hardware h.264 video decode on the gpu over d3d9 (dxva / media foundation), so
@@ -66,7 +74,7 @@ GPLv3 covers the Venetium patches/tooling, and Chromium + the other upstreams ke
 ## credits
 
 built on [supermium](https://github.com/win32ss/supermium) and ungoogled chromium. thanks to Jaybee form openRT community for porting CR77 and Sharing it, Thanks to osmium for the first try port of chromium for these devices.
-And special thanks to kristibek, jimkoutso2008, Max RM, albert,guilherme,fraae, Peter, jwa4 and others who i may forget, all the community. 
+And special thanks to kristibek, jimkoutso2008, Max RM, albert,guilherme,fraae, Peter, jwa4, ilya vysotsky (computershik73, venetium w10m) and others who i may forget, all the community. 
 
 it was possible with help of claude Ai.
 
